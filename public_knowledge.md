@@ -40,7 +40,7 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
   - HTTPS: `https://github.com/cube1345/ESP32_AgentMesh.git`
   - SSH: `git@github.com:cube1345/ESP32_AgentMesh.git`
   - Visibility: private
-  - Current pushed main commit: `b6cae3f` (`Initialize ESP32 AgentMesh firmware`)
+  - Initial firmware snapshot commit: `b6cae3f` (`Initialize ESP32 AgentMesh firmware`)
 - Root `README.md` now defines the project scope, build flow, and repository layout under the ESPAgent name.
 - `docs/ARCHITECTURE.md` uses the current ESPAgent module layout (`main/channels/feishu`, `main/onboard`, `main/espnow`, `main/sensors`, etc.) and no longer contains external-origin mapping tables.
 - `docs/TODO.md` is an ESPAgent roadmap rather than an external comparison tracker.
@@ -276,7 +276,7 @@ As of 2026-06-15:
 - The current working directory still does not expose a normal Git worktree to `git status`; `.git` exists as an empty read-only directory and `git status` reports that this path is not a Git repository.
 - In this environment `.git` is mounted as a read-only tmpfs placeholder, so normal in-place `git init` cannot replace it from the sandbox.
 - Current push work uses temporary Git metadata outside the project tree: `/tmp/ESP32_AgentMesh.git` with `GIT_DIR=/tmp/ESP32_AgentMesh.git` and `GIT_WORK_TREE=/home/cube/WorkSpace/ESP/ESPAgent`.
-- `main` has been pushed to the private `cube1345/ESP32_AgentMesh` repository at commit `b6cae3f`.
+- `main` has been pushed to the private `cube1345/ESP32_AgentMesh` repository. The initial firmware snapshot commit is `b6cae3f`.
 - Treat source files as the source of truth and avoid relying on plain `git status` in the project root unless the host-side `.git` mount is removed outside this sandbox.
 - Do not commit or publish private `main/espagent_secrets.h`.
 - Do not commit build output directories.
