@@ -24,6 +24,10 @@
 串口监视说明：
 
 - 当前四个串口都应使用 `/dev/ttyUSB0-3`。
+- 批量烧录脚本为 `tools/flash_roles_usb0_3.sh`，固定只使用 `/dev/ttyUSB0`、`/dev/ttyUSB1`、`/dev/ttyUSB2`、`/dev/ttyUSB3`，并按 Coordinator、Sensor、Control、Display 顺序烧录。
+- 四角色压力测试脚本为 `tools/stress_mesh_usb0_3.py`，同样固定只使用 `/dev/ttyUSB0-3`；它会先执行四板 `config_show`，再由 USB0 连续发 Mesh command，并监听 USB1/USB2/USB3 的接收、执行、结果发布和崩溃日志。
+- 飞书入口压力测试脚本为 `tools/stress_feishu_usb0_3.py`，同样只监听 `/dev/ttyUSB0-3`；它会真实向 Feishu bot `咕咕嘎嘎！` 发送温湿度和控制灯请求，再统计 USB0 的 Mesh 下发、USB1/USB2 的接收执行和四板崩溃情况。
+- `/dev/ttyACM*` 不作为四角色烧录端口；如果某个 `/dev/ttyUSB0-3` 不存在，就视为对应 ESP32-S3 未检测到，不要改烧 ACM。
 - 在本工作环境中，读取串口监视器时需要提权；非提权扫描可能短暂看不到 `/dev/ttyUSB*`，但提权读取可看到四块板日志。
 - 建议联调时一次发送一条飞书命令，再并行观察 USB0/USB1/USB2/USB3，避免多条 LLM 回合交错。
 
@@ -153,13 +157,22 @@ espagent/roles/control_agent/command
 - USB1 `sensor_agent` 已烧录并通过串口确认 role 启动和 `state online`。
 - USB2 `control_agent` 已烧录并通过串口确认 `state online`。
 - USB3 `display_agent` 已烧录并通过串口确认 `state online`。
+- 2026-06-15 已新增并验证 `tools/flash_roles_usb0_3.sh`：脚本会临时切换 `main/espagent_secrets.h` 的节点 profile，按 USB0-USB3 顺序烧录四个角色，最后恢复为 Coordinator profile；脚本明确拒绝使用 `/dev/ttyACM*`。
+- 2026-06-15 已新增并验证 `tools/stress_mesh_usb0_3.py`：
+  - 基线测试 `--rounds 5 --interval 6 --settle 40 --quiet`：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃，PASS。
+  - 突发测试 `--rounds 5 --interval 1.5 --settle 60 --quiet`：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃，PASS。
+  - 测试中的 AHT10/DHT22/MH-Z19 错误来自当前物理传感器未接入或不可用，不代表 Mesh 链路失败。
+  - Display role 当前可确认 profile 与 state 在线；完整 timeline 订阅/可视化仍是后续工作。
 - Feishu WebSocket ACK 栈溢出已修复：`feishu_ack` 从硬编码 4KB 改为 `ESPAGENT_FEISHU_ACK_STACK`，当前 8KB。
 - Feishu P2P 端到端回复恢复：测试消息收到 `ESPAgent is processing your request...` 和 `收到。`。
+- Feishu 入口压测中复现过 USB0 `Tmr Svc` 栈溢出；已把 heartbeat 文件读取/消息注入移出 timer callback，改由 `heartbeat_worker` 执行，并把 `CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH` 提升到 4096。
 - Coordinator 可在自然语言中自动选择目标角色：
   - `读取温湿度` -> 回复已向 `sensor_agent` 发送读取指令。
   - `点亮WS2812为蓝色` -> 回复已转发给 `control_agent`。
+- Coordinator 对上述两类常见飞书指令已加入确定性 Mesh 路由和假成功保护，不再完全依赖 LLM 自己选择 `mesh_send_command`。
+- 2026-06-15 飞书入口压力测试 `tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet` 通过：飞书发送 4/4，USB1 sensor 接收/执行 2/2，USB2 control 接收/执行 2/2，0 崩溃，PASS。
 - 历史进度：USB0 `coordinator_agent` 和 USB1 `control_agent` 曾连接到同一个 MQTT broker，串口验证了各自 state/events 发布；USB1 `control_agent` 曾验证接收 `espagent/cube1345/roles/control_agent/command` 并 dry-run 校验。
-- 2026-06-15 四板串口确认均在线；下一步仍需要抓取 Coordinator MQTT publish、Sensor/Control MQTT receive、result event 三段日志，形成完整 MQTT 执行证据。
+- 2026-06-15 四板串口确认均在线；Coordinator MQTT publish、Sensor/Control MQTT receive、result event 三段日志已经在串口/MQTT 压测与飞书入口压测中形成基础证据。
 - `mesh_send_command` 工具已加入 LLM tool registry，Coordinator 可以通过 MQTT 向指定 node/role 发布标准 Mesh command。
 - Sensor 角色收到 `read_temperature_humidity` command 时，已支持执行 AHT10/AHT20 温湿度读取，并把 `mesh_command_result` 发布到本节点 events 和全局 timeline。
 - `main/roles/role_config.c/.h` 根据 role/capability 判断节点应该运行哪些服务。
@@ -189,7 +202,7 @@ espagent/roles/control_agent/command
 
 当前需要分清“固件体积”和“运行时启用服务”：
 
-- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；最新 USB0 验证构建 `ESPAgent.bin` 为 `0x14eb70`，2MB app 分区剩余 `0xb1490`，约 35%。
+- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；最新 USB0 验证构建 `ESPAgent.bin` 为 `0x14f790`，2MB app 分区剩余 `0xb0870`，约 34%。
 - 运行时已经按 role/capability 裁剪服务。Coordinator 最重，Sensor/Control 中等，Display 目前最轻。
 - USB0 Coordinator 启动日志显示 PSRAM 约 8MB 可用，完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用；说明当前并未真正把硬件资源吃满。
 

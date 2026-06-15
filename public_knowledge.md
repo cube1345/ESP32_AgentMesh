@@ -64,6 +64,16 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
 - Current temporary MQTT topic prefix: `espagent/cube1345`
 - Serial port used for the Feishu/LLM coordinator board: `/dev/ttyUSB0`
 - Serial monitoring note: this workspace may require elevated serial reads for `/dev/ttyUSB0-3`; non-escalated `/dev` scans can transiently miss the devices even when the host sees them.
+- Four-role flash helper: `tools/flash_roles_usb0_3.sh`
+  - Flashes only `/dev/ttyUSB0`, `/dev/ttyUSB1`, `/dev/ttyUSB2`, and `/dev/ttyUSB3` in order.
+  - USB0 -> `coordinator_agent`, USB1 -> `sensor_agent`, USB2 -> `control_agent`, USB3 -> `display_agent`.
+  - `/dev/ttyACM*` is intentionally ignored. If one of `/dev/ttyUSB0-3` is missing, treat that board as not detected instead of flashing an ACM port.
+  - The script temporarily rewrites `main/espagent_secrets.h` per role, flashes the board, then restores `espagent_secrets.h` to the Coordinator profile.
+- Four-role pressure-test helper: `tools/stress_mesh_usb0_3.py`
+  - Uses only `/dev/ttyUSB0-3`; `/dev/ttyACM*` is intentionally ignored.
+  - Verifies all four `config_show` role profiles before injecting commands.
+  - Sends `mesh_send_command` from USB0 and monitors USB1/USB2/USB3 serial logs for MQTT command receive, execution, result events, warnings, errors, and crashes.
+  - Current test workload alternates `read_temperature_humidity` for `sensor_agent` and `set_status_light` for `control_agent`.
 - Verified Wi-Fi at runtime on 2026-04-27:
   - SSID: `Redmi K70`
   - Device reported `WiFi connected: yes`
@@ -133,6 +143,14 @@ Important for future AI agents:
   - A stack overflow in the async `feishu_ack` task was reproduced on real Feishu inbound messages.
   - The ACK task stack is now configured as `ESPAGENT_FEISHU_ACK_STACK` at 8KB.
   - After reflashing `/dev/ttyUSB0`, Feishu P2P messages again receive normal bot replies instead of resetting during ACK.
+- Feishu-entry Mesh pressure stability:
+  - A real Feishu-entry run reproduced a `Tmr Svc` FreeRTOS timer service stack overflow on USB0 after Feishu/MQTT activity.
+  - `main/heartbeat/heartbeat.c` now defers heartbeat SPIFFS reads and message injection to a `heartbeat_worker` task instead of doing that work inside the FreeRTOS timer callback.
+  - `CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH` is now set to 4096 in both `sdkconfig.defaults` and the active `sdkconfig`.
+  - `main/agent/agent_loop.c` now has deterministic coordinator-side Mesh routing for simple Feishu commands:
+    - ordinary temperature/humidity requests route directly to `sensor_agent` with action `read_temperature_humidity`
+    - remote/control-board status-light requests route directly to `control_agent` with action `set_status_light`
+  - The agent loop also blocks final replies that claim an MQTT Mesh command was sent when no Mesh/routed tool was executed in that turn.
 
 ## Safety Improvement Recently Added
 
@@ -198,9 +216,11 @@ Implemented and verified in code:
 - Sensor role has a narrow direct execution path for `read_temperature_humidity` and publishes `mesh_command_result`.
 - Control role can be targeted by Coordinator for WS2812/GPIO-style requests; full remote hardware execution still depends on the safe command queue/interlock path.
 - Feishu WebSocket ACK is now asynchronous with an 8KB stack, avoiding the previous `feishu_ack` stack overflow.
+- FreeRTOS timer service stability has been improved by moving heartbeat file/message work out of the timer callback and increasing the timer service stack to 4096.
+- Coordinator now has deterministic Mesh routing for common Feishu commands, so `读取温湿度` and remote/control-board WS2812 status-light requests no longer rely entirely on LLM tool selection.
 - `spawn_subagent` is implemented on `main` as a bounded temporary FreeRTOS task with an independent short ReAct loop.
 - Subagent execution is deliberately restricted to research/file/time/weather tools, so it cannot bypass the main agent's hardware, sensor, or Mesh routing safeguards.
-- `idf.py build` passed after the subagent implementation; observed app binary size was `0x14eb70`, leaving about `0xb1490` bytes free in the app partition.
+- `idf.py build` passed after the Feishu-entry Mesh stress fixes; observed app binary size was `0x14f790`, leaving about `0xb0870` bytes free in the app partition.
 
 Verified on physical boards:
 
@@ -209,10 +229,31 @@ Verified on physical boards:
 - `/dev/ttyUSB2` is `esp32s3-control-01` / `control_agent`.
 - `/dev/ttyUSB3` is `esp32s3-display-01` / `display_agent`.
 - All four roles were flashed in order and later observed on serial as MQTT `state online` publishers.
+- On 2026-06-15, `tools/flash_roles_usb0_3.sh` was added and verified by reflashing USB0-USB3 in order. The final run used only `/dev/ttyUSB0-3`; an extra `/dev/ttyACM0` was present but deliberately not used.
+- On 2026-06-15, `tools/stress_mesh_usb0_3.py` was added and run on the four flashed boards:
+  - Baseline run: `--rounds 5 --interval 6 --settle 40 --quiet`
+    - `sent=10`, `queued_ok=10`, `queued_error=0`
+    - `sensor_received=5`, `sensor_executed=5`
+    - `control_received=5`, `control_executed=5`
+    - `crashes=0`, `RESULT: PASS`
+  - Burst run: `--rounds 5 --interval 1.5 --settle 60 --quiet`
+    - `sent=10`, `queued_ok=10`, `queued_error=0`
+    - `sensor_received=5`, `sensor_executed=5`
+    - `control_received=5`, `control_executed=5`
+    - `crashes=0`, `RESULT: PASS`
+  - Sensor warnings/errors during the run were expected hardware-side misses from unconnected or unavailable sensors (`AHT10`, `DHT22`, `MH-Z19`) and did not crash the firmware.
+  - `mqtt_inbound_lines=0` on Display indicates the current display role is online and publishing state but is not yet a full timeline subscriber/visualizer.
 - Feishu P2P bot `咕咕嘎嘎！` is connected to the Coordinator board.
 - Feishu message `测试第一角色修复后是否恢复：请回复收到。` produced `ESPAgent is processing your request...` followed by `收到。`.
 - Feishu message `读取温湿度` produced a Coordinator reply saying it had sent a read command to `sensor_agent`.
 - Feishu message `点亮WS2812为蓝色` produced a Coordinator reply saying it had forwarded the command to `control_agent`.
+- On 2026-06-15, `tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet` passed from the real Feishu bot entry:
+  - `sent_ok=4`, `sent_failed=0`
+  - `sensor_received=2`, `sensor_executed=2`
+  - `control_received=2`, `control_executed=2`
+  - `mesh_command_result_lines=8`
+  - `crashes=0`, `RESULT: PASS`
+  - Artifacts were saved under `artifacts/feishu_stress/feishu_stress_205412_ttyUSB*.log`.
 - `/dev/ttyUSB1` currently logs `DHT22=ESP_ERR_TIMEOUT` and `MH-Z19=ESP_FAIL`; this means the sensor node is online, but those specific physical sensors are not currently returning data on the configured pins.
 - On 2026-06-15, USB0 was reflashed with the current coordinator firmware containing `spawn_subagent`.
 - USB0 boot log verified `Registered tool: spawn_subagent`, `Tools JSON built (26 tools)`, and `Subagent tools JSON built`.
@@ -226,7 +267,7 @@ Verified on physical boards:
   - logs showed `Tool use iteration 1`, `LLM tool[0]: get_current_time({})`, `Tool[get_current_time] => 2026-06-15 12:48:18 CST (Monday)`, then final LLM answer
   - final response: `当前时间：**2026年6月15日（星期一）12:48 CST**`
 - Current four-role resource usage snapshot:
-  - Flash is not role-pruned yet. All roles use the same firmware image; latest verified app binary is `0x14eb70`, leaving `0xb1490` bytes free in the 2MB app partition.
+  - Flash is not role-pruned yet. All roles use the same firmware image; latest verified app binary is `0x14f790`, leaving `0xb0870` bytes free in the 2MB app partition.
   - USB0 Coordinator is the heaviest runtime role: LLM/Feishu/WebSocket/MQTT/SNTP/cron/proactive plus temporary `subagent`; USB0 boot showed PSRAM around 8MB free at startup and about 8.25MB free after the ReAct validation turn.
   - USB1 Sensor currently runs sensor sampling, presence/environment monitors, MQTT telemetry, and serial CLI; it does not run LLM or Feishu.
   - USB2 Control currently runs the control boundary, MQTT command receiver, local control tools, and boot servo demo; it does not run LLM or Feishu.
@@ -245,6 +286,14 @@ Best next engineering step:
 - Monitor `/dev/ttyUSB0-3` with elevated serial reads while sending one Feishu command at a time.
 - For sensor validation, send `读取温湿度` and verify Coordinator command publish, Sensor command receive, and `mesh_command_result`.
 - For control validation, send `点亮WS2812为蓝色` and verify Coordinator command publish, Control command receive, physical LED change, and result/timeline event.
+
+Runtime skills updated on 2026-06-15:
+
+- Added `spiffs_data/skills/agent-mesh-coordination.md` so the runtime agent can route natural-language requests to `sensor_agent`, `control_agent`, and `display_agent` without asking the user for MQTT node IDs.
+- Added `spiffs_data/skills/mcu-edge-ai-boundaries.md` to clearly state the current MCU/cloud AI boundary: ESP32-S3 runs the agent runtime, tools, Mesh, cache, memory, and small local logic; full LLM reasoning still runs through remote LLM APIs.
+- Added `spiffs_data/skills/mesh-resource-planning.md` to encode four-board resource planning and the rule that each ESP32 should be role-saturated by useful services, not by duplicating all services everywhere.
+- Added `spiffs_data/skills/mqtt-mesh-operations.md` to standardize topic use, result-event expectations, and the security boundary for development vs production MQTT.
+- Research framing used for these skills: Agent Mesh should be role-based orchestration; MQTT is suitable as a lightweight publish/subscribe fabric; MCU-side AI should be treated as edge runtime plus future TinyML/local inference, not a current on-device full LLM.
 
 ## Previous Progress Snapshot - 2026-06-14
 

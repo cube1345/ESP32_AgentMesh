@@ -122,8 +122,13 @@
 
 ### [ ] LingShu Agent Mesh Coordinator
 - **Target**: Expand the current ESP32-S3 Edge Agent Node into a multi-node system with Coordinator Agent, Sensor Agent, Control Agent, Memory Agent, Communication Agent, and Display Agent.
-- **Current**: Phase 1.6 is implemented in firmware: node identity and role profile exist; MQTT publishes state/telemetry/events under `espagent/nodes/<node_id>/...`; node/role command topics are subscribed; `main/mesh` parses and validates command JSON; `main/roles` provides coordinator/sensor/control/display service boundaries; `espagent_app` starts LLM/chat, scheduler, sensor monitors, control outputs, and display boundaries according to role/capability. `mesh_send_command` is registered as an LLM-callable Coordinator tool, and `sensor_agent` can execute the whitelisted `read_temperature_humidity` Mesh command and publish `mesh_command_result`.
+- **Current**: Phase 1.6 is implemented in firmware: node identity and role profile exist; MQTT publishes state/telemetry/events under `espagent/nodes/<node_id>/...`; node/role command topics are subscribed; `main/mesh` parses and validates command JSON; `main/roles` provides coordinator/sensor/control/display service boundaries; `espagent_app` starts LLM/chat, scheduler, sensor monitors, control outputs, and display boundaries according to role/capability. `mesh_send_command` is registered as an LLM-callable Coordinator tool, and `sensor_agent` can execute the whitelisted `read_temperature_humidity` Mesh command and publish `mesh_command_result`. Runtime skills now include Agent Mesh coordination, MQTT Mesh operations, MCU edge AI capability boundaries, and four-role resource planning.
 - **Recommendation**: Implement Coordinator-side `command_id` result correlation and Feishu summary before enabling broader remote control. Keep control-role hardware execution disabled until command queue, authorization, audit events, safety interlock, and message_bus/tool_guard routing are implemented.
+
+### [ ] MCU Edge AI / TinyML Path
+- **Target**: Add optional local inference for small, bounded tasks such as sensor anomaly detection, wake word/command spotting, or low-dimensional classification.
+- **Current**: ESP32-S3 runs the agent runtime, tools, Mesh, cache, memory, and deterministic edge logic; full LLM reasoning still runs through remote APIs. Runtime skill `mcu-edge-ai-boundaries.md` documents this boundary so the agent does not overclaim local LLM capability.
+- **Recommendation**: Treat TinyML / LiteRT Micro / ESP-DL / ESP-SR as future integration paths. Do not expose a local inference tool until model size, operators, RAM/PSRAM budget, latency, driver input path, and validation data are defined.
 
 ### [ ] Multi-Channel Manager
 - **Target**: Centralize channel lifecycle if Feishu, WebSocket, serial, and future channels need common management.

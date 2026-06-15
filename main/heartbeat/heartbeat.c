@@ -8,16 +8,22 @@
 #include <stdbool.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/timers.h"
 #include "esp_log.h"
 
 static const char *TAG = "heartbeat";
+
+#define HEARTBEAT_WORKER_STACK 4096
+#define HEARTBEAT_WORKER_PRIO  (tskIDLE_PRIORITY + 1)
 
 #define HEARTBEAT_PROMPT \
     "Read " ESPAGENT_HEARTBEAT_FILE " and follow any instructions or tasks listed there. " \
     "If nothing needs attention, reply with just: HEARTBEAT_OK"
 
 static TimerHandle_t s_heartbeat_timer = NULL;
+static portMUX_TYPE s_heartbeat_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_heartbeat_worker_running = false;
 
 /* ── Content check ────────────────────────────────────────────── */
 
@@ -103,12 +109,44 @@ static bool heartbeat_send(void)
     return true;
 }
 
+static void heartbeat_worker_task(void *arg)
+{
+    (void)arg;
+    heartbeat_send();
+
+    portENTER_CRITICAL(&s_heartbeat_lock);
+    s_heartbeat_worker_running = false;
+    portEXIT_CRITICAL(&s_heartbeat_lock);
+
+    vTaskDelete(NULL);
+}
+
 /* ── Timer callback ───────────────────────────────────────────── */
 
 static void heartbeat_timer_callback(TimerHandle_t xTimer)
 {
     (void)xTimer;
-    heartbeat_send();
+
+    portENTER_CRITICAL(&s_heartbeat_lock);
+    if (s_heartbeat_worker_running) {
+        portEXIT_CRITICAL(&s_heartbeat_lock);
+        return;
+    }
+    s_heartbeat_worker_running = true;
+    portEXIT_CRITICAL(&s_heartbeat_lock);
+
+    BaseType_t ok = xTaskCreate(heartbeat_worker_task,
+                                "heartbeat_worker",
+                                HEARTBEAT_WORKER_STACK,
+                                NULL,
+                                HEARTBEAT_WORKER_PRIO,
+                                NULL);
+    if (ok != pdPASS) {
+        portENTER_CRITICAL(&s_heartbeat_lock);
+        s_heartbeat_worker_running = false;
+        portEXIT_CRITICAL(&s_heartbeat_lock);
+        ESP_LOGW(TAG, "Failed to create heartbeat worker");
+    }
 }
 
 /* ── Public API ───────────────────────────────────────────────── */

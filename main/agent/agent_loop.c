@@ -322,6 +322,152 @@ static bool tool_guard_match_servo_request(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+static bool tool_guard_match_temperature_humidity_request(const char *message) {
+  static const char *const keywords[] = {
+      "temperature", "humidity", "temp", "hum", "aht20", "aht10",
+      "温度",        "湿度",     "温湿度", "气温", "室温",  "环境温度",
+      "读取温湿度",  "读一下温度", "湿度多少",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool text_claims_mesh_dispatched(const char *text) {
+  if (!text) {
+    return false;
+  }
+
+  const bool mentions_mesh =
+      contains_substr_ci(text, "mqtt") || contains_substr_ci(text, "mesh") ||
+      contains_substr_ci(text, "control_agent") ||
+      contains_substr_ci(text, "sensor_agent") ||
+      contains_substr_ci(text, "已通过 MQTT") ||
+      contains_substr_ci(text, "通过 MQTT") ||
+      contains_substr_ci(text, "MQTT Mesh");
+
+  const bool claims_sent =
+      contains_substr_ci(text, "sent") || contains_substr_ci(text, "queued") ||
+      contains_substr_ci(text, "published") ||
+      contains_substr_ci(text, "已发送") || contains_substr_ci(text, "已发出") ||
+      contains_substr_ci(text, "已下发") || contains_substr_ci(text, "已发布") ||
+      contains_substr_ci(text, "已通过") || contains_substr_ci(text, "发送到") ||
+      contains_substr_ci(text, "下发到");
+
+  return mentions_mesh && claims_sent;
+}
+
+static bool message_should_have_used_mesh(const char *message) {
+  return tool_guard_match_temperature_humidity_request(message) ||
+         tool_guard_match_light_request(message) ||
+         tool_guard_match_gpio_write_request(message) ||
+         tool_guard_match_servo_request(message);
+}
+
+static bool final_text_is_unexecuted_mesh_claim(const char *text,
+                                                const espagent_msg_t *msg) {
+  return msg && message_should_have_used_mesh(msg->content) &&
+         text_claims_mesh_dispatched(text);
+}
+
+static bool message_has_local_marker(const char *message) {
+  static const char *const keywords[] = {
+      "local", "this board", "coordinator", "usb0", "本机", "本地",
+      "这块板", "第一角色", "协调器",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static const char *detect_status_light_color(const char *message) {
+  if (!message) {
+    return NULL;
+  }
+  if (contains_substr_ci(message, "blue") || contains_substr_ci(message, "蓝")) {
+    return "blue";
+  }
+  if (contains_substr_ci(message, "green") || contains_substr_ci(message, "绿")) {
+    return "green";
+  }
+  if (contains_substr_ci(message, "red") || contains_substr_ci(message, "红")) {
+    return "red";
+  }
+  if (contains_substr_ci(message, "white") || contains_substr_ci(message, "白")) {
+    return "white";
+  }
+  if (contains_substr_ci(message, "yellow") || contains_substr_ci(message, "黄")) {
+    return "yellow";
+  }
+  if (contains_substr_ci(message, "purple") || contains_substr_ci(message, "紫")) {
+    return "purple";
+  }
+  if (contains_substr_ci(message, "cyan") || contains_substr_ci(message, "青")) {
+    return "cyan";
+  }
+  if (contains_substr_ci(message, "orange") || contains_substr_ci(message, "橙")) {
+    return "orange";
+  }
+  if (contains_substr_ci(message, "off") || contains_substr_ci(message, "关闭") ||
+      contains_substr_ci(message, "关灯") || contains_substr_ci(message, "熄灭")) {
+    return "off";
+  }
+  return NULL;
+}
+
+static bool is_mesh_related_tool_name(const char *name) {
+  return name &&
+         (strcmp(name, "mesh_send_command") == 0 ||
+          strcmp(name, "read_temperature_humidity") == 0 ||
+          strcmp(name, "set_status_light") == 0 ||
+          strcmp(name, "ws2812_set") == 0 ||
+          strcmp(name, "gpio_write") == 0 ||
+          strcmp(name, "servo_write") == 0);
+}
+
+static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
+                                                   char *tool_output,
+                                                   size_t tool_output_size,
+                                                   char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content)) {
+    return false;
+  }
+
+  const char *payload = NULL;
+  char payload_buf[256];
+  char reply_buf[512];
+
+  if (tool_guard_match_temperature_humidity_request(msg->content) &&
+      !tool_guard_match_weather_request(msg->content)) {
+    payload =
+        "{\"target_role\":\"sensor_agent\",\"action\":\"read_temperature_humidity\",\"args\":{}}";
+  } else if (tool_guard_match_light_request(msg->content)) {
+    const char *color = detect_status_light_color(msg->content);
+    if (!color) {
+      return false;
+    }
+    snprintf(payload_buf, sizeof(payload_buf),
+             "{\"target_role\":\"control_agent\",\"action\":\"set_status_light\","
+             "\"args\":{\"color\":\"%s\"}}",
+             color);
+    payload = payload_buf;
+  } else {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("mesh_send_command", payload, tool_output, tool_output_size);
+  ESP_LOGI(TAG, "=== CONV === Deterministic Mesh route => %s", tool_output);
+
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf), "已通过 MQTT Mesh 下发命令：%s", tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "MQTT Mesh 命令下发失败：%s", tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *msg,
                              char *output, size_t output_size) {
   if (!call || !msg || !msg->content || call->name[0] == '\0') {
@@ -744,9 +890,13 @@ static void agent_loop_task(void *arg) {
     char *final_text = NULL;
     int iteration = 0;
     bool sent_working_status = false;
+    bool mesh_related_tool_seen = false;
     tool_fallback[0] = '\0';
 
-    while (iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
+    try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
+                                           &final_text);
+
+    while (!final_text && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
       /* Send "working" indicator before each API call */
 #if ESPAGENT_AGENT_SEND_WORKING_STATUS
       if (!proactive_turn && !sent_working_status &&
@@ -780,6 +930,14 @@ static void agent_loop_task(void *arg) {
           final_text = strdup(resp.text);
           ESP_LOGI(TAG, "=== CONV === << LLM: %.*s", (int)resp.text_len,
                    resp.text);
+          if (!mesh_related_tool_seen && final_text &&
+              final_text_is_unexecuted_mesh_claim(final_text, &msg)) {
+            ESP_LOGW(TAG,
+                     "LLM claimed Mesh dispatch without a tool call; replacing "
+                     "final response");
+            free(final_text);
+            final_text = strdup("我没有拿到实际的 MQTT Mesh 工具执行结果，不能声称已经下发。请再发一次明确命令，例如：读取温湿度，或：把控制板状态灯设为蓝色。");
+          }
         }
         llm_response_free(&resp);
         break;
@@ -791,6 +949,9 @@ static void agent_loop_task(void *arg) {
         ESP_LOGI(TAG, "=== CONV === << LLM tool[%d]: %s(%s)", ci,
                  resp.calls[ci].name,
                  resp.calls[ci].input ? resp.calls[ci].input : "{}");
+        if (is_mesh_related_tool_name(resp.calls[ci].name)) {
+          mesh_related_tool_seen = true;
+        }
       }
 
       /* Append assistant message with content array */

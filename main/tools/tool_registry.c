@@ -261,7 +261,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "mesh_send_command",
-        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use this when the coordinator should route a user request to another ESP32. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. This queues the command; remote execution may be dry-run until that role enables command execution.",
+        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use this when the coordinator should route a user request to another ESP32. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote control/status-light requests, use target_role=control_agent with action=set_status_light or ws2812_set and color/RGB args. Do not claim a Mesh command was sent unless this tool returns OK.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"

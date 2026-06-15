@@ -107,8 +107,9 @@ esp32s3-display-01      display_agent      display,timeline,alerts,state,watchdo
 - USB3 `display_agent` 已烧录，串口确认 Display role 周期发布 `state online`。
 - 2026-06-15 联调确认：四个串口 `/dev/ttyUSB0-3` 均可读取，但当前工具环境读串口需要提权；非提权 `/dev` 扫描可能短暂看不到设备。
 - Coordinator 通过飞书自然语言测试已经能把 `读取温湿度` 路由到 `sensor_agent`，把 `点亮WS2812为蓝色` 路由到 `control_agent`。
+- Coordinator 现在对常见飞书 Mesh 指令有确定性路由：普通 `读取温湿度` 直接转 `sensor_agent/read_temperature_humidity`，远程/控制板 WS2812 状态灯颜色请求直接转 `control_agent/set_status_light`，不再完全依赖 LLM 自己选择工具。
 - Sensor 节点当前日志中可见 `DHT22=ESP_ERR_TIMEOUT` 和 `MH-Z19=ESP_FAIL`，表示节点在线但这些具体传感器在当前接线/配置下未读到数据。
-- 当前控制类远程执行仍需补齐 command queue、safety interlock、actuator state 和 result/timeline 审计后再完全开放；sensor 只有 `read_temperature_humidity` 白名单例外。
+- 当前控制类远程执行已支持 WS2812/status-light 白名单验证；更通用的 actuator command queue、safety interlock、actuator state 和 result/timeline 审计仍需继续补齐后再完全开放。
 - 联调用 broker 暂为 `broker.emqx.io:1883`，topic prefix 暂为 `espagent/cube1345`；这是调试配置，不是生产配置。
 - `mesh_send_command` 已加入 LLM tool registry，Coordinator 可以把跨节点请求发布为 MQTT Mesh command。
 - Sensor 角色已补充 `read_temperature_humidity` command 白名单：收到命令后可调用 AHT10/AHT20 工具并发布 `mesh_command_result` 到 events/timeline。
@@ -126,7 +127,7 @@ espagent/agent/timeline
 espagent/alerts
 ```
 
-当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并发布 `mesh_command_result`；其它 node/role command 仍以校验和 dry-run 日志为主，不直接执行硬件动作。Control 角色真正执行前必须补 command queue、鉴权、审计、message_bus/tool_guard 转发和 safety interlock。
+当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并发布 `mesh_command_result`；Control 角色已支持 WS2812/status-light 这类低风险白名单命令并发布结果。其它 node/role command 仍以校验和 dry-run 日志为主，不直接执行硬件动作。Control 角色后续真正开放更多执行器前必须补 command queue、鉴权、审计、message_bus/tool_guard 转发和 safety interlock。
 
 Feishu/LLM 通信板的 MQTT 桥接已经进入可编译状态：
 
@@ -148,7 +149,7 @@ Subagent 状态：
 
 四角色资源占用快照：
 
-- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像；最新验证 app 二进制为 `0x14eb70`，2MB app 分区剩余 `0xb1490`，约 35%。
+- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像；最新验证 app 二进制为 `0x14f790`，2MB app 分区剩余 `0xb0870`，约 34%。
 - Coordinator 是当前最重角色，承担 LLM、Feishu WebSocket、WebSocket server、MQTT、SNTP、cron/proactive、session/context 和临时 subagent。USB0 启动日志显示 PSRAM 约 8MB 可用；完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用。
 - Sensor 当前承担 sensor sampling、environment/presence monitor、MQTT telemetry 和串口 CLI，不运行 LLM/Feishu。
 - Control 当前承担控制边界、MQTT command 接收、本地执行器工具和 boot servo demo，不运行 LLM/Feishu。
@@ -160,6 +161,9 @@ Feishu WebSocket 稳定性状态：
 - 2026-06-15 复现过一次 `feishu_ack` 任务栈溢出：飞书 WebSocket 收到消息后，ACK 小任务因 4KB 栈不足重启 Coordinator。
 - 已新增 `ESPAGENT_FEISHU_ACK_STACK`，当前配置为 8KB，并把 `feishu_ack` 任务改为使用该配置。
 - 修复后重新烧录 USB0，飞书消息 `测试第一角色修复后是否恢复：请回复收到。` 已正常得到 `ESPAgent is processing your request...` 和 `收到。` 两条回复。
+- 2026-06-15 飞书入口压测又复现过一次 USB0 `Tmr Svc` FreeRTOS timer service 栈溢出。根因方向是 timer callback 中承载了 heartbeat 文件读取和消息注入等重型工作，同时 `CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH=2048` 偏小。
+- 已将 heartbeat timer callback 改为只启动 `heartbeat_worker` task，真正的 SPIFFS 读取和 message_bus 注入在 worker 中执行；同时把 `CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH` 提升到 4096，并写入 `sdkconfig.defaults`。
+- 压测还暴露出 LLM 偶发“口头声称已通过 MQTT Mesh 发送、但没有工具调用”的问题。`agent_loop` 现在会拦截这种假成功回复，并对温湿度和远程/控制板状态灯请求优先走确定性 Mesh 路由。
 
 ## 四角色公共认知
 
@@ -202,24 +206,35 @@ Feishu WebSocket 稳定性状态：
 - `feishu_inbound` 和 `feishu_outbound` MQTT 事件桥接已完成并通过构建。
 - USB0 作为 Coordinator 已验证 MQTT state/events 发布到公网测试 broker。
 - Coordinator 已新增 `mesh_send_command` 工具，可向 `sensor_agent`、`control_agent` 或指定 node 发布标准 MQTT Mesh command。
+- Coordinator 已新增确定性 Mesh 快速路由：飞书中常见的 `读取温湿度` 和远程/控制板 WS2812 状态灯颜色请求会直接生成 `mesh_send_command`，减少 LLM 漏工具调用导致的假成功。
 - UTF-8 safe prompt truncation 已修复，避免 LLM API 因截断中文而返回 HTTP 400。
 - 启动后 SNTP 校时已接入，默认 `ntp.aliyun.com`，`get_current_time` 会优先使用已同步系统时间。
 - 高德 `get_weather` 工具已注册，默认南京市栖霞区。
 
 当前限制：
 
-- 还没有把自然语言任务自动转换成正式 Mesh command。
+- 简单自然语言任务已经能自动转换成正式 Mesh command：普通温湿度读取和远程/控制板 WS2812 状态灯颜色请求已验证。复杂跨节点任务仍需要继续通过 LLM/tool planning 转换。
 - 还没有等待远端 `mesh_command_result`、关联 `command_id` 并把结果主动汇总回复飞书。
 - 还没有完整 tool_use/tool_result timeline。
 - 还没有 role-based tool exposure，Coordinator 仍能看到较多本地工具。
 - MQTT broker 不可达时，事件只能在本地队列中等待，无法被其他节点看到。
-- SNTP/天气修复已通过构建，但还没有在真实 Feishu 消息上完成板端运行验证。
+- SNTP/天气修复已通过构建；天气真实 Feishu 场景仍需单独板端验证。
 
 下一步：
 
 - 将 LLM 产出的跨节点动作转为 `espagent_mesh_command_t`。
 - 对 dispatch 结果增加 command_id、target_role、safety_level、ttl_ms。
 - 把天气、时间、主动提醒结果同步到 timeline，供 Display Agent 展示。
+
+四板压力验证：
+
+- `tools/flash_roles_usb0_3.sh` 固定只烧录 `/dev/ttyUSB0-3`，不使用 `/dev/ttyACM*`。
+- `tools/stress_mesh_usb0_3.py` 固定只测试 `/dev/ttyUSB0-3`，先确认四板 `config_show` role，再由 USB0 连续发送 `mesh_send_command`，并监视 USB1/USB2/USB3 日志。
+- 2026-06-15 基线测试 `--rounds 5 --interval 6 --settle 40 --quiet` 通过：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃。
+- 2026-06-15 突发测试 `--rounds 5 --interval 1.5 --settle 60 --quiet` 通过：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃。
+- 2026-06-15 飞书入口压力测试 `tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet` 通过：飞书发送 4/4，USB1 sensor 接收/执行 2/2，USB2 control 接收/执行 2/2，`mesh_command_result_lines=8`，0 崩溃；日志在 `artifacts/feishu_stress/feishu_stress_205412_ttyUSB*.log`。
+- 压测中出现的 AHT10/DHT22/MH-Z19 错误来自当前物理传感器未接入或不可用，不代表 MQTT Mesh 链路失败。
+- Display role 当前可确认 profile 与 state 在线；完整 timeline 订阅、缓存和可视化仍未完成。
 
 ### Sensor Agent
 
@@ -569,6 +584,17 @@ ESPAgent/
 | `spiffs_data/memory/MEMORY.md` | 长期记忆初始文件。 |
 | `spiffs_data/skills/*.md` | skills，运行时由 `skill_loader` 汇总进 prompt。 |
 
+当前运行时 skills 已覆盖：
+
+- `weather.md`: 天气请求优先使用高德 `get_weather`。
+- `proactive-care.md`: 定时天气、主动关心、daily briefing。
+- `agent-cache-engineering.md` / `esp32-kv-cache.md`: prompt/cache/KV cache 边界和优化。
+- `gpio-control.md`: GPIO 安全控制指导。
+- `agent-mesh-coordination.md`: 四角色自然语言路由，避免让用户手填 MQTT node id。
+- `mqtt-mesh-operations.md`: MQTT Mesh topic、command/result、开发与生产安全边界。
+- `mcu-edge-ai-boundaries.md`: MCU 端 AI 能力边界，明确当前不是 ESP32-S3 本地 LLM。
+- `mesh-resource-planning.md`: 四块 ESP32-S3 的资源使用方向和后续补强路径。
+
 运行期还会使用：
 
 - `/spiffs/memory/<YYYY-MM-DD>.md`: daily notes。
@@ -711,15 +737,20 @@ Flash 配置为 16MB，自定义分区表：
 - Agent Mesh Phase 1：node identity、capabilities、responsibilities、MQTT state/telemetry/event、node/role command topic。
 - 四 ESP32 role profile 文档：coordinator、sensor、control、display。
 - Agent Mesh Phase 1.5：新增 `main/mesh` 协议层、`main/roles` 角色服务骨架，并让 `espagent_app` 根据 role/capability 选择性启动 LLM/聊天、scheduler、sensor monitor、control demo、display 边界服务。
-- MQTT node/role command 已接入 `mesh_protocol` 做 JSON schema 解析、`action` 必填校验、`target_node`/`target_role` 匹配校验；除 Sensor `read_temperature_humidity` 白名单外，当前仍是 dry-run 日志，不执行硬件动作。
+- MQTT node/role command 已接入 `mesh_protocol` 做 JSON schema 解析、`action` 必填校验、`target_node`/`target_role` 匹配校验；Sensor `read_temperature_humidity` 和 Control WS2812/status-light 已有白名单执行路径，其它命令当前仍是 dry-run 日志，不执行硬件动作。
 - Feishu 通信板 MQTT 桥接已完成第一版：`feishu_inbound` 发布到 node events、`agent/dispatch`、`agent/timeline`，`feishu_outbound` 发布到 node events 和 `agent/timeline`；MQTT queue 支持连接前事件暂存，MQTT packet remaining length 解析已修正。
 - Coordinator 已注册 `mesh_send_command` 工具，可向指定 node 或 role 发布标准 MQTT Mesh command。
+- Coordinator 已加入确定性 Mesh 路由和假成功保护：常见温湿度/控制板状态灯飞书请求会直接下发 MQTT Mesh；如果本轮没有实际 Mesh/routed tool 执行，固件不会允许最终回复声称“已发送”。
 - Sensor 角色已支持白名单 `read_temperature_humidity` Mesh command，并将 AHT10/AHT20 执行结果发布为 `mesh_command_result` 到本节点 events 和全局 timeline。
+- Control 角色已支持 WS2812/status-light 白名单 Mesh command，并将执行结果发布为 `mesh_command_result` 到本节点 events 和全局 timeline。
+- 新增 Agent Mesh / MCU edge AI 运行时 skills：`agent-mesh-coordination.md`、`mqtt-mesh-operations.md`、`mcu-edge-ai-boundaries.md`、`mesh-resource-planning.md`。这些文件把联网调研得到的边界固化进运行时 prompt：角色化 Agent Mesh 调度、MQTT pub/sub 协作、MCU 端 TinyML/小模型推理方向、以及“当前 ESP32-S3 不运行本地完整 LLM”的能力边界。
 - Feishu 通信板时间同步已补齐：Wi-Fi 连接后启动 SNTP 校时，`get_current_time` 不再优先依赖 Google Date 头；天气工具仍使用高德 `get_weather`，默认南京市栖霞区。
 - 本地私有配置当前已设置为 Feishu/LLM 入口板：`esp32s3-coordinator-01` / `coordinator_agent` / `coordinator,communication,llm,dispatch,timeline,alerts`。
 - 已烧录 coordinator 固件到 `/dev/ttyUSB0`，目标 ESP32-S3 MAC 为 `14:c1:9f:2d:76:20`；串口日志确认 Feishu、LLM、agent_loop 和 coordinator role 均启动，本地 sensor monitor 与 boot servo demo 已按角色跳过。
 - 已修复飞书消息统一回复 `抱歉，我这次处理请求时遇到了错误。` 的根因：system prompt 旧 16KB buffer 被截断到 UTF-8 多字节字符中间，导致 OpenAI-compatible LLM API 返回 HTTP 400 `invalid unicode code point`。现在 prompt buffer 为 24KB，`context_builder` 和 `agent_loop` 都做 UTF-8-safe truncation。
 - 修复后已烧录并通过串口 `inject_msg system debug hello` 验证：LLM API 正常返回，最终回复成功进入 outbound。
+- 已修复飞书入口压测中的 `Tmr Svc` 栈溢出：heartbeat timer callback 不再直接读 SPIFFS/注入消息，而是启动 `heartbeat_worker`；FreeRTOS timer service task stack 提升到 4096。
+- 已完成飞书入口 2 轮压力测试：`tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet`，飞书发送 4/4，sensor 2/2，control 2/2，0 崩溃，结果 `PASS`。
 - GitHub 远端：
   - HTTPS: `https://github.com/cube1345/ESP32_AgentMesh.git`
   - SSH: `git@github.com:cube1345/ESP32_AgentMesh.git`
@@ -730,11 +761,11 @@ Flash 配置为 16MB，自定义分区表：
 ## 当前限制
 
 - 当前仍是单 ESP32-S3 的单 `agent_loop`，不是完整多 Agent 运行时。
-- MQTT command 现在已做基础 schema/目标校验；除 Sensor `read_temperature_humidity` 白名单外，dispatch 仍只打印日志，不执行硬件动作。
-- Sensor 角色只有 `read_temperature_humidity` 白名单执行路径；Control 角色仍不会从 MQTT command 直接执行硬件动作。
+- MQTT command 现在已做基础 schema/目标校验；Sensor `read_temperature_humidity` 和 Control WS2812/status-light 已有白名单执行路径，其它 dispatch 仍只打印日志，不执行硬件动作。
+- Sensor 角色目前只有 `read_temperature_humidity` 白名单执行路径；Control 角色目前只开放 WS2812/status-light 这类低风险白名单执行路径。
 - 还没有 MQTT command queue、鉴权、审计事件、结果关联和完整安全执行链路。
 - 还没有根据 role 自动裁剪工具列表。
-- Coordinator 现在会把 Feishu 入站广播到 `agent/dispatch`，但还没有把自然语言任务转成面向 sensor/control/display 节点的正式 Mesh command。
+- Coordinator 现在会把 Feishu 入站广播到 `agent/dispatch`，并且能把普通温湿度读取、远程/控制板状态灯颜色请求转成正式 Mesh command；复杂自然语言任务的通用 Mesh planning 仍未完成。
 - timeline topic 已有 Feishu inbound/outbound 基础事件，但还没有完整 tool_use/tool_result 流。
 - Memory 写入依赖模型主动调用文件工具，没有固件侧强制 consolidation。
 - session 只保存最终对话，不保存完整 tool_use/tool_result 轨迹。
@@ -764,6 +795,7 @@ Flash 配置为 16MB，自定义分区表：
 
 - MCP Gateway：数据库、知识库、Home Assistant、云服务。
 - Memory Agent：长期记忆压缩、用户偏好、skills 管理。
+- MCU edge AI：评估 TinyML / LiteRT Micro / ESP-DL / ESP-SR 类小模型路径，只在模型文件、驱动、工具 schema 和资源预算明确后再声明为已实现能力。
 - Android App：移动查看、调试、控制、调度时间线展示。
 - ESP32-P4 中控屏：现场可视化和触控操作。
 - 多节点策略：传感器冗余、控制器仲裁、异常告警。
