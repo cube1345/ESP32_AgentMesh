@@ -757,6 +757,8 @@ Flash 配置为 16MB，自定义分区表：
   - 仓库可见性：private
   - 当前项目已重新以 `ESP32_AgentMesh` 私有仓库承载，保留 ESPAgent 固件名称和 Agent Mesh 代码架构。
   - `main` 已推送；初始固件快照提交为 `b6cae3f`（`Initialize ESP32 AgentMesh firmware`）。
+  - Feishu 入口 Mesh 压测修复、确定性 Mesh 路由、压测脚本、skills 和文档更新已推送到 `main`：`dbe3c41`（`Stabilize Feishu mesh pressure path`）。
+  - 本地 `artifacts/` 仅保存压测串口日志，未纳入远程提交。
 
 ## 当前限制
 

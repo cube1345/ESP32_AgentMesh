@@ -41,6 +41,7 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
   - SSH: `git@github.com:cube1345/ESP32_AgentMesh.git`
   - Visibility: private
   - Initial firmware snapshot commit: `b6cae3f` (`Initialize ESP32 AgentMesh firmware`)
+  - Latest pushed main commit after Feishu-entry Mesh stress fixes: `dbe3c41` (`Stabilize Feishu mesh pressure path`)
 - Root `README.md` now defines the project scope, build flow, and repository layout under the ESPAgent name.
 - `docs/ARCHITECTURE.md` uses the current ESPAgent module layout (`main/channels/feishu`, `main/onboard`, `main/espnow`, `main/sensors`, etc.) and no longer contains external-origin mapping tables.
 - `docs/TODO.md` is an ESPAgent roadmap rather than an external comparison tracker.
@@ -254,6 +255,7 @@ Verified on physical boards:
   - `mesh_command_result_lines=8`
   - `crashes=0`, `RESULT: PASS`
   - Artifacts were saved under `artifacts/feishu_stress/feishu_stress_205412_ttyUSB*.log`.
+- The Feishu-entry Mesh stress fix and documentation update were pushed to private GitHub `main` as commit `dbe3c41` (`Stabilize Feishu mesh pressure path`).
 - `/dev/ttyUSB1` currently logs `DHT22=ESP_ERR_TIMEOUT` and `MH-Z19=ESP_FAIL`; this means the sensor node is online, but those specific physical sensors are not currently returning data on the configured pins.
 - On 2026-06-15, USB0 was reflashed with the current coordinator firmware containing `spawn_subagent`.
 - USB0 boot log verified `Registered tool: spawn_subagent`, `Tools JSON built (26 tools)`, and `Subagent tools JSON built`.
