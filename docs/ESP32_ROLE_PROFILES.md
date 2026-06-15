@@ -8,7 +8,7 @@
 - 每块板通过 `main/espagent_secrets.h` 设置不同的 `NODE_ID`、`NODE_ROLE`、`NODE_CAPABILITIES` 和 `NODE_RESPONSIBILITIES`。
 - MQTT state/telemetry/event payload 会带上这些字段。
 - 每块板会订阅自己的节点命令 topic 和角色命令 topic。
-- 远程 command 当前已经有基础 schema/目标校验；Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并回传 `mesh_command_result`，Control 等其它硬件动作仍不直接执行。真正开放控制前必须接入 command queue、message_bus、schema 校验、tool_guard 和 safety interlock。
+- 远程 command 当前已经有基础 schema/目标校验；Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并回传 `mesh_command_result`。Control 角色对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write` 已有低/中安全级直接执行路径，但这仍是联调路径；真正作为生产控制链路前必须接入 command queue、message_bus、schema 校验、tool_guard 和 safety interlock。
 
 ## 当前板端进度
 
@@ -166,7 +166,7 @@ espagent/roles/control_agent/command
 - `main/roles/coordinator_node.c/.h`、`sensor_node.c/.h`、`control_node.c/.h`、`display_node.c/.h` 已作为四类职责入口接入启动流程。
 - `main/app/espagent_app.c` 已根据 role/capability 选择性启动 LLM/聊天入口、scheduler/proactive、sensor monitor、control boot demo、display 边界服务。
 - `main/mesh/mesh_types.h` 和 `main/mesh/mesh_protocol.c/.h` 已定义 Mesh command 类型，并解析/校验 MQTT command。
-- MQTT node/role command 现在会进入 `mesh_protocol` 校验 `action`、`target_node`、`target_role`；除 Sensor `read_temperature_humidity` 白名单外，仍保持 dry-run，不执行硬件。
+- MQTT node/role command 现在会进入 `mesh_protocol` 校验 `action`、`target_node`、`target_role`；Sensor `read_temperature_humidity` 已有白名单执行路径；Control 对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write` 已有直接执行路径，但还没有 command queue、鉴权、审计和 safety interlock。
 - Feishu 通信板 MQTT 桥接已完成第一版：
   - `feishu_inbound` 发布到 `espagent/nodes/<coordinator_id>/events`、`espagent/agent/dispatch`、`espagent/agent/timeline`。
   - `feishu_outbound` 发布到 `espagent/nodes/<coordinator_id>/events`、`espagent/agent/timeline`。
@@ -187,12 +187,27 @@ espagent/roles/control_agent/command
 
 目标不是让四块板都跑同样的满功能固件，而是让每块 ESP32-S3 吃满自己擅长的硬件资源。
 
+当前需要分清“固件体积”和“运行时启用服务”：
+
+- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；最新 USB0 验证构建 `ESPAgent.bin` 为 `0x14eb70`，2MB app 分区剩余 `0xb1490`，约 35%。
+- 运行时已经按 role/capability 裁剪服务。Coordinator 最重，Sensor/Control 中等，Display 目前最轻。
+- USB0 Coordinator 启动日志显示 PSRAM 约 8MB 可用，完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用；说明当前并未真正把硬件资源吃满。
+
 | 节点 | 资源侧重点 | 不建议承担 |
 |------|------------|------------|
 | `coordinator_agent` | LLM HTTPS、Feishu/WebSocket、JSON 解析、session/context、dispatch/timeline | 长周期传感器采样、高风险执行器直控 |
 | `sensor_agent` | I2C/UART/GPIO 采样、滤波、短期缓存、MQTT/ESP-NOW telemetry | LLM、用户聊天入口、继电器/电机控制 |
 | `control_agent` | GPIO、PWM、I2S、继电器、舵机、RGB、动作队列、安全互锁 | 任务理解、天气搜索、跨节点规划 |
 | `display_agent` | 屏幕/状态灯、PSRAM buffer、timeline cache、alerts/watchdog | 主 LLM、重型采样、危险控制 |
+
+当前实际资源利用判断：
+
+| 节点 | 当前实际启用 | 当前资源饱和度 |
+|------|--------------|----------------|
+| `coordinator_agent` | LLM、Feishu、WebSocket、MQTT、SNTP、cron/proactive、session/context、临时 subagent | 四者中最高，但仍有较大 PSRAM/Flash 余量 |
+| `sensor_agent` | sensor sampling、environment/presence monitor、MQTT telemetry、serial CLI | 中等，尚缺 sensor cache、滤波统计、阈值事件 |
+| `control_agent` | control boundary、MQTT command receiver、本地 actuator tools、boot servo demo | 中等偏低，尚缺 command queue、safety interlock、actuator_state |
+| `display_agent` | display/state/watchdog boundary、MQTT state/events/timeline/alerts 订阅 | 最低，尚缺真实屏幕 UI、timeline store、watchdog 聚合 |
 
 当前 profile 已经不只是声明能力：`espagent_app` 会根据 role/capability 选择性启动服务。推荐结构仍继续保持：
 

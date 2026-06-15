@@ -146,6 +146,15 @@ Subagent 状态：
 - 2026-06-15 已在 USB0 coordinator 板端完成真实验证：烧录当前固件后启动日志显示 `Registered tool: spawn_subagent`、`Tools JSON built (26 tools)`、`Subagent tools JSON built`；串口执行 `tool_exec spawn_subagent {"task":"Call_get_current_time_and_return_one_sentence"}` 后，子代理完成 LLM tool loop，调用 `get_current_time`，并以 `ESP_OK` 返回当前时间。
 - 2026-06-15 同一 USB0 板端也完成主 `agent_loop` ReAct 验证：串口 `inject_msg system react_test 请调用get_current_time并回复当前时间` 触发 `Tool use iteration 1`，模型调用 `get_current_time({})`，工具返回系统时间后第二轮 LLM 生成最终回复。
 
+四角色资源占用快照：
+
+- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像；最新验证 app 二进制为 `0x14eb70`，2MB app 分区剩余 `0xb1490`，约 35%。
+- Coordinator 是当前最重角色，承担 LLM、Feishu WebSocket、WebSocket server、MQTT、SNTP、cron/proactive、session/context 和临时 subagent。USB0 启动日志显示 PSRAM 约 8MB 可用；完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用。
+- Sensor 当前承担 sensor sampling、environment/presence monitor、MQTT telemetry 和串口 CLI，不运行 LLM/Feishu。
+- Control 当前承担控制边界、MQTT command 接收、本地执行器工具和 boot servo demo，不运行 LLM/Feishu。
+- Display 当前承担 display/state/watchdog 边界和 MQTT 订阅，但真实屏幕 UI、timeline store、watchdog 聚合还未实现，是目前最空的角色。
+- 当前状态不是硬件资源完全拉满，而是按角色裁剪服务并保留较大 RAM/PSRAM/Flash 余量，便于继续加入 Sensor cache、Control command queue/safety interlock、Display timeline/UI。
+
 Feishu WebSocket 稳定性状态：
 
 - 2026-06-15 复现过一次 `feishu_ack` 任务栈溢出：飞书 WebSocket 收到消息后，ACK 小任务因 4KB 栈不足重启 Coordinator。

@@ -225,6 +225,13 @@ Verified on physical boards:
   - command: `inject_msg system react_test 请调用get_current_time并回复当前时间`
   - logs showed `Tool use iteration 1`, `LLM tool[0]: get_current_time({})`, `Tool[get_current_time] => 2026-06-15 12:48:18 CST (Monday)`, then final LLM answer
   - final response: `当前时间：**2026年6月15日（星期一）12:48 CST**`
+- Current four-role resource usage snapshot:
+  - Flash is not role-pruned yet. All roles use the same firmware image; latest verified app binary is `0x14eb70`, leaving `0xb1490` bytes free in the 2MB app partition.
+  - USB0 Coordinator is the heaviest runtime role: LLM/Feishu/WebSocket/MQTT/SNTP/cron/proactive plus temporary `subagent`; USB0 boot showed PSRAM around 8MB free at startup and about 8.25MB free after the ReAct validation turn.
+  - USB1 Sensor currently runs sensor sampling, presence/environment monitors, MQTT telemetry, and serial CLI; it does not run LLM or Feishu.
+  - USB2 Control currently runs the control boundary, MQTT command receiver, local control tools, and boot servo demo; it does not run LLM or Feishu.
+  - USB3 Display currently runs the display/state/watchdog boundary and MQTT subscriptions, but still lacks real screen UI, timeline store, and watchdog aggregation, so it is the least utilized role.
+  - Current design is not "hardware fully saturated"; it is role-gated with large RAM/PSRAM/Flash headroom so Sensor cache, Control queue/interlock, and Display timeline/UI can still be added safely.
 
 Still pending:
 
