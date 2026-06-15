@@ -214,6 +214,17 @@ Verified on physical boards:
 - Feishu message `读取温湿度` produced a Coordinator reply saying it had sent a read command to `sensor_agent`.
 - Feishu message `点亮WS2812为蓝色` produced a Coordinator reply saying it had forwarded the command to `control_agent`.
 - `/dev/ttyUSB1` currently logs `DHT22=ESP_ERR_TIMEOUT` and `MH-Z19=ESP_FAIL`; this means the sensor node is online, but those specific physical sensors are not currently returning data on the configured pins.
+- On 2026-06-15, USB0 was reflashed with the current coordinator firmware containing `spawn_subagent`.
+- USB0 boot log verified `Registered tool: spawn_subagent`, `Tools JSON built (26 tools)`, and `Subagent tools JSON built`.
+- USB0 runtime verified `spawn_subagent` through serial CLI:
+  - command: `tool_exec spawn_subagent {"task":"Call_get_current_time_and_return_one_sentence"}`
+  - logs showed `Spawning subagent`, `Subagent started`, `Subagent tool iteration 1`, `Executing tool: get_current_time`, `Subagent done`, and `Subagent completed`
+  - result: `tool_exec status: ESP_OK`
+  - output: `Current time is **Monday, June 15, 2026, 12:47 PM CST**.`
+- USB0 runtime verified the main ReAct loop through serial `inject_msg`:
+  - command: `inject_msg system react_test 请调用get_current_time并回复当前时间`
+  - logs showed `Tool use iteration 1`, `LLM tool[0]: get_current_time({})`, `Tool[get_current_time] => 2026-06-15 12:48:18 CST (Monday)`, then final LLM answer
+  - final response: `当前时间：**2026年6月15日（星期一）12:48 CST**`
 
 Still pending:
 

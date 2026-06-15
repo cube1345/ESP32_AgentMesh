@@ -143,6 +143,8 @@ Subagent 状态：
 - 子代理工具面被严格限制为：`web_search`、`get_weather`、`get_current_time`、`read_file`、`write_file`、`edit_file`、`list_dir`。
 - 子代理不能调用硬件、传感器、GPIO、WS2812、舵机、Mesh command，也不能递归创建子代理。
 - 当前是同步等待模式，超时由 `ESPAGENT_SUBAGENT_TIMEOUT_MS` 控制；后续更合理的 Mesh 版本应演进成 async task_id + `message_bus`/timeline 回注结果。
+- 2026-06-15 已在 USB0 coordinator 板端完成真实验证：烧录当前固件后启动日志显示 `Registered tool: spawn_subagent`、`Tools JSON built (26 tools)`、`Subagent tools JSON built`；串口执行 `tool_exec spawn_subagent {"task":"Call_get_current_time_and_return_one_sentence"}` 后，子代理完成 LLM tool loop，调用 `get_current_time`，并以 `ESP_OK` 返回当前时间。
+- 2026-06-15 同一 USB0 板端也完成主 `agent_loop` ReAct 验证：串口 `inject_msg system react_test 请调用get_current_time并回复当前时间` 触发 `Tool use iteration 1`，模型调用 `get_current_time({})`，工具返回系统时间后第二轮 LLM 生成最终回复。
 
 Feishu WebSocket 稳定性状态：
 
