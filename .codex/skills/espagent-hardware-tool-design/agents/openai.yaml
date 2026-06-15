@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESPAgent Hardware Tools"
+  short_description: "Design AI-callable GPIO, RGB, and sensor tools that map cleanly from chat phrasing."
+  default_prompt: "Use this skill when designing ESPAgent hardware tools, names, schemas, and chat-trigger behavior."

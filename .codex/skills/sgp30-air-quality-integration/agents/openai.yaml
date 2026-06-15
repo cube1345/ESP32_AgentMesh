@@ -1,0 +1,4 @@
+interface:
+  display_name: "SGP30 Air Quality"
+  short_description: "Integrate Sensirion SGP30 reads, CRC handling, warm-up logic, and air-quality tooling."
+  default_prompt: "Use this skill when implementing or debugging SGP30 air-quality sensing on ESP32 or ESPAgent."

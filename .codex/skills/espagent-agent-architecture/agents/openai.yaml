@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESPAgent Architecture"
+  short_description: "Route ESPAgent firmware changes across agent, channels, tools, memory, and startup code."
+  default_prompt: "Use this skill when mapping or extending the ESPAgent ESP32-S3 firmware architecture."

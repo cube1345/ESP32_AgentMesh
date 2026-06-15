@@ -1,0 +1,4 @@
+interface:
+  display_name: "ESP32 IDF I2C Bring-Up"
+  short_description: "Bring up and debug ESP32 or ESP32-S3 I2C peripherals with the ESP-IDF v5 master API."
+  default_prompt: "Use this skill when wiring, probing, or debugging an I2C device on ESP32 with ESP-IDF v5.x."

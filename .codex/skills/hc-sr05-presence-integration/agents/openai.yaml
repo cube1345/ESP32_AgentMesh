@@ -1,0 +1,4 @@
+interface:
+  display_name: "HC-SR05 Presence"
+  short_description: "Bring up HC-SR05 ultrasonic presence sensing on ESP32."
+  default_prompt: "Use $hc-sr05-presence-integration to wire, debug, or expose an HC-SR05 ultrasonic presence sensor."
