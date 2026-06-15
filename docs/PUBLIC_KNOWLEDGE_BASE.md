@@ -712,7 +712,9 @@ Flash 配置为 16MB，自定义分区表：
 - GitHub 远端：
   - HTTPS: `https://github.com/cube1345/ESP32_AgentMesh.git`
   - SSH: `git@github.com:cube1345/ESP32_AgentMesh.git`
+  - 仓库可见性：private
   - 当前项目已重新以 `ESP32_AgentMesh` 私有仓库承载，保留 ESPAgent 固件名称和 Agent Mesh 代码架构。
+  - `main` 已推送，当前提交为 `b6cae3f`（`Initialize ESP32 AgentMesh firmware`）。
 
 ## 当前限制
 
