@@ -19,6 +19,7 @@
 
 #include "espagent_config.h"
 #include "agent/agent_loop.h"
+#include "automation/automation_engine.h"
 #include "bus/message_bus.h"
 #include "cache/cache_store.h"
 #include "channels/feishu/feishu_bot.h"
@@ -35,6 +36,7 @@
 #include "roles/control_node.h"
 #include "roles/coordinator_node.h"
 #include "roles/display_node.h"
+#include "roles/guardian_node.h"
 #include "roles/role_config.h"
 #include "roles/sensor_node.h"
 #include "sensors/sensor_mqtt.h"
@@ -325,6 +327,7 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(tool_registry_init(), TAG, "tool_registry_init failed");
 
     if (espagent_role_runs_scheduler()) {
+        ESP_RETURN_ON_ERROR(automation_engine_init(), TAG, "automation_engine_init failed");
         ESP_RETURN_ON_ERROR(cron_service_init(), TAG, "cron_service_init failed");
         ESP_RETURN_ON_ERROR(heartbeat_init(), TAG, "heartbeat_init failed");
         ESP_RETURN_ON_ERROR(proactive_service_init(), TAG, "proactive_service_init failed");
@@ -342,6 +345,7 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(sensor_node_init(), TAG, "sensor_node_init failed");
     ESP_RETURN_ON_ERROR(control_node_init(), TAG, "control_node_init failed");
     ESP_RETURN_ON_ERROR(display_node_init(), TAG, "display_node_init failed");
+    ESP_RETURN_ON_ERROR(guardian_node_init(), TAG, "guardian_node_init failed");
 
     return ESP_OK;
 }
@@ -437,6 +441,7 @@ esp_err_t espagent_app_start_network_services(void)
     ESP_RETURN_ON_ERROR(sensor_node_start(), TAG, "sensor_node_start failed");
     ESP_RETURN_ON_ERROR(control_node_start(), TAG, "control_node_start failed");
     ESP_RETURN_ON_ERROR(display_node_start(), TAG, "display_node_start failed");
+    ESP_RETURN_ON_ERROR(guardian_node_start(), TAG, "guardian_node_start failed");
 
     if (espagent_role_runs_llm()) {
         ESP_RETURN_ON_ERROR(agent_loop_start(), TAG, "agent_loop_start failed");
@@ -453,6 +458,11 @@ esp_err_t espagent_app_start_network_services(void)
     ESP_RETURN_ON_ERROR(sensor_mqtt_start(), TAG, "sensor_mqtt_start failed");
 
     if (espagent_role_runs_scheduler()) {
+        esp_err_t automation_err = automation_engine_start();
+        if (automation_err != ESP_OK) {
+            ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
+        }
+
         esp_err_t cron_err = cron_service_start();
         if (cron_err != ESP_OK) {
             ESP_LOGW(TAG, "Cron service start failed: %s", esp_err_to_name(cron_err));

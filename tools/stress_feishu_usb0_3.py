@@ -27,7 +27,7 @@ EXPECTED_ROLES = {
     "/dev/ttyUSB0": "coordinator_agent",
     "/dev/ttyUSB1": "sensor_agent",
     "/dev/ttyUSB2": "control_agent",
-    "/dev/ttyUSB3": "display_agent",
+    "/dev/ttyUSB3": "guardian_agent",
 }
 CRASH_PATTERNS = (
     "Guru Meditation",
@@ -69,6 +69,7 @@ class Metrics:
     processing_turns: int = 0
     working_status_sent: int = 0
     final_responses: int = 0
+    async_result_turns: int = 0
     feishu_send_ok: int = 0
     llm_tool_mesh: int = 0
     queued_mesh: int = 0
@@ -284,7 +285,8 @@ def final_metrics(states: dict[int, PortState], sent: list[SentMessage], sensor_
     metrics.feishu_user_seen = sum(1 for tag in all_tags if tag in usb0 and ">> USER" in usb0)
     metrics.processing_turns = count_tags_near(usb0, all_tags, "Processing message from feishu")
     metrics.working_status_sent = usb0.count("Feishu send success") - count_tags_near(usb0, all_tags, "Queue final response")
-    metrics.final_responses = count_tags_near(usb0, all_tags, "Queue final response")
+    metrics.final_responses = usb0.count("Queue final response to feishu:")
+    metrics.async_result_turns = usb0.count("Internal async Mesh result.")
     metrics.feishu_send_ok = usb0.count("Feishu send success")
     metrics.llm_tool_mesh = usb0.count("mesh_send_command")
     metrics.queued_mesh = usb0.count("OK: queued MQTT mesh command")
@@ -327,7 +329,7 @@ def main() -> int:
     try:
         print("===== ESPAgent Feishu-entry pressure test =====")
         print(f"chat_id={args.chat_id}")
-        print("Ports: /dev/ttyUSB0 coordinator, /dev/ttyUSB1 sensor, /dev/ttyUSB2 control, /dev/ttyUSB3 display")
+        print("Ports: /dev/ttyUSB0 coordinator, /dev/ttyUSB1 sensor, /dev/ttyUSB2 control, /dev/ttyUSB3 guardian")
         print("ACM policy: ignored by design")
 
         request_config(states)
@@ -356,7 +358,7 @@ def main() -> int:
         print("===== metrics =====")
         print(f"sent_ok={metrics.sent_ok} sent_failed={metrics.sent_failed} expected_total={expected_total}")
         print(f"feishu_user_seen={metrics.feishu_user_seen} processing_turns={metrics.processing_turns}")
-        print(f"final_responses={metrics.final_responses} feishu_send_ok={metrics.feishu_send_ok}")
+        print(f"final_responses={metrics.final_responses} async_result_turns={metrics.async_result_turns} feishu_send_ok={metrics.feishu_send_ok}")
         print(f"llm_tool_mesh_mentions={metrics.llm_tool_mesh} queued_mesh={metrics.queued_mesh}")
         print(f"sensor_received={metrics.sensor_received} sensor_executed={metrics.sensor_executed} expected={expected_each}")
         print(f"control_received={metrics.control_received} control_executed={metrics.control_executed} expected={expected_each}")
@@ -370,6 +372,7 @@ def main() -> int:
             and metrics.sent_ok == expected_total
             and metrics.processing_turns >= expected_total
             and metrics.final_responses >= expected_total
+            and metrics.async_result_turns >= expected_total
             and metrics.sensor_received >= expected_each
             and metrics.sensor_executed >= expected_each
             and metrics.control_received >= expected_each

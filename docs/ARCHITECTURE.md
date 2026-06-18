@@ -121,14 +121,18 @@ MQTT topics:
 | `espagent/nodes/<node_id>/telemetry` | publish | Sensor telemetry with node metadata when the role has sensor capability |
 | `espagent/nodes/<node_id>/events` | publish | MQTT lifecycle events, Feishu bridge events, and command result events |
 | `espagent/nodes/<node_id>/command` | subscribe | Validates node-targeted Mesh commands through `mesh_protocol`; execution is role-limited |
-| `espagent/roles/<role>/command` | subscribe | Validates role-targeted Mesh commands for coordinator/sensor/control/display groups |
+| `espagent/roles/<role>/command` | subscribe | Validates role-targeted Mesh commands for coordinator/sensor/control/guardian groups |
 | `espagent/agent/dispatch` | subscribe/publish | Coordinator publishes Feishu inbound dispatch events; nodes can observe dispatch messages |
 | `espagent/alerts` | subscribe | Logs alert messages |
-| `espagent/agent/timeline` | publish/subscribe | Receives Feishu inbound/outbound timeline events and sensor `mesh_command_result` events |
+| `espagent/agent/timeline` | publish/subscribe | Receives Feishu inbound/outbound timeline events, ReAct tool events, structured OutputMessages, and Guardian audit inputs |
 
-This is intentionally not a full distributed multi-agent runtime yet. Feishu, WebSocket, cron, proactive checks, and future injected messages still converge on the same message bus and the same serial `agent_loop`. `mesh_send_command` can publish a standard MQTT Mesh command from the Coordinator to a target node or role. Sensor role currently supports the whitelisted `read_temperature_humidity` command and publishes `mesh_command_result`; control-role hardware execution remains disabled until command queue, authorization, safety interlock, audit, and result correlation are implemented.
+This is intentionally not a full distributed multi-agent runtime yet. Feishu, WebSocket, cron, proactive checks, automation callbacks, and injected async results still converge on the same message bus and the same serial `agent_loop`. `mesh_send_command` now publishes `espagent.policy_check.v1` before the real Mesh command, waits for Guardian's `espagent.policy_decision.v1`, and only continues when `decision=allow`; with `require_ack=true` it defaults to async mode, returns an `async_task_id`, waits for the matching structured `espagent.output.v1` OutputMessage in a background task, and injects that result back into `message_bus` for the LLM to summarize. Sensor role currently supports the whitelisted `read_temperature_humidity` command; Control role supports low/medium-risk whitelisted actuator commands and verifies a local cached Guardian allow decision before execution. Guardian also observes timeline events, publishes `espagent.guardian.audit.v1` audit records, and maintains a lightweight StateBoard.
 
-For four ESP32-S3 boards, use the same firmware and assign different node profiles in `espagent_secrets.h`: `coordinator_agent`, `sensor_agent`, `control_agent`, and `display_agent`. See `docs/ESP32_ROLE_PROFILES.md`.
+Persistent automation is the first runtime layer for multi-step and always-on conditional behavior. The LLM creates a deterministic workflow/rule through `automation_create_workflow` or `automation_create_rule`; the firmware stores rules in `/spiffs/automation.json`, and the FreeRTOS `automation` task periodically reads Sensor data through Mesh and triggers Control actions through the same Guardian-gated Mesh path. This is how tasks such as "red now, blue after 10 seconds" or "if humidity is above 40%, set the WS2812 red, otherwise blue" continue without keeping the LLM turn open.
+
+Automation has two execution paths. Condition-action rules are handled by one long-lived `rule_task`, which scans up to `ESPAGENT_AUTOMATION_MAX_RULES` active rules, respects each rule's `interval_s`, `cooldown_s`, and hysteresis, then runs Sensor/Control Mesh calls serially. Ordered/delayed workflows do not run inside `rule_task`: every accepted workflow starts a temporary `workflow_task`, executes up to `ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS` steps in order, then marks itself complete. Current limits are 8 rules, 8 workflow slots, and 8 steps per workflow. Rules are persisted across reboot; workflow tasks are currently one-shot runtime work and are not restored after reboot.
+
+For four ESP32-S3 boards, use the same firmware and assign different node profiles in `espagent_secrets.h`: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`. ESP32-P4/Android carry the display-terminal role. See `docs/ESP32_ROLE_PROFILES.md`.
 
 ---
 
@@ -167,6 +171,10 @@ main/
 │   ├── agent_loop.c        ReAct loop: LLM call → tool execution → repeat
 │   ├── context_builder.h   System prompt + messages builder API
 │   └── context_builder.c   Reads bootstrap files + memory + tool guidance
+│
+├── automation/
+│   ├── automation_engine.h Persistent workflow/rule runtime API
+│   └── automation_engine.c FreeRTOS automation task, rule persistence, Mesh execution
 │
 ├── tools/
 │   ├── tool_registry.h     Tool definition struct, register/dispatch API
@@ -232,7 +240,7 @@ main/
 │
 ├── roles/
 │   ├── role_config.h       Role/capability service-gating API
-│   ├── role_config.c       Coordinator/sensor/control/display runtime policy
+│   ├── role_config.c       Coordinator/sensor/control/guardian/display runtime policy
 │   ├── coordinator_node.c  Coordinator role boundary
 │   ├── sensor_node.c       Sensor role boundary
 │   ├── control_node.c      Control role boundary
@@ -253,7 +261,7 @@ main/
 │
 └── ota/
     ├── ota_manager.h       OTA update API
-    └── ota_manager.c       esp_https_ota wrapper
+    └── ota_manager.c       HTTPS-only esp_https_ota wrapper + partition info
 ```
 
 ---
@@ -265,6 +273,7 @@ main/
 | `feishu_ws`        | 0    | 5        | 12 KB  | Feishu WebSocket receive loop        |
 | `agent_loop`       | 1    | 6        | 12 KB  | Message processing + LLM API call    |
 | `subagent`         | 1    | 5        | 12 KB  | Temporary bounded subagent ReAct loop |
+| `automation`       | 0    | 4        | 12 KB  | Persistent workflow/rule polling and Mesh actions |
 | `outbound`         | 0    | 5        | 8 KB   | Route responses to Feishu / WS     |
 | `proactive`        | any  | 4        | 5 KB   | Periodic proactive agent checks      |
 | `cron`             | any  | 4        | 5 KB   | Scheduled job polling and injection  |
@@ -310,6 +319,16 @@ Offset      Size      Name        Purpose
 
 Total: 16 MB flash.
 
+Current OTA behavior:
+
+- `main/ota/ota_manager.c` uses ESP-IDF `esp_https_ota` with the bundled root CA store.
+- `ota_update` rejects empty URLs and non-HTTPS URLs.
+- The target URL must be an app image such as `ESPAgent.bin`, not a full flash image.
+- The current trigger surface is Serial CLI only: `ota_info` and `ota_update <HTTPS_BIN_URL>`.
+- The Agent does not write firmware source code or compile firmware on the MCU. OTA is an operations path: a developer or CI prepares `ESPAgent.bin`, then the device downloads and installs it.
+- Future Agent-driven OTA should be treated as orchestration only: version discovery, role matching, Guardian approval, human confirmation, command dispatch, reboot observation, and health reporting.
+- Four S3 roles currently use the same firmware image with build-time profile in `espagent_secrets.h`; OTAing a generic image can change that role profile unless the uploaded `.bin` was built for the intended role. A future improvement is to move role identity to NVS so one app image can update all roles safely.
+
 ---
 
 ## Storage Layout (SPIFFS)
@@ -323,6 +342,7 @@ SPIFFS is a flat filesystem — no real directories. Files use path-like names.
 /spiffs/memory/2026-02-05.md    Daily notes (one file per day)
 /spiffs/sessions/session_<fnv64>.jsonl Session history (hash of channel chat id)
 /spiffs/cron.json               Persistent scheduled jobs
+/spiffs/automation.json         Persistent automation workflows/rules
 ```
 
 Session files are JSONL (one JSON object per line):
@@ -489,6 +509,7 @@ app_main()
   ├── [if coordinator/llm]
   │   └── llm_proxy_init()          Load API key + model from build-time secrets
   ├── tool_registry_init()          Register tools, build tools JSON
+  ├── automation_engine_init()      Load /spiffs/automation.json rules
   ├── [if coordinator/scheduler]
   │   ├── cron_service_init()
   │   ├── heartbeat_init()
@@ -517,6 +538,7 @@ app_main()
       ├── control_node_start()
       ├── display_node_start()
       ├── [if coordinator/llm] agent_loop_start()
+      ├── automation_engine_start()
       ├── [if coordinator/communication] feishu_bot_start()
       ├── sensor_mqtt_start()       Mesh MQTT state/event/telemetry for all roles
       ├── [if coordinator/scheduler]
@@ -542,8 +564,36 @@ The CLI provides debug and maintenance commands only. All configuration is done 
 | `session_list`                 | List all session files               |
 | `session_clear <CHAT_ID>`      | Delete a session file                |
 | `heap_info`                    | Show internal + PSRAM free bytes     |
+| `ota_info`                     | Show running, boot, and next OTA partitions |
+| `ota_update <HTTPS_BIN_URL>`   | Download HTTPS app `.bin`, write inactive OTA slot, reboot on success |
 | `restart`                      | Reboot the device                    |
 | `help`                         | List all available commands           |
+
+OTA is currently a local maintenance capability only. It is not registered as an LLM tool and should not be exposed through Feishu until it is gated by Guardian policy, explicit human confirmation, image provenance checks, and role/profile handling.
+
+The intended higher-level OTA flow is:
+
+```text
+developer/CI builds ESPAgent.bin
+        |
+        v
+publish firmware + manifest
+        |
+        v
+Coordinator compares node versions and roles
+        |
+        v
+Guardian checks source, role, version, and risk
+        |
+        v
+user confirms
+        |
+        v
+target ESP32 downloads and applies OTA
+        |
+        v
+node reboots, reports version and health
+```
 
 ---
 

@@ -10,3 +10,10 @@
  * @return ESP_OK on success (device will reboot), error code otherwise
  */
 esp_err_t ota_update_from_url(const char *url);
+
+/**
+ * Print current OTA partition state to the serial console/log.
+ *
+ * @return ESP_OK when partition metadata can be queried
+ */
+esp_err_t ota_print_info(void);

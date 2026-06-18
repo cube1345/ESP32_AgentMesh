@@ -24,7 +24,7 @@ EXPECTED_ROLES = {
     "/dev/ttyUSB0": "coordinator_agent",
     "/dev/ttyUSB1": "sensor_agent",
     "/dev/ttyUSB2": "control_agent",
-    "/dev/ttyUSB3": "display_agent",
+    "/dev/ttyUSB3": "guardian_agent",
 }
 CRASH_PATTERNS = (
     "Guru Meditation",
@@ -59,6 +59,9 @@ class Metrics:
     control_received: int = 0
     control_executed: int = 0
     command_results: int = 0
+    policy_checks: int = 0
+    policy_decisions: int = 0
+    guardian_audits: int = 0
     mqtt_state: int = 0
     mqtt_inbound: int = 0
     crashes: int = 0
@@ -172,6 +175,14 @@ def classify_line(state: PortState, line: str, metrics: Metrics) -> None:
         metrics.control_received += 1
     if "Mesh control command executed" in line:
         metrics.control_executed += 1
+    if "Policy check received" in line:
+        metrics.policy_checks += 1
+        metrics.mqtt_inbound += 1
+    if "Guardian policy decision:" in line:
+        metrics.policy_decisions += 1
+        metrics.mqtt_inbound += 1
+    if "Guardian audited timeline event:" in line:
+        metrics.guardian_audits += 1
     if "mesh_command_result" in line:
         metrics.command_results += 1
     if "MQTT publish" in line and "/state:" in line:
@@ -252,6 +263,10 @@ def final_metrics(states: dict[int, PortState], rounds: int, live: Metrics) -> M
     result.sensor_executed = count_ids_near_marker(usb1, "stress-sensor", rounds, "Mesh sensor command executed")
     result.control_received = count_ids_near_marker(usb2, "stress-control", rounds, "Mesh role command received for control_agent")
     result.control_executed = count_ids_near_marker(usb2, "stress-control", rounds, "Mesh control command executed")
+    usb3 = next(s for s in states.values() if s.port == "/dev/ttyUSB3").text
+    result.policy_checks = usb3.count("Policy check received")
+    result.policy_decisions = usb3.count("Guardian policy decision:")
+    result.guardian_audits = usb3.count("Guardian audited timeline event:")
     result.command_results = all_text.count("mesh_command_result")
     result.mqtt_state = all_text.count('"state":"online"')
     result.mqtt_inbound = all_text.count("MQTT inbound") + all_text.count("Mesh dispatch received") + all_text.count("Mesh alert received")
@@ -290,7 +305,7 @@ def main() -> int:
     metrics = Metrics()
     try:
         print("===== ESPAgent USB0-USB3 Mesh pressure test =====")
-        print("Ports: /dev/ttyUSB0 coordinator, /dev/ttyUSB1 sensor, /dev/ttyUSB2 control, /dev/ttyUSB3 display")
+        print("Ports: /dev/ttyUSB0 coordinator, /dev/ttyUSB1 sensor, /dev/ttyUSB2 control, /dev/ttyUSB3 guardian")
         print("ACM policy: ignored by design")
 
         request_config(states)
@@ -317,6 +332,7 @@ def main() -> int:
         print(f"queued_ok={metrics.queued_ok} queued_error={metrics.queued_error}")
         print(f"sensor_received={metrics.sensor_received} sensor_executed={metrics.sensor_executed} expected={expected_each}")
         print(f"control_received={metrics.control_received} control_executed={metrics.control_executed} expected={expected_each}")
+        print(f"policy_checks={metrics.policy_checks} policy_decisions={metrics.policy_decisions} guardian_audits={metrics.guardian_audits}")
         print(f"mesh_command_result_lines={metrics.command_results}")
         print(f"mqtt_state_lines={metrics.mqtt_state} mqtt_inbound_lines={metrics.mqtt_inbound}")
         print(f"warnings={metrics.warnings} errors={metrics.errors} crashes={metrics.crashes}")
@@ -329,6 +345,9 @@ def main() -> int:
             and metrics.sensor_executed >= expected_each
             and metrics.control_received >= expected_each
             and metrics.control_executed >= expected_each
+            and metrics.policy_checks >= len(commands)
+            and metrics.policy_decisions >= len(commands)
+            and metrics.guardian_audits >= len(commands)
             and metrics.crashes == 0
         )
         print("RESULT:", "PASS" if pass_basic else "FAIL")

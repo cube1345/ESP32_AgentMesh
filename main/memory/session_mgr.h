@@ -17,6 +17,15 @@ esp_err_t session_mgr_init(void);
 esp_err_t session_append(const char *chat_id, const char *role, const char *content);
 
 /**
+ * Append a structured trace event to a per-session trace file.
+ * Trace events are not loaded into LLM chat history.
+ */
+esp_err_t session_append_trace(const char *chat_id,
+                               const char *event_type,
+                               const char *summary,
+                               const char *raw_json);
+
+/**
  * Load session history as a JSON array string suitable for LLM messages.
  * Returns the last max_msgs messages as:
  * [{"role":"user","content":"..."},{"role":"assistant","content":"..."},...]

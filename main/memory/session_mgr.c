@@ -39,6 +39,20 @@ static void session_path(const char *chat_id, char *buf, size_t size)
     }
 }
 
+static void session_trace_path(const char *chat_id, char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return;
+    }
+
+    uint64_t hash = session_hash_chat_id(chat_id);
+    int n = snprintf(buf, size, "%s/trace_%016" PRIx64 ".jsonl",
+                     ESPAGENT_SPIFFS_SESSION_DIR, hash);
+    if (n < 0 || (size_t)n >= size) {
+        buf[0] = '\0';
+    }
+}
+
 static bool session_legacy_chat_id_is_safe(const char *chat_id)
 {
     if (!chat_id || chat_id[0] == '\0') {
@@ -100,6 +114,55 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
     cJSON *obj = cJSON_CreateObject();
     cJSON_AddStringToObject(obj, "role", role);
     cJSON_AddStringToObject(obj, "content", content);
+    cJSON_AddNumberToObject(obj, "ts", (double)time(NULL));
+
+    char *line = cJSON_PrintUnformatted(obj);
+    cJSON_Delete(obj);
+
+    if (line) {
+        fprintf(f, "%s\n", line);
+        free(line);
+    }
+
+    fclose(f);
+    return ESP_OK;
+}
+
+esp_err_t session_append_trace(const char *chat_id,
+                               const char *event_type,
+                               const char *summary,
+                               const char *raw_json)
+{
+    char path[128];
+    session_trace_path(chat_id, path, sizeof(path));
+    if (path[0] == '\0') {
+        ESP_LOGE(TAG, "Cannot build trace path");
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(path, "a");
+    if (!f) {
+        ESP_LOGE(TAG, "Cannot open trace file %s", path);
+        return ESP_FAIL;
+    }
+
+    cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(obj, "type", "trace");
+    cJSON_AddStringToObject(obj, "event", event_type ? event_type : "event");
+    cJSON_AddStringToObject(obj, "summary", summary ? summary : "");
+    if (raw_json && raw_json[0]) {
+        cJSON *raw = cJSON_Parse(raw_json);
+        if (raw) {
+            cJSON_AddItemToObject(obj, "raw", raw);
+        } else {
+            cJSON_AddStringToObject(obj, "raw_text", raw_json);
+        }
+    }
     cJSON_AddNumberToObject(obj, "ts", (double)time(NULL));
 
     char *line = cJSON_PrintUnformatted(obj);
@@ -186,8 +249,10 @@ esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, 
         if (cJSON_IsString(role) && cJSON_IsString(content)) {
             cJSON_AddStringToObject(entry, "role", role->valuestring);
             cJSON_AddStringToObject(entry, "content", content->valuestring);
+            cJSON_AddItemToArray(arr, entry);
+        } else {
+            cJSON_Delete(entry);
         }
-        cJSON_AddItemToArray(arr, entry);
     }
 
     /* Cleanup ring buffer */

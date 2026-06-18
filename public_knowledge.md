@@ -1,6 +1,6 @@
 # Public Knowledge
 
-Last updated: 2026-06-15
+Last updated: 2026-06-18
 
 This file is the required shared handoff document for any AI working in this repository.
 
@@ -60,14 +60,15 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
   - `/dev/ttyUSB0`: `esp32s3-coordinator-01`, `coordinator_agent`
   - `/dev/ttyUSB1`: `esp32s3-sensor-01`, `sensor_agent`
   - `/dev/ttyUSB2`: `esp32s3-control-01`, `control_agent`
-  - `/dev/ttyUSB3`: `esp32s3-display-01`, `display_agent`
+  - `/dev/ttyUSB3`: `esp32s3-guardian-01`, `guardian_agent`
+  - `/dev/ttyACM0`: ESP32-P4+C6 Display Terminal project, not an ESP32-S3 role flashing target
 - Current temporary MQTT test broker: `broker.emqx.io:1883`
 - Current temporary MQTT topic prefix: `espagent/cube1345`
 - Serial port used for the Feishu/LLM coordinator board: `/dev/ttyUSB0`
 - Serial monitoring note: this workspace may require elevated serial reads for `/dev/ttyUSB0-3`; non-escalated `/dev` scans can transiently miss the devices even when the host sees them.
 - Four-role flash helper: `tools/flash_roles_usb0_3.sh`
   - Flashes only `/dev/ttyUSB0`, `/dev/ttyUSB1`, `/dev/ttyUSB2`, and `/dev/ttyUSB3` in order.
-  - USB0 -> `coordinator_agent`, USB1 -> `sensor_agent`, USB2 -> `control_agent`, USB3 -> `display_agent`.
+  - USB0 -> `coordinator_agent`, USB1 -> `sensor_agent`, USB2 -> `control_agent`, USB3 -> `guardian_agent`.
   - `/dev/ttyACM*` is intentionally ignored. If one of `/dev/ttyUSB0-3` is missing, treat that board as not detected instead of flashing an ACM port.
   - The script temporarily rewrites `main/espagent_secrets.h` per role, flashes the board, then restores `espagent_secrets.h` to the Coordinator profile.
 - Four-role pressure-test helper: `tools/stress_mesh_usb0_3.py`
@@ -134,7 +135,8 @@ Important for future AI agents:
   - Coordinator / Communication Agent: Feishu, WebSocket, LLM, dispatch, timeline, proactive, time/weather/search
   - Sensor Agent: sensor sampling, telemetry, cache, threshold events
   - Control Agent: actuator command queue, safety interlock, hardware execution
-  - Display / Watchdog Agent: state, telemetry, timeline, alerts, watchdog visualization
+  - Guardian Agent: policy decision, OutputMessage audit, privacy boundary, watchdog/stateboard
+  - ESP32-P4/Android Display Terminal: state, telemetry, timeline, alerts, visualized reasoning and communication trace
 - Time/weather sync for the Feishu coordinator board:
   - Wi-Fi connection now starts SNTP time sync with `ntp.aliyun.com`
   - `get_current_time` prefers the synchronized system clock and only falls back to HTTP Date lookup
@@ -152,6 +154,15 @@ Important for future AI agents:
     - ordinary temperature/humidity requests route directly to `sensor_agent` with action `read_temperature_humidity`
     - remote/control-board status-light requests route directly to `control_agent` with action `set_status_light`
   - The agent loop also blocks final replies that claim an MQTT Mesh command was sent when no Mesh/routed tool was executed in that turn.
+- Automation runtime:
+  - `automation_create_workflow` turns ordered/delayed requests into deterministic Mesh steps, for example "red now, blue after 10 seconds".
+  - `automation_create_rule` persists condition-action rules to `/spiffs/automation.json`.
+  - A FreeRTOS `automation` task polls Sensor data and triggers Control actions through the same Guardian-gated Mesh path, so the condition task can keep running while the user chats about other work.
+  - Condition rules are executed by one long-lived `rule_task`; multiple rules are scanned serially with each rule's own interval, cooldown, and hysteresis.
+  - Multi-step workflows are executed by per-workflow temporary `workflow_task` workers, not by `rule_task`.
+  - Current limits are 8 rules, 8 workflow slots, and 8 steps per workflow.
+  - Rules are persistent across reboot; workflows are currently one-shot runtime tasks and are not restored after reboot.
+  - Current rule lifecycle tools are `automation_list` and `automation_remove`; natural-language pause/resume and a richer rule status board are still pending.
 
 ## Safety Improvement Recently Added
 
@@ -200,7 +211,42 @@ Observed SGP30 sample range during runtime check:
 - eCO2 roughly `400` to `413 ppm`
 - TVOC roughly `0` to `14 ppb`
 
-## Current Progress Snapshot - 2026-06-15
+## Current Progress Snapshot - 2026-06-18
+
+The project is now in the four-S3 Agent Mesh plus ESP32-P4/Android Display Terminal stage.
+
+Implemented and verified since the 2026-06-15 snapshot:
+
+- USB0 remains `esp32s3-coordinator-01` / `coordinator_agent`, handling Feishu, LLM, Mesh dispatch, timeline, policy requests, and automation tool creation.
+- USB1 is `esp32s3-sensor-01` / `sensor_agent`; AHT20 is now physically wired and verified on I2C address `0x38`.
+- USB2 is `esp32s3-control-01` / `control_agent`; it has executed WS2812 status-light commands through the Mesh path.
+- USB3 is now `esp32s3-guardian-01` / `guardian_agent`; the old S3 Display role has been replaced by Guardian because ESP32-P4+C6 and Android carry the display-terminal role.
+- `/dev/ttyACM0` is the ESP32-P4+C6 display terminal. It is not used by S3 flash scripts.
+- AHT20 readings were verified on USB1, with typical serial output around `temperature=27.4 C, humidity=45.2%`.
+- Sensor telemetry now publishes AHT20 JSON on `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`, including `temp`, `humidity`, `sensor:"AHT20"`, and `status`.
+- `read_temperature_humidity` now prefers the AHT20-backed environment read path.
+- `automation_create_workflow`, `automation_create_rule`, `automation_list`, and `automation_remove` are registered tools.
+- Persistent rules are stored at `/spiffs/automation.json`.
+- The `automation` FreeRTOS task runs in the background and polls rules without holding the LLM turn open.
+- A humidity condition rule was verified end-to-end:
+  - rule metric: `humidity_percent`
+  - threshold: `40`
+  - USB1 AHT20 reported humidity around `46.0%`
+  - USB0 automation rule triggered a Mesh control action
+  - Guardian policy allowed the action
+  - USB2 executed `set_status_light`
+  - WS2812 GPIO48 logged red output `rgb=(255,0,0)`
+  - the temporary test rule was removed afterward with `automation_remove`
+- Automation task stack overflow was reproduced and fixed by setting `ESPAGENT_AUTOMATION_STACK` to `12 * 1024` and using that value when creating the `automation` task.
+- ESP32-P4+C6 can subscribe to `nodes/+/telemetry`, so the AHT20 telemetry is now available to the display data stream. The current P4 UI should still be described carefully: MQTT subscribe/connect is verified, but not every Environment Monitor card is proven dynamically bound to live telemetry yet.
+
+Current engineering boundary:
+
+- The Agent does not keep thinking forever to maintain a condition task. The LLM translates the user's request into a stored rule, then firmware runtime executes the rule.
+- This makes background conditions reliable on the MCU, while preserving the Agent's role as planner/interpreter.
+- Natural-language pause/resume/delete for default rules, conflict detection, multi-condition expressions, workflow cancellation/recovery, and a queryable automation status board remain pending.
+
+## Previous Progress Snapshot - 2026-06-15
 
 The project is now in the four-board Coordinator/Sensor/Control/Display bring-up stage.
 
@@ -216,6 +262,9 @@ Implemented and verified in code:
 - MQTT node/role command parsing validates JSON shape, `action`, target node, target role, TTL, safety level, acknowledgement flag, and args payload.
 - Sensor role has a narrow direct execution path for `read_temperature_humidity` and publishes `mesh_command_result`.
 - Control role can be targeted by Coordinator for WS2812/GPIO-style requests; full remote hardware execution still depends on the safe command queue/interlock path.
+- Structured Agent Mesh timeline events are now published on `espagent/cube1345/agent/timeline` for `tool_use`, `tool_result`, `mesh_command_queued`, `mesh_command_result`, `final_reply`, and error paths.
+- ESP32-P4+C6 display terminal work has started in `/home/cube/WorkSpace/ESP/lvgl_traffic_control`: the existing LVGL dashboard now has an `AgentMesh` tab, a bare TCP MQTT subscriber for `timeline/state/telemetry/alerts`, an event queue, a small timeline buffer, node status cards, and final-result display.
+- The P4 display firmware was built and flashed to `/dev/ttyACM0` on 2026-06-15. Final serial validation showed Wi-Fi connected with IP `10.176.79.81`, MQTT connected to `broker.emqx.io:1883`, subscriptions were issued for `agent/timeline`, `nodes/+/state`, `nodes/+/telemetry`, and `alerts`, and the broker accepted the `agent/timeline` subscription with `SUBACK id=1 code=0x00`. A host-side broker loopback test confirmed the topic can be forwarded, but a host-published test timeline message was not observed on the P4 serial receive log during the capture window; P4 receive-log/on-screen timeline refresh still needs continued runtime validation with live S3 traffic.
 - Feishu WebSocket ACK is now asynchronous with an 8KB stack, avoiding the previous `feishu_ack` stack overflow.
 - FreeRTOS timer service stability has been improved by moving heartbeat file/message work out of the timer callback and increasing the timer service stack to 4096.
 - Coordinator now has deterministic Mesh routing for common Feishu commands, so `读取温湿度` and remote/control-board WS2812 status-light requests no longer rely entirely on LLM tool selection.
@@ -281,7 +330,7 @@ Still pending:
 - Serial/MQTT proof that `sensor_agent` publishes a successful real `mesh_command_result` with actual AHT10/AHT20 data after a Feishu request.
 - Serial/MQTT proof that `control_agent` executes the remote WS2812 command on `/dev/ttyUSB2` and publishes the final result event.
 - Coordinator result correlation: wait for `mesh_command_result`, correlate `command_id`, and summarize the remote result back to Feishu.
-- `command_queue`, `safety_interlock`, `actuator_state`, authorization, audit events, and full tool_use/tool_result timeline.
+- `command_queue`, `safety_interlock`, `actuator_state`, authorization, audit events, timeline persistence, richer task-decomposition events, and Coordinator-side result correlation.
 
 Best next engineering step:
 
@@ -329,7 +378,7 @@ Still pending:
 - Coordinator does not yet wait for `mesh_command_result`, correlate `command_id`, and summarize the remote result back to Feishu.
 - Control role is not currently flashed on USB1 after this pass; it remains the third-role target.
 - Control role does not yet have `command_queue`, `safety_interlock`, `actuator_state`, authorization, or audit-driven hardware execution.
-- Full tool_use/tool_result timeline has not yet been implemented.
+- Basic `tool_use`/`tool_result`/final-reply timeline publication is implemented; persistent trace storage, richer task-decomposition events, and physical P4 display validation are still pending.
 
 Best next engineering step:
 
@@ -367,13 +416,41 @@ As of 2026-06-15:
 - GPIO pin allowlist documented in system prompt (prevents LLM hallucination)
 - Build ported to ESP-IDF 6.1-dev (cJSON upstream, fixed wifi_manager)
 - Mesh command publishing: implemented through `mesh_send_command`
-- Four-board role bring-up: `/dev/ttyUSB0-3` map to coordinator, sensor, control, and display roles, and all four have been observed publishing `state online`
+- Four-board role bring-up: `/dev/ttyUSB0-3` map to coordinator, sensor, control, and guardian roles; ESP32-P4/Android now carry the display-terminal role
 - Feishu coordinator runtime: restored after the `feishu_ack` stack fix; P2P bot `咕咕嘎嘎！` replies normally again
 - Natural-language role routing: verified through Feishu for `读取温湿度` -> `sensor_agent` and `点亮WS2812为蓝色` -> `control_agent`
-- Sensor Mesh result path for `read_temperature_humidity`: implemented in code; physical sensor-node boot is verified, but successful real sensor result over MQTT is still pending
-- Coordinator result correlation and Feishu summary of remote command results: not implemented yet
+- Sensor Mesh result path for `read_temperature_humidity`: implemented and verified with real AHT20 readings on USB1
+- Coordinator result correlation and async OutputMessage reinjection: implemented as first version for Mesh results
+- Guardian policy gate and OutputMessage audit: implemented as first version on USB3
+- Automation workflow/rule runtime: implemented; humidity condition rule verified from USB0 -> USB1 AHT20 -> Guardian -> USB2 WS2812
+- ESP32-P4 display data stream: MQTT connect/subscribe verified; full live UI binding still needs more runtime proof
 
 ## Update Log
+
+### 2026-06-18
+
+- Updated current documentation for the post-Guardian four-role layout:
+  - USB0 Coordinator
+  - USB1 Sensor
+  - USB2 Control
+  - USB3 Guardian
+  - ESP32-P4/Android Display Terminal
+- Verified AHT20 on USB1 `sensor_agent`; typical readings are around `27.x C / 45-46%RH`.
+- Updated Sensor telemetry documentation to record AHT20 JSON publishing on `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`.
+- Documented automation runtime:
+  - `automation_create_workflow`
+  - `automation_create_rule`
+  - `automation_list`
+  - `automation_remove`
+  - persistent storage at `/spiffs/automation.json`
+  - background FreeRTOS `automation` task
+- Verified humidity condition automation:
+  - metric `humidity_percent`
+  - threshold `40`
+  - Sensor AHT20 humidity around `46.0%`
+  - Control WS2812 executed red `rgb=(255,0,0)`
+  - temporary test rule removed afterward
+- Fixed and documented the automation task stack issue by using `ESPAGENT_AUTOMATION_STACK = 12 * 1024`.
 
 ### 2026-06-14
 

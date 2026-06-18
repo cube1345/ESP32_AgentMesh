@@ -31,6 +31,15 @@ bool espagent_role_is_display(void)
            espagent_node_has_capability("display");
 }
 
+bool espagent_role_is_guardian(void)
+{
+    return espagent_node_is_role(ESPAGENT_ROLE_GUARDIAN) ||
+           espagent_node_has_capability("guardian") ||
+           espagent_node_has_capability("security") ||
+           espagent_node_has_capability("audit") ||
+           espagent_node_has_capability("privacy");
+}
+
 bool espagent_role_runs_llm(void)
 {
     return espagent_role_is_edge() ||
@@ -69,8 +78,17 @@ bool espagent_role_runs_control_outputs(void)
 
 bool espagent_role_runs_display_outputs(void)
 {
+    if (espagent_role_is_guardian()) {
+        return false;
+    }
     return espagent_role_is_edge() ||
            espagent_role_is_display() ||
            espagent_node_has_capability("state") ||
            espagent_node_has_capability("watchdog");
+}
+
+bool espagent_role_runs_guardian(void)
+{
+    return espagent_role_is_edge() ||
+           espagent_role_is_guardian();
 }

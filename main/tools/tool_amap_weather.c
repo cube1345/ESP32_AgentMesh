@@ -88,10 +88,11 @@ static const char *json_str(cJSON *obj, const char *key)
     return cJSON_IsString(item) ? item->valuestring : "";
 }
 
-static esp_err_t amap_direct_get(const char *path, amap_buf_t *buf)
+static esp_err_t amap_direct_get_scheme(const char *scheme, const char *path,
+                                        amap_buf_t *buf)
 {
     char url[512];
-    snprintf(url, sizeof(url), "https://" AMAP_HOST "%s", path);
+    snprintf(url, sizeof(url), "%s://" AMAP_HOST "%s", scheme, path);
 
     esp_http_client_config_t config = {
         .url = url,
@@ -99,8 +100,10 @@ static esp_err_t amap_direct_get(const char *path, amap_buf_t *buf)
         .user_data = buf,
         .timeout_ms = 15000,
         .buffer_size = 4096,
-        .crt_bundle_attach = esp_crt_bundle_attach,
     };
+    if (strcmp(scheme, "https") == 0) {
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) {
@@ -120,6 +123,22 @@ static esp_err_t amap_direct_get(const char *path, amap_buf_t *buf)
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+static esp_err_t amap_direct_get(const char *path, amap_buf_t *buf)
+{
+    esp_err_t err = amap_direct_get_scheme("https", path, buf);
+    if (err == ESP_OK) {
+        return ESP_OK;
+    }
+
+    if (buf && buf->data && buf->cap > 0) {
+        buf->len = 0;
+        buf->data[0] = '\0';
+    }
+    ESP_LOGW(TAG, "Amap HTTPS request failed (%s), retrying with HTTP fallback",
+             esp_err_to_name(err));
+    return amap_direct_get_scheme("http", path, buf);
 }
 
 static esp_err_t amap_proxy_get(const char *path, amap_buf_t *buf)

@@ -27,7 +27,7 @@
 
 ### [ ] Background Work / Long-running Tasks
 - **Target**: Support background jobs that can run outside the immediate chat turn and inject results back into the message bus.
-- **Current**: Dedicated cron, heartbeat, proactive, sensor monitor, environment monitor, and a bounded `spawn_subagent` worker pattern exist. `cron_add` supports recurring, one-shot, and daily jobs; `proactive_service` can periodically inject an internal self-check. `spawn_subagent` can run one focused research/file/time/weather subtask in a temporary FreeRTOS task, but it is synchronous from the caller's perspective and is not a generic arbitrary background job runner.
+- **Current**: Dedicated cron, heartbeat, proactive, sensor monitor, environment monitor, automation engine, and a bounded `spawn_subagent` worker pattern exist. `cron_add` supports recurring, one-shot, and daily jobs; `proactive_service` can periodically inject an internal self-check. `automation_create_workflow` runs deterministic ordered/delayed Mesh actions in temporary `workflow_task` workers, and `automation_create_rule` persists condition-action rules in `/spiffs/automation.json` for one FreeRTOS `rule_task` to poll Sensor data and trigger Control actions. The current automation limits are 8 rules, 8 workflow slots, and 8 steps per workflow. `spawn_subagent` can run one focused research/file/time/weather subtask in a temporary FreeRTOS task, but it is synchronous from the caller's perspective and is not a generic arbitrary background job runner.
 - **Recommendation**: Use one bounded FreeRTOS worker pattern before adding broader scheduling abstractions.
 
 ### [x] ~~Bounded Subagent Tool~~
@@ -122,8 +122,8 @@
 
 ### [ ] LingShu Agent Mesh Coordinator
 - **Target**: Expand the current ESP32-S3 Edge Agent Node into a multi-node system with Coordinator Agent, Sensor Agent, Control Agent, Memory Agent, Communication Agent, and Display Agent.
-- **Current**: Phase 1.6 is implemented in firmware: node identity and role profile exist; MQTT publishes state/telemetry/events under `espagent/nodes/<node_id>/...`; node/role command topics are subscribed; `main/mesh` parses and validates command JSON; `main/roles` provides coordinator/sensor/control/display service boundaries; `espagent_app` starts LLM/chat, scheduler, sensor monitors, control outputs, and display boundaries according to role/capability. `mesh_send_command` is registered as an LLM-callable Coordinator tool, and `sensor_agent` can execute the whitelisted `read_temperature_humidity` Mesh command and publish `mesh_command_result`. Runtime skills now include Agent Mesh coordination, MQTT Mesh operations, MCU edge AI capability boundaries, and four-role resource planning.
-- **Recommendation**: Implement Coordinator-side `command_id` result correlation and Feishu summary before enabling broader remote control. Keep control-role hardware execution disabled until command queue, authorization, audit events, safety interlock, and message_bus/tool_guard routing are implemented.
+- **Current**: Phase 1.7 is implemented and board-verified in firmware: node identity and role profile exist; MQTT publishes state/telemetry/events under `espagent/nodes/<node_id>/...`; node/role command topics are subscribed; `main/mesh` parses and validates command JSON; `main/roles` provides coordinator/sensor/control/guardian service boundaries; `espagent_app` starts LLM/chat, scheduler, sensor monitors, control outputs, and guardian/display boundaries according to role/capability. `mesh_send_command` is registered as an LLM-callable Coordinator tool, publishes Guardian `policy_check`, defaults to async `async_task_id`, waits for structured `espagent.output.v1` in a background task, and injects the result back through `message_bus`. `sensor_agent` and `control_agent` can execute their whitelisted Mesh commands; Control locally verifies cached Guardian allow decisions before actuator execution. Local tools, remote Mesh results, and final replies now publish structured OutputMessage; session trace JSONL and Guardian StateBoard exist.
+- **Recommendation**: Keep high-risk hardware execution disabled until command queue, authorization/signature checks, human confirmation, richer audit events, safety interlock, and message_bus/tool_guard routing are implemented. Next priority is trace/stateboard queryability and watchdog aggregation for ESP32-P4/Android display.
 
 ### [ ] MCU Edge AI / TinyML Path
 - **Target**: Add optional local inference for small, bounded tasks such as sensor anomaly detection, wake word/command spotting, or low-dimensional classification.
@@ -169,12 +169,15 @@
 - [x] LingShu Agent Mesh Phase 1.5 role-gated startup and command dry-run validation
 - [x] Mesh command publish tool (`mesh_send_command`) for Coordinator-to-node/role MQTT commands
 - [x] Sensor-side whitelisted Mesh command result path for `read_temperature_humidity`
+- [x] AHT20-backed Sensor telemetry path verified on USB1 (`27.x C / 45-46%RH`)
+- [x] Automation workflow/rule tools (`automation_create_workflow`, `automation_create_rule`, `automation_list`, `automation_remove`)
+- [x] Humidity condition automation verified from USB0 -> USB1 AHT20 -> Guardian -> USB2 WS2812
 - [x] Bounded Subagent Tool (`spawn_subagent`) with filtered search/weather/time/file tool access
-- [x] Four-ESP32 role profile configuration (`coordinator_agent`, `sensor_agent`, `control_agent`, `display_agent`)
+- [x] Four-ESP32 role profile configuration (`coordinator_agent`, `sensor_agent`, `control_agent`, `guardian_agent`)
 - [x] WebSocket Gateway (port 18789, JSON protocol)
 - [x] Serial CLI (esp_console, debug/maintenance commands)
 - [x] HTTP CONNECT Proxy (Feishu + LLM API + search APIs via proxy tunnel)
-- [x] OTA Update
+- [x] OTA Update (Serial CLI HTTPS app-bin update; Agent orchestration planned)
 - [x] WiFi Manager (build-time credentials, exponential backoff)
 - [x] SPIFFS storage
 - [x] Build-time config (`espagent_secrets.h`) + runtime NVS override via CLI
@@ -198,9 +201,11 @@
 12. [done] Sensor whitelisted `read_temperature_humidity` command result event
 13. [done] Bounded `spawn_subagent` tool on current `main` architecture
 14. Coordinator result wait/correlation by `command_id` and Feishu summary reply
-15. Flash and verify a real `sensor_agent` board with AHT10/AHT20 over MQTT
-16. Mesh command queue + authorization + safety interlock + actuator state for `control_agent`
-17. Async subagent task_id + `message_bus`/timeline result injection
-18. Full timeline events for tool_use/tool_result/remote result
-19. Other enhancements
+15. [done] Flash and verify a real `sensor_agent` board with AHT20 over MQTT
+16. [done] Add deterministic automation workflow/rule tools for delayed actions and temperature/humidity conditions
+17. Natural-language automation pause/resume/remove, status board, conflict detection, workflow cancellation/recovery, and richer multi-condition rules
+18. Mesh command queue + authorization + safety interlock + actuator state for `control_agent`
+19. Async subagent task_id + `message_bus`/timeline result injection
+20. Full timeline events for tool_use/tool_result/remote result
+21. Other enhancements
 ```

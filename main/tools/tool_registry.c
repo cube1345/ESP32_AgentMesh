@@ -1,6 +1,7 @@
 #include "tool_registry.h"
 
 #include "espagent_config.h"
+#include "tools/tool_automation.h"
 #include "tools/tool_cron.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
@@ -25,7 +26,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 30
+#define MAX_TOOLS 40
 
 static espagent_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -69,6 +70,33 @@ static esp_err_t tool_read_temperature_humidity_execute(const char *input_json,
             "{\"target_role\":\"sensor_agent\",\"action\":\"read_temperature_humidity\",\"args\":{}}",
             output,
             output_size);
+    }
+
+    if (!has_local_diagnostics) {
+        tool_environment_values_t values = {0};
+        char status[96] = {0};
+        esp_err_t env_err = tool_environment_read_values(&values, status, sizeof(status));
+        if (env_err == ESP_OK &&
+            values.temperature_c_x10 != -1 &&
+            values.humidity_percent_x10 != -1) {
+            snprintf(output, output_size,
+                     "OK: AHT20 on SDA=%d SCL=%d addr=0x%02x -> temperature=%.1f C, humidity=%.1f%% [%s]",
+                     ESPAGENT_AHT10_DEFAULT_SDA_GPIO,
+                     ESPAGENT_AHT10_DEFAULT_SCL_GPIO,
+                     ESPAGENT_AHT10_DEFAULT_ADDR,
+                     (double)values.temperature_c_x10 / 10.0,
+                     (double)values.humidity_percent_x10 / 10.0,
+                     status);
+            return ESP_OK;
+        }
+
+        snprintf(output, output_size,
+                 "Error: AHT20 not readable on SDA=%d SCL=%d addr=0x%02x [%s]",
+                 ESPAGENT_AHT10_DEFAULT_SDA_GPIO,
+                 ESPAGENT_AHT10_DEFAULT_SCL_GPIO,
+                 ESPAGENT_AHT10_DEFAULT_ADDR,
+                 status[0] ? status : esp_err_to_name(env_err));
+        return env_err == ESP_OK ? ESP_ERR_NOT_FOUND : env_err;
     }
 
     return tool_aht10_read_temperature_humidity_execute(input_json, output, output_size);
@@ -265,16 +293,74 @@ esp_err_t tool_registry_init(void)
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
-            "\"target_role\":{\"type\":\"string\",\"description\":\"Optional target role such as sensor_agent or control_agent\"},"
-            "\"action\":{\"type\":\"string\",\"description\":\"Command action such as read_temperature_humidity\"},"
+            "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads and control_agent for actuators.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh command action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
-            "\"ttl_ms\":{\"type\":\"integer\",\"description\":\"Command time-to-live in milliseconds, defaults to 30000\"},"
-            "\"safety_level\":{\"type\":\"integer\",\"description\":\"Safety level hint, defaults to 1\"},"
-            "\"require_ack\":{\"type\":\"boolean\",\"description\":\"Whether the remote node should acknowledge, defaults to true\"}},"
-            "\"required\":[\"action\"]}",
+            "\"trace_id\":{\"type\":\"string\",\"description\":\"Optional trace id shared across the user request and downstream OutputMessage\"},"
+            "\"ttl_ms\":{\"type\":\"integer\",\"minimum\":1000,\"maximum\":30000,\"description\":\"Command time-to-live in milliseconds, defaults to 30000\"},"
+            "\"safety_level\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":2,\"description\":\"Safety level hint: 0 low, 1 medium, 2 high; defaults to 1\"},"
+            "\"require_ack\":{\"type\":\"boolean\",\"description\":\"Whether the remote node should acknowledge, defaults to true\"},"
+            "\"async\":{\"type\":\"boolean\",\"description\":\"When true, return immediately and inject the remote OutputMessage later; defaults to true\"}},"
+            "\"required\":[\"action\"],\"additionalProperties\":false}",
         .execute = tool_mesh_send_command_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "automation_create_workflow",
+        .description = "Create and start a deterministic multi-step automation workflow. Use this instead of direct single hardware calls when the user asks for ordered actions, delays, or sequences, such as 'turn red, wait 10 seconds, then turn blue'. Each step is executed by the automation runtime through MQTT Mesh and Guardian policy, so the agent loop is not blocked.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short workflow name\"},"
+            "\"steps\":{\"type\":\"array\",\"description\":\"Ordered delayed mesh actions\","
+            "\"items\":{\"type\":\"object\",\"properties\":{"
+            "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
+            "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
+            "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh action\"},"
+            "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
+            "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
+            "\"required\":[\"action\"]}}},"
+            "\"required\":[\"name\",\"steps\"],\"additionalProperties\":false}",
+        .execute = tool_automation_create_workflow_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "automation_create_rule",
+        .description = "Create a persistent condition-action automation rule. Use this when the user asks for ongoing monitoring or conditional linkage such as 'if temperature is above 35 set the light red, otherwise blue'. The runtime periodically reads sensor_agent telemetry and triggers control_agent actions with cooldown and hysteresis.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short rule name\"},"
+            "\"metric\":{\"type\":\"string\",\"enum\":[\"temperature_c\",\"humidity_percent\"],\"description\":\"Sensor metric to compare; defaults to temperature_c\"},"
+            "\"threshold\":{\"type\":\"number\",\"description\":\"Threshold for above/below branching\"},"
+            "\"interval_s\":{\"type\":\"integer\",\"description\":\"Polling interval in seconds, defaults to 10\"},"
+            "\"cooldown_s\":{\"type\":\"integer\",\"description\":\"Minimum seconds between triggered actions, defaults to 30\"},"
+            "\"hysteresis_c\":{\"type\":\"number\",\"description\":\"Deadband around threshold to prevent flapping; also used for humidity units\"},"
+            "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
+            "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
+            "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
+            "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
+        .execute = tool_automation_create_rule_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "automation_list",
+        .description = "List active workflows and persistent automation rules.",
+        .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
+        .execute = tool_automation_list_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "automation_remove",
+        .description = "Remove an automation workflow or rule by id.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Workflow or rule id returned by automation_list/create\"}},"
+            "\"required\":[\"id\"]}",
+        .execute = tool_automation_remove_execute,
     });
 
     register_tool(&(espagent_tool_t){

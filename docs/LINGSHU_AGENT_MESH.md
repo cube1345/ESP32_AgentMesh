@@ -73,7 +73,12 @@ Phase 1 新增的 Mesh 能力：
 - system prompt 中明确当前设备是 Edge Agent Node。
 - MQTT telemetry/state/event payload 带节点身份、能力和职责。
 - MQTT 订阅 node command、role command、dispatch、timeline、alerts 主题。
-- Sensor 角色对白名单 `read_temperature_humidity` 支持受限执行并发布 `mesh_command_result`。
+- Sensor 角色对白名单 `read_temperature_humidity` 支持受限执行并发布结构化 `espagent.output.v1` OutputMessage。
+- Control 角色对白名单状态灯/WS2812/舵机/GPIO 命令支持低中风险执行并发布结构化 OutputMessage。
+- Coordinator `mesh_send_command` 可以等待相同 `command_id` 的 OutputMessage 并回灌给下一轮 LLM，形成跨节点 ReAct 闭环第一版。
+- Guardian 角色订阅 timeline 并生成 `espagent.guardian.audit.v1` 观察式审计事件。
+- Automation runtime 已支持把自然语言转换为确定性多步 workflow 或持久化 condition-action rule；后台 FreeRTOS task 会周期读取 Sensor 数据并通过 Guardian-gated Mesh 触发 Control 动作。
+- 条件 rule 由一个常驻 `rule_task` 串行扫描执行；多步 workflow 由独立临时 `workflow_task` 执行。当前默认支持 8 条规则、8 个 workflow 槽位、每个 workflow 8 步。
 - Coordinator 可以通过 LLM tool calling 将自然语言请求路由到 `sensor_agent` 或 `control_agent`，用户正常对话时不需要手写 MQTT node id。
 - 串口 `config_show` 展示节点身份和关键 MQTT topic。
 - Feishu WebSocket 接入已修复 ACK 栈溢出问题，当前 Coordinator 能稳定收到飞书消息并回复。
@@ -120,18 +125,18 @@ espagent/alerts
 esp32s3-coordinator-01  coordinator_agent  coordinator,communication,llm,dispatch,timeline,alerts
 esp32s3-sensor-01       sensor_agent       sensor,telemetry,environment,air_quality,light,presence
 esp32s3-control-01      control_agent      control,gpio,rgb,servo,relay,actuator
-esp32s3-display-01      display_agent      display,timeline,alerts,state,watchdog
+esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audit,watchdog,stateboard
 ```
 
 详细配置见 `docs/ESP32_ROLE_PROFILES.md`。
 
-2026-06-15 实物状态：
+2026-06-17 development 推荐状态：
 
 ```text
 /dev/ttyUSB0  esp32s3-coordinator-01  coordinator_agent  Feishu / LLM / dispatch
 /dev/ttyUSB1  esp32s3-sensor-01       sensor_agent       sensing / telemetry
 /dev/ttyUSB2  esp32s3-control-01      control_agent      RGB / GPIO / actuator boundary
-/dev/ttyUSB3  esp32s3-display-01      display_agent      state / timeline / alerts
+/dev/ttyUSB3  esp32s3-guardian-01     guardian_agent     audit / policy / privacy / watchdog
 ```
 
 已验证：
@@ -140,11 +145,13 @@ esp32s3-display-01      display_agent      display,timeline,alerts,state,watchdo
 - 飞书 P2P bot `咕咕嘎嘎！` 已恢复端到端回复。
 - `读取温湿度` 会被 Coordinator 路由到 `sensor_agent`。
 - `点亮WS2812为蓝色` 会被 Coordinator 路由到 `control_agent`。
+- USB1 `sensor_agent` 已实测 AHT20，典型读数 `27.x C / 45-46%RH`，并已发布到 `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`。
+- 湿度条件联动已验证：USB0 后台 automation rule 读取 USB1 AHT20 湿度，判断 `humidity_percent > 40` 后经 Guardian 放行，由 USB2 点亮 WS2812 红色。
 
 仍需补充的验证：
 
-- 抓取 USB0 发布 MQTT command、USB1/USB2 接收 command、下游发布 `mesh_command_result` 的完整串口证据。
-- Control 角色真实执行远程硬件动作前，还需要 command queue、safety interlock、actuator state 和审计事件。
+- 抓取 USB0 发布 MQTT command、USB1/USB2 接收 command、下游发布 OutputMessage、USB3 Guardian 发布 audit 的完整串口证据。
+- Control 角色已经能执行低/中风险白名单动作；更高风险或长期运行的执行器动作前，还需要 command queue、safety interlock、actuator state 和更完整审计事件。
 
 ### 控制层
 
@@ -228,10 +235,11 @@ Display Agent 展示完整调度时间线
 
 - 当前固件不是完整多 Agent 系统，只有一个 ESP32-S3 `agent_loop`。
 - MQTT 使用裸 TCP MQTT 实现，尚未实现 TLS、认证、retain、QoS 完整语义。
-- MQTT command/dispatch 当前仍以受限能力为主：Sensor `read_temperature_humidity` 是白名单执行路径，Control 远程硬件执行仍需安全链路完成后再开放。
+- MQTT command/dispatch 当前仍以受限能力为主：Sensor `read_temperature_humidity` 是白名单执行路径，Control 已开放 WS2812/status-light/servo/GPIO 的低中风险白名单路径；更高风险执行器仍需 command queue、人工确认和 safety interlock 后再开放。
 - 节点 profile 当前用于身份、能力声明、prompt 和 MQTT payload；还没有根据 role 自动裁剪工具列表。
 - ESP32-P4 本体没有 Wi-Fi 射频，作为 Display Agent 时需要带无线协处理器的开发板或通过 Android/网关接入。
 - MCP、云端 Coordinator、Android App、ESP32-P4 UI 还属于后续扩展。
+- Automation 已能覆盖温湿度条件和顺序/延迟动作，但还没有完善自然语言暂停/恢复/删除规则、规则冲突检测、复杂多条件表达式和可查询规则状态面板。
 
 ## 下一阶段建议
 

@@ -127,6 +127,7 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     }
 
     copy_field(out->command_id, sizeof(out->command_id), json_string(root, "command_id"));
+    copy_field(out->trace_id, sizeof(out->trace_id), json_string(root, "trace_id"));
     copy_field(out->target_node, sizeof(out->target_node), json_string(root, "target_node"));
     copy_field(out->target_role, sizeof(out->target_role), json_string(root, "target_role"));
     copy_field(out->action, sizeof(out->action), action);

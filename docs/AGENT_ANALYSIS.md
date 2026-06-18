@@ -71,9 +71,10 @@ Feishu / WebSocket reply
 
 - 仍然只有一个 `agent_loop` 串行处理 LLM 回合。
 - 还没有多个独立 LLM Agent 进程。
-- MQTT `command` 和 `dispatch` 主题已经具备 JSON 解析、目标校验和角色边界；`sensor_agent` 对 `read_temperature_humidity` 有受限白名单执行路径，其它命令仍以校验/dry-run 为主。
-- 远程控制类命令执行需要后续补 command queue、鉴权、审计日志、safety interlock，并接回现有 message_bus/tool guard。
-- 四块 ESP32 可以使用同一固件，通过 `coordinator_agent`、`sensor_agent`、`control_agent`、`display_agent` profile 分工，但当前还没有跨节点真实执行链路。
+- MQTT `command` 和 `dispatch` 主题已经具备 JSON 解析、目标校验和角色边界；`sensor_agent` 对 `read_temperature_humidity` 有受限白名单执行路径，`control_agent` 对状态灯/WS2812/舵机/GPIO 有低中风险白名单执行路径。
+- 下游执行结果已经升级为结构化 `espagent.output.v1` OutputMessage；Coordinator 的 `mesh_send_command` 可以等待同一 `command_id` 的 OutputMessage 并回灌给下一轮 LLM。
+- 远程控制类命令后续仍需要补 command queue、强制鉴权、Guardian policy decision、safety interlock，并接回现有 message_bus/tool guard。
+- 四块 ESP32 可以使用同一固件，通过 `coordinator_agent`、`sensor_agent`、`control_agent`、`guardian_agent` profile 分工。ESP32-P4/Android 承担显示终端。
 
 当前 MQTT Mesh topic：
 

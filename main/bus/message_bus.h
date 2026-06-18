@@ -13,6 +13,7 @@
 
 /* Message flags */
 #define ESPAGENT_MSG_FLAG_PROACTIVE  (1U << 0)
+#define ESPAGENT_MSG_FLAG_INTERNAL_RESULT  (1U << 1)
 
 /* Message types on the bus */
 typedef struct {

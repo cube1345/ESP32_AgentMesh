@@ -6,6 +6,7 @@
 #define ESPAGENT_MESH_NODE_MAX        32
 #define ESPAGENT_MESH_ROLE_MAX        32
 #define ESPAGENT_MESH_ACTION_MAX      32
+#define ESPAGENT_MESH_TRACE_MAX       48
 #define ESPAGENT_MESH_ARGS_JSON_MAX   256
 
 typedef enum {
@@ -16,6 +17,7 @@ typedef enum {
 
 typedef struct {
     char command_id[ESPAGENT_MESH_ID_MAX];
+    char trace_id[ESPAGENT_MESH_TRACE_MAX];
     char target_node[ESPAGENT_MESH_NODE_MAX];
     char target_role[ESPAGENT_MESH_ROLE_MAX];
     char action[ESPAGENT_MESH_ACTION_MAX];

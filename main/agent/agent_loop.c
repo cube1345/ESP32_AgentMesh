@@ -4,6 +4,7 @@
 #include "llm/llm_proxy.h"
 #include "memory/session_mgr.h"
 #include "proactive/proactive_service.h"
+#include "sensors/sensor_mqtt.h"
 #include "espagent_config.h"
 #include "tools/tool_registry.h"
 
@@ -12,6 +13,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <ctype.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -413,6 +415,260 @@ static const char *detect_status_light_color(const char *message) {
   return NULL;
 }
 
+typedef struct {
+  const char *name;
+  const char *const *aliases;
+  size_t alias_count;
+} status_light_color_alias_t;
+
+static const char *const color_alias_blue[] = {"blue", "蓝"};
+static const char *const color_alias_green[] = {"green", "绿"};
+static const char *const color_alias_red[] = {"red", "红"};
+static const char *const color_alias_white[] = {"white", "白"};
+static const char *const color_alias_yellow[] = {"yellow", "黄"};
+static const char *const color_alias_purple[] = {"purple", "violet", "紫"};
+static const char *const color_alias_cyan[] = {"cyan", "青"};
+static const char *const color_alias_orange[] = {"orange", "橙"};
+static const char *const color_alias_off[] = {"off", "关闭", "关灯", "熄灭"};
+
+static const status_light_color_alias_t status_light_colors[] = {
+    {"blue", color_alias_blue, sizeof(color_alias_blue) / sizeof(color_alias_blue[0])},
+    {"green", color_alias_green, sizeof(color_alias_green) / sizeof(color_alias_green[0])},
+    {"red", color_alias_red, sizeof(color_alias_red) / sizeof(color_alias_red[0])},
+    {"white", color_alias_white, sizeof(color_alias_white) / sizeof(color_alias_white[0])},
+    {"yellow", color_alias_yellow, sizeof(color_alias_yellow) / sizeof(color_alias_yellow[0])},
+    {"purple", color_alias_purple, sizeof(color_alias_purple) / sizeof(color_alias_purple[0])},
+    {"cyan", color_alias_cyan, sizeof(color_alias_cyan) / sizeof(color_alias_cyan[0])},
+    {"orange", color_alias_orange, sizeof(color_alias_orange) / sizeof(color_alias_orange[0])},
+    {"off", color_alias_off, sizeof(color_alias_off) / sizeof(color_alias_off[0])},
+};
+
+static const char *find_substr_ci_ascii(const char *haystack, const char *needle) {
+  if (!haystack || !needle || !needle[0]) {
+    return NULL;
+  }
+
+  size_t needle_len = strlen(needle);
+  for (const char *p = haystack; *p; p++) {
+    size_t i = 0;
+    while (i < needle_len && p[i]) {
+      unsigned char a = (unsigned char)p[i];
+      unsigned char b = (unsigned char)needle[i];
+      if (a < 0x80) {
+        a = (unsigned char)tolower(a);
+      }
+      if (b < 0x80) {
+        b = (unsigned char)tolower(b);
+      }
+      if (a != b) {
+        break;
+      }
+      i++;
+    }
+    if (i == needle_len) {
+      return p;
+    }
+  }
+  return NULL;
+}
+
+static bool starts_with_ci_ascii(const char *text, const char *prefix) {
+  if (!text || !prefix) {
+    return false;
+  }
+  while (*prefix) {
+    unsigned char a = (unsigned char)*text++;
+    unsigned char b = (unsigned char)*prefix++;
+    if (a < 0x80) {
+      a = (unsigned char)tolower(a);
+    }
+    if (b < 0x80) {
+      b = (unsigned char)tolower(b);
+    }
+    if (a != b) {
+      return false;
+    }
+    if (!*text && *prefix) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static int extract_status_light_color_sequence(const char *message,
+                                               const char **out,
+                                               size_t out_count) {
+  if (!message || !out || out_count == 0) {
+    return 0;
+  }
+
+  const char *cursor = message;
+  int count = 0;
+  while (*cursor && count < (int)out_count) {
+    const char *best_pos = NULL;
+    const char *best_color = NULL;
+    size_t best_len = 0;
+    for (size_t i = 0; i < sizeof(status_light_colors) / sizeof(status_light_colors[0]); i++) {
+      const status_light_color_alias_t *color = &status_light_colors[i];
+      for (size_t j = 0; j < color->alias_count; j++) {
+        const char *alias = color->aliases[j];
+        const char *pos = find_substr_ci_ascii(cursor, alias);
+        if (pos && (!best_pos || pos < best_pos)) {
+          best_pos = pos;
+          best_color = color->name;
+          best_len = strlen(alias);
+        }
+      }
+    }
+    if (!best_pos || !best_color || best_len == 0) {
+      break;
+    }
+    if (count == 0 || strcmp(out[count - 1], best_color) != 0) {
+      out[count++] = best_color;
+    }
+    cursor = best_pos + best_len;
+  }
+  return count;
+}
+
+static bool message_has_sequence_marker(const char *message) {
+  static const char *const keywords[] = {
+      "then", "after", "wait", "sequence", "workflow", "first", "next",
+      "先", "再", "然后", "之后", "以后", "后", "等待", "延迟", "过", "秒", "分钟",
+      "闪", "切换", "变成", "改为", "再亮",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static uint32_t parse_light_sequence_delay_ms(const char *message) {
+  if (!message) {
+    return 1000;
+  }
+
+  for (const char *p = message; *p; p++) {
+    if (!isdigit((unsigned char)*p)) {
+      continue;
+    }
+    unsigned value = 0;
+    const char *q = p;
+    while (isdigit((unsigned char)*q)) {
+      value = value * 10U + (unsigned)(*q - '0');
+      q++;
+    }
+    while (*q && isspace((unsigned char)*q)) {
+      q++;
+    }
+    if (strncmp(q, "秒", strlen("秒")) == 0 ||
+        *q == 's' || *q == 'S' || starts_with_ci_ascii(q, "sec") ||
+        starts_with_ci_ascii(q, "second")) {
+      if (value == 0) {
+        return 1000;
+      }
+      if (value > 600) {
+        value = 600;
+      }
+      return value * 1000U;
+    }
+    if (strncmp(q, "分钟", strlen("分钟")) == 0 ||
+        strncmp(q, "分", strlen("分")) == 0 ||
+        *q == 'm' || *q == 'M' || starts_with_ci_ascii(q, "minute")) {
+      if (value == 0) {
+        return 60000;
+      }
+      if (value > 30) {
+        value = 30;
+      }
+      return value * 60000U;
+    }
+    p = q - 1;
+  }
+
+  if (contains_substr_ci(message, "十秒")) {
+    return 10000;
+  }
+  if (contains_substr_ci(message, "一秒")) {
+    return 1000;
+  }
+  if (contains_substr_ci(message, "两秒") || contains_substr_ci(message, "二秒")) {
+    return 2000;
+  }
+  if (contains_substr_ci(message, "三秒")) {
+    return 3000;
+  }
+  return 1000;
+}
+
+static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
+                                                     char *tool_output,
+                                                     size_t tool_output_size,
+                                                     char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !tool_guard_match_light_request(msg->content) ||
+      !message_has_sequence_marker(msg->content)) {
+    return false;
+  }
+
+  const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
+  int color_count = extract_status_light_color_sequence(
+      msg->content, colors, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS);
+  if (color_count < 2) {
+    return false;
+  }
+
+  uint32_t delay_ms = parse_light_sequence_delay_ms(msg->content);
+  cJSON *root = cJSON_CreateObject();
+  cJSON *steps = cJSON_CreateArray();
+  if (!root || !steps) {
+    cJSON_Delete(root);
+    cJSON_Delete(steps);
+    return false;
+  }
+
+  cJSON_AddStringToObject(root, "name", "light_sequence");
+  cJSON_AddItemToObject(root, "steps", steps);
+  for (int i = 0; i < color_count; i++) {
+    cJSON *step = cJSON_CreateObject();
+    cJSON *args = cJSON_CreateObject();
+    if (!step || !args) {
+      cJSON_Delete(step);
+      cJSON_Delete(args);
+      cJSON_Delete(root);
+      return false;
+    }
+    cJSON_AddNumberToObject(step, "delay_ms", i == 0 ? 0 : (double)delay_ms);
+    cJSON_AddStringToObject(step, "target_role", "control_agent");
+    cJSON_AddStringToObject(step, "action", "set_status_light");
+    cJSON_AddStringToObject(args, "color", colors[i]);
+    cJSON_AddItemToObject(step, "args", args);
+    cJSON_AddItemToArray(steps, step);
+  }
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_workflow", payload, tool_output, tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic workflow route => %s", tool_output);
+
+  char reply_buf[512];
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建灯光多步流程：先设置为%s，随后按顺序切换，共%d步。%s",
+             colors[0], color_count, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "灯光多步流程创建失败：%s", tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool is_mesh_related_tool_name(const char *name) {
   return name &&
          (strcmp(name, "mesh_send_command") == 0 ||
@@ -433,30 +689,52 @@ static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
     return false;
   }
 
-  const char *payload = NULL;
-  char payload_buf[256];
   char reply_buf[512];
+  cJSON *payload_root = NULL;
 
   if (tool_guard_match_temperature_humidity_request(msg->content) &&
       !tool_guard_match_weather_request(msg->content)) {
-    payload =
-        "{\"target_role\":\"sensor_agent\",\"action\":\"read_temperature_humidity\",\"args\":{}}";
+    payload_root = cJSON_CreateObject();
+    if (payload_root) {
+      cJSON_AddStringToObject(payload_root, "target_role", "sensor_agent");
+      cJSON_AddStringToObject(payload_root, "action", "read_temperature_humidity");
+      cJSON_AddItemToObject(payload_root, "args", cJSON_CreateObject());
+    }
   } else if (tool_guard_match_light_request(msg->content)) {
     const char *color = detect_status_light_color(msg->content);
     if (!color) {
       return false;
     }
-    snprintf(payload_buf, sizeof(payload_buf),
-             "{\"target_role\":\"control_agent\",\"action\":\"set_status_light\","
-             "\"args\":{\"color\":\"%s\"}}",
-             color);
-    payload = payload_buf;
+    payload_root = cJSON_CreateObject();
+    if (payload_root) {
+      cJSON_AddStringToObject(payload_root, "target_role", "control_agent");
+      cJSON_AddStringToObject(payload_root, "action", "set_status_light");
+      cJSON *args = cJSON_CreateObject();
+      if (args) {
+        cJSON_AddStringToObject(args, "color", color);
+        cJSON_AddItemToObject(payload_root, "args", args);
+      }
+    }
   } else {
+    return false;
+  }
+
+  if (!payload_root) {
+    return false;
+  }
+  cJSON_AddBoolToObject(payload_root, "async", true);
+  cJSON_AddStringToObject(payload_root, "reply_channel", msg->channel);
+  cJSON_AddStringToObject(payload_root, "reply_chat_id", msg->chat_id);
+
+  char *payload = cJSON_PrintUnformatted(payload_root);
+  cJSON_Delete(payload_root);
+  if (!payload) {
     return false;
   }
 
   tool_output[0] = '\0';
   tool_registry_execute("mesh_send_command", payload, tool_output, tool_output_size);
+  cJSON_free(payload);
   ESP_LOGI(TAG, "=== CONV === Deterministic Mesh route => %s", tool_output);
 
   if (strncmp(tool_output, "OK:", 3) == 0) {
@@ -727,7 +1005,9 @@ static void append_pending_clarification_prompt(char *prompt, size_t size,
 
 static char *patch_tool_input_with_context(const llm_tool_call_t *call,
                                            const espagent_msg_t *msg) {
-  if (!call || !msg || strcmp(call->name, "cron_add") != 0) {
+  if (!call || !msg ||
+      (strcmp(call->name, "cron_add") != 0 &&
+       strcmp(call->name, "mesh_send_command") != 0)) {
     return NULL;
   }
 
@@ -741,6 +1021,35 @@ static char *patch_tool_input_with_context(const llm_tool_call_t *call,
   }
 
   bool changed = false;
+
+  if (strcmp(call->name, "mesh_send_command") == 0) {
+    cJSON *async_item = cJSON_GetObjectItem(root, "async");
+    if (!async_item) {
+      cJSON_AddBoolToObject(root, "async", true);
+      changed = true;
+    }
+    cJSON *reply_channel = cJSON_GetObjectItem(root, "reply_channel");
+    if (!cJSON_IsString(reply_channel) && msg->channel[0] != '\0') {
+      json_set_string(root, "reply_channel", msg->channel);
+      changed = true;
+    }
+    cJSON *reply_chat = cJSON_GetObjectItem(root, "reply_chat_id");
+    if (!cJSON_IsString(reply_chat) && msg->chat_id[0] != '\0') {
+      json_set_string(root, "reply_chat_id", msg->chat_id);
+      changed = true;
+    }
+
+    char *patched = NULL;
+    if (changed) {
+      patched = cJSON_PrintUnformatted(root);
+      if (patched) {
+        ESP_LOGI(TAG, "Patched mesh_send_command reply target to %s:%s",
+                 msg->channel, msg->chat_id);
+      }
+    }
+    cJSON_Delete(root);
+    return patched;
+  }
 
   cJSON *channel_item = cJSON_GetObjectItem(root, "channel");
   const char *channel =
@@ -773,7 +1082,134 @@ static char *patch_tool_input_with_context(const llm_tool_call_t *call,
   }
   cJSON_Delete(root);
   return patched;
-} /* Build the user message with tool_result blocks */
+}
+
+static void publish_tool_timeline(const llm_tool_call_t *call,
+                                  const char *tool_input,
+                                  const char *event_type,
+                                  const char *status,
+                                  const char *result)
+{
+  char summary[192] = {0};
+  char command_id[64] = {0};
+  char target_role[64] = {0};
+  char target_node[64] = {0};
+  char action[64] = {0};
+
+  snprintf(summary, sizeof(summary), "%s %s",
+           event_type ? event_type : "tool",
+           call ? call->name : "(unknown)");
+  if (result && result[0]) {
+    size_t len = strlen(result);
+    snprintf(summary, sizeof(summary), "%s: %.*s%s",
+             call ? call->name : "tool",
+             (int)(len > 96 ? 96 : len), result, len > 96 ? "..." : "");
+  }
+
+  if (call && tool_input && strcmp(call->name, "mesh_send_command") == 0) {
+    cJSON *root = cJSON_Parse(tool_input);
+    if (root && cJSON_IsObject(root)) {
+      cJSON *item = cJSON_GetObjectItem(root, "command_id");
+      if (cJSON_IsString(item)) {
+        snprintf(command_id, sizeof(command_id), "%s", item->valuestring);
+      }
+      item = cJSON_GetObjectItem(root, "target_role");
+      if (cJSON_IsString(item)) {
+        snprintf(target_role, sizeof(target_role), "%s", item->valuestring);
+      }
+      item = cJSON_GetObjectItem(root, "target_node");
+      if (cJSON_IsString(item)) {
+        snprintf(target_node, sizeof(target_node), "%s", item->valuestring);
+      }
+      item = cJSON_GetObjectItem(root, "action");
+      if (cJSON_IsString(item)) {
+        snprintf(action, sizeof(action), "%s", item->valuestring);
+      }
+    }
+    cJSON_Delete(root);
+  }
+
+  (void)sensor_mqtt_publish_timeline_event(
+      strcmp(event_type ? event_type : "", "tool_use") == 0 ? "reasoning" : "result",
+      event_type,
+      status,
+      summary,
+      command_id,
+      target_role,
+      target_node,
+      action);
+}
+
+static void compact_for_trace(const char *in, char *out, size_t out_size) {
+  if (!out || out_size == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (!in) {
+    return;
+  }
+  size_t len = strlen(in);
+  size_t copy = len > out_size - 1 ? out_size - 1 : len;
+  memcpy(out, in, copy);
+  out[copy] = '\0';
+  terminate_at_utf8_boundary(out, strlen(out));
+}
+
+static void append_tool_trace(const espagent_msg_t *msg,
+                              const char *event_type,
+                              const llm_tool_call_t *call,
+                              const char *payload) {
+  if (!msg || !event_type || !call) {
+    return;
+  }
+
+  char compact[512] = {0};
+  compact_for_trace(payload, compact, sizeof(compact));
+
+  cJSON *root = cJSON_CreateObject();
+  if (!root) {
+    return;
+  }
+  cJSON_AddStringToObject(root, "event", event_type);
+  cJSON_AddStringToObject(root, "tool_call_id", call->id);
+  cJSON_AddStringToObject(root, "tool", call->name);
+  cJSON_AddStringToObject(root, "payload", compact);
+  char *json = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!json) {
+    return;
+  }
+
+  char summary[128] = {0};
+  snprintf(summary, sizeof(summary), "%s %s", event_type, call->name);
+  (void)session_append_trace(msg->chat_id, event_type, summary, json);
+  cJSON_free(json);
+}
+
+static void publish_local_tool_output(const llm_tool_call_t *call,
+                                      const char *tool_output,
+                                      esp_err_t result_err) {
+  if (!call) {
+    return;
+  }
+
+  char summary[192] = {0};
+  char result_text[384] = {0};
+  compact_for_trace(tool_output, result_text, sizeof(result_text));
+  snprintf(summary, sizeof(summary), "%s: %s",
+           call->name,
+           result_err == ESP_OK ? "local tool result" : "local tool error");
+  (void)sensor_mqtt_publish_output_message("tool_result",
+                                           NULL,
+                                           NULL,
+                                           call->name,
+                                           "coordinator_agent",
+                                           result_err,
+                                           summary,
+                                           result_text);
+}
+
+/* Build the user message with tool_result blocks */
 static cJSON *build_tool_results(const llm_response_t *resp,
                                  const espagent_msg_t *msg, char *tool_output,
                                  size_t tool_output_size, char *tool_fallback,
@@ -788,10 +1224,17 @@ static cJSON *build_tool_results(const llm_response_t *resp,
       tool_input = patched_input;
     }
 
+    publish_tool_timeline(call, tool_input, "tool_use", "pending", NULL);
+    append_tool_trace(msg, "tool_use", call, tool_input);
+
     tool_output[0] = '\0';
     if (!tool_guard_check(call, msg, tool_output, tool_output_size)) {
-      free(patched_input);
       ESP_LOGI(TAG, "=== CONV === Tool[%s] => %s", call->name, tool_output);
+      publish_tool_timeline(call, tool_input, "tool_result", "blocked",
+                            tool_output);
+      append_tool_trace(msg, "tool_result", call, tool_output);
+      publish_local_tool_output(call, tool_output, ESP_ERR_INVALID_STATE);
+      free(patched_input);
 
       cJSON *result_block = cJSON_CreateObject();
       cJSON_AddStringToObject(result_block, "type", "tool_result");
@@ -804,9 +1247,15 @@ static cJSON *build_tool_results(const llm_response_t *resp,
     /* Execute tool */
     tool_registry_execute(call->name, tool_input, tool_output,
                           tool_output_size);
-    free(patched_input);
 
     ESP_LOGI(TAG, "=== CONV === Tool[%s] => %s", call->name, tool_output);
+    const bool tool_error = strncmp(tool_output, "Error:", 6) == 0;
+    publish_tool_timeline(call, tool_input, "tool_result",
+                          tool_error ? "error" : "ok", tool_output);
+    append_tool_trace(msg, "tool_result", call, tool_output);
+    publish_local_tool_output(call, tool_output,
+                              tool_error ? ESP_FAIL : ESP_OK);
+    free(patched_input);
 
     if (tool_fallback && tool_fallback_size > 0 &&
         strcmp(call->name, "web_search") == 0 && tool_output[0] != '\0') {
@@ -859,7 +1308,9 @@ static void agent_loop_task(void *arg) {
              msg.content);
 
     bool proactive_turn = (msg.flags & ESPAGENT_MSG_FLAG_PROACTIVE) != 0;
-    if (!proactive_turn) {
+    bool internal_result_turn =
+        (msg.flags & ESPAGENT_MSG_FLAG_INTERNAL_RESULT) != 0;
+    if (!proactive_turn && !internal_result_turn) {
       proactive_service_note_contact(msg.channel, msg.chat_id);
     }
 
@@ -893,8 +1344,12 @@ static void agent_loop_task(void *arg) {
     bool mesh_related_tool_seen = false;
     tool_fallback[0] = '\0';
 
-    try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
-                                           &final_text);
+    if (!try_execute_deterministic_light_workflow(&msg, tool_output,
+                                                  TOOL_OUTPUT_SIZE,
+                                                  &final_text)) {
+      try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
+                                             &final_text);
+    }
 
     while (!final_text && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
       /* Send "working" indicator before each API call */
@@ -990,8 +1445,12 @@ static void agent_loop_task(void *arg) {
 
       /* Save to session (only user text + final assistant text) */
       esp_err_t save_user =
-          proactive_turn ? ESP_OK : session_append(msg.chat_id, "user", msg.content);
+          (proactive_turn || internal_result_turn) ? ESP_OK : session_append(msg.chat_id, "user", msg.content);
       esp_err_t save_asst = session_append(msg.chat_id, "assistant", final_text);
+      if (internal_result_turn) {
+        (void)session_append_trace(msg.chat_id, "async_result_input",
+                                   "Async Mesh result injected", msg.content);
+      }
       if (save_user != ESP_OK || save_asst != ESP_OK) {
         ESP_LOGW(TAG, "Session save failed for chat %s (user=%s, assistant=%s)",
                  msg.chat_id, esp_err_to_name(save_user),
@@ -1009,6 +1468,19 @@ static void agent_loop_task(void *arg) {
                out.chat_id, (int)strlen(final_text));
       ESP_LOGI(TAG, "=== CONV === >> RESPONSE [%s/%s]: %s", out.channel,
                out.chat_id, out.content);
+      (void)sensor_mqtt_publish_timeline_event("final", "final_reply", "ok",
+                                               out.content, NULL, NULL, NULL,
+                                               NULL);
+      (void)sensor_mqtt_publish_output_message("final_reply",
+                                               NULL,
+                                               NULL,
+                                               "final_reply",
+                                               msg.channel,
+                                               ESP_OK,
+                                               out.content,
+                                               out.content);
+      (void)session_append_trace(msg.chat_id, "final_reply",
+                                 "Assistant final reply", out.content);
       if (message_bus_push_outbound(&out) != ESP_OK) {
         ESP_LOGW(TAG, "Outbound queue full, drop final response");
         free(final_text);
@@ -1024,6 +1496,19 @@ static void agent_loop_task(void *arg) {
       out.content = strdup(tool_fallback[0] ? tool_fallback
                                             : "抱歉，我这次处理请求时遇到了错误。");
       if (out.content) {
+        (void)sensor_mqtt_publish_timeline_event("final", "error", "error",
+                                                 out.content, NULL, NULL, NULL,
+                                                 NULL);
+        (void)sensor_mqtt_publish_output_message("final_reply",
+                                                 NULL,
+                                                 NULL,
+                                                 "final_reply",
+                                                 msg.channel,
+                                                 ESP_FAIL,
+                                                 out.content,
+                                                 out.content);
+        (void)session_append_trace(msg.chat_id, "final_error",
+                                   "Assistant error reply", out.content);
         if (message_bus_push_outbound(&out) != ESP_OK) {
           ESP_LOGW(TAG, "Outbound queue full, drop error response");
           free(out.content);

@@ -24,29 +24,34 @@ NODE_IDS=(
   "esp32s3-coordinator-01"
   "esp32s3-sensor-01"
   "esp32s3-control-01"
-  "esp32s3-display-01"
+  "esp32s3-guardian-01"
 )
 
 NODE_ROLES=(
   "coordinator_agent"
   "sensor_agent"
   "control_agent"
-  "display_agent"
+  "guardian_agent"
 )
 
 NODE_CAPABILITIES=(
   "coordinator,communication,llm,dispatch,timeline,alerts"
   "sensor,telemetry,environment,air_quality,light,presence"
   "control,gpio,rgb,servo,relay,actuator"
-  "display,timeline,alerts,state,watchdog"
+  "guardian,security,policy,privacy,audit,watchdog,stateboard"
 )
 
 NODE_RESPONSIBILITIES=(
   "receive user messages, call LLM, plan dispatch, publish timeline, and notify users"
-  "read environment sensors and publish telemetry for coordinator and display nodes"
+  "read environment sensors and publish telemetry for coordinator and display terminals"
   "execute whitelisted hardware actions after schema validation and tool guard checks"
-  "display mesh state, timeline, telemetry, alerts, and watchdog status"
+  "enforce policy decisions, audit OutputMessages, watch node health, and protect private data"
 )
+
+SELECTED_INDICES=("$@")
+if [[ "${#SELECTED_INDICES[@]}" -eq 0 ]]; then
+  SELECTED_INDICES=(0 1 2 3)
+fi
 
 require_file() {
   local path="$1"
@@ -137,14 +142,18 @@ cleanup_on_error() {
 }
 
 require_file "$SECRETS_FILE"
-for i in 0 1 2 3; do
+for i in "${SELECTED_INDICES[@]}"; do
+  if [[ ! "$i" =~ ^[0-3]$ ]]; then
+    echo "ERROR: role index must be 0, 1, 2, or 3; got ${i}" >&2
+    exit 1
+  fi
   require_fixed_usb_port "$i" "${PORTS[$i]}"
 done
 
 cp "$SECRETS_FILE" "$BACKUP_FILE"
 trap cleanup_on_error ERR INT TERM
 
-for i in 0 1 2 3; do
+for i in "${SELECTED_INDICES[@]}"; do
   flash_one "$i"
 done
 
@@ -153,4 +162,4 @@ rm -f "$BACKUP_FILE"
 trap - ERR INT TERM
 
 echo
-echo "OK: USB0-USB3 flashed in order. main/espagent_secrets.h restored to coordinator_agent profile."
+echo "OK: flashed role index(es): ${SELECTED_INDICES[*]}. main/espagent_secrets.h restored to coordinator_agent profile."

@@ -1,15 +1,32 @@
 #include "tools/tool_mesh_command.h"
 
 #include "esp_timer.h"
+#include "esp_log.h"
 #include "espagent_config.h"
+#include "bus/message_bus.h"
 #include "mesh/mesh_protocol.h"
 #include "sensors/sensor_mqtt.h"
 
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
+
+typedef struct {
+    char task_id[48];
+    char command_id[ESPAGENT_MESH_ID_MAX];
+    char trace_id[ESPAGENT_MESH_TRACE_MAX];
+    char target_role[ESPAGENT_MESH_ROLE_MAX];
+    char target_node[ESPAGENT_MESH_NODE_MAX];
+    char action[ESPAGENT_MESH_ACTION_MAX];
+    char reply_channel[16];
+    char reply_chat_id[96];
+    uint32_t wait_ms;
+} mesh_wait_task_ctx_t;
 
 static const char *json_string(cJSON *root, const char *key)
 {
@@ -41,6 +58,95 @@ static bool is_control_action(const char *action)
             strcmp(action, "gpio_write") == 0);
 }
 
+static bool is_sensor_action(const char *action)
+{
+    return action && strcmp(action, "read_temperature_humidity") == 0;
+}
+
+static bool is_allowed_mesh_action(const char *action)
+{
+    return is_sensor_action(action) || is_control_action(action);
+}
+
+static esp_err_t request_policy_decision(const char *command_id,
+                                         const char *trace_id,
+                                         const char *target_role,
+                                         const char *target_node,
+                                         const char *action,
+                                         int safety_level,
+                                         int ttl_ms,
+                                         char *decision_json,
+                                         size_t decision_json_size,
+                                         char *reason,
+                                         size_t reason_size)
+{
+    cJSON *policy = cJSON_CreateObject();
+    if (!policy) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int64_t ts_ms = esp_timer_get_time() / 1000;
+    cJSON_AddStringToObject(policy, "schema", "espagent.policy_check.v1");
+    cJSON_AddStringToObject(policy, "event", "policy_check");
+    cJSON_AddStringToObject(policy, "command_id", command_id);
+    cJSON_AddStringToObject(policy, "trace_id", trace_id);
+    cJSON_AddStringToObject(policy, "source_role", "coordinator_agent");
+    cJSON_AddStringToObject(policy, "target_role", target_role ? target_role : "");
+    cJSON_AddStringToObject(policy, "target_node", target_node ? target_node : "");
+    cJSON_AddStringToObject(policy, "action", action);
+    cJSON_AddNumberToObject(policy, "safety_level", safety_level);
+    cJSON_AddNumberToObject(policy, "ttl_ms", ttl_ms);
+    cJSON_AddNumberToObject(policy, "ts_ms", (double)ts_ms);
+
+    char *json = cJSON_PrintUnformatted(policy);
+    cJSON_Delete(policy);
+    if (!json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI("tool_mesh_command", "Policy check requested: %s", json);
+    esp_err_t err = sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_POLICY_CHECK, json);
+    cJSON_free(json);
+    if (err != ESP_OK) {
+        snprintf(reason, reason_size, "failed to publish policy_check: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
+    if (wait_ms > 8000U) {
+        wait_ms = 8000U;
+    }
+    if (wait_ms < 1000U) {
+        wait_ms = 1000U;
+    }
+
+    err = sensor_mqtt_wait_policy_decision(command_id,
+                                           decision_json,
+                                           decision_json_size,
+                                           wait_ms);
+    if (err != ESP_OK) {
+        snprintf(reason, reason_size, "policy_decision wait timed out after %ums", (unsigned)wait_ms);
+        return err;
+    }
+
+    cJSON *decision = cJSON_Parse(decision_json);
+    if (!decision || !cJSON_IsObject(decision)) {
+        cJSON_Delete(decision);
+        snprintf(reason, reason_size, "policy_decision is not valid JSON");
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    cJSON *decision_item = cJSON_GetObjectItem(decision, "decision");
+    cJSON *reason_item = cJSON_GetObjectItem(decision, "reason");
+    const char *decision_text = cJSON_IsString(decision_item) ? decision_item->valuestring : "";
+    const char *reason_text = cJSON_IsString(reason_item) ? reason_item->valuestring : "";
+    snprintf(reason, reason_size, "%s", reason_text);
+    bool allowed = strcmp(decision_text, "allow") == 0;
+    cJSON_Delete(decision);
+
+    return allowed ? ESP_OK : ESP_ERR_INVALID_STATE;
+}
+
 static void copy_text(char *dst, size_t dst_size, const char *src)
 {
     if (!dst || dst_size == 0) {
@@ -70,6 +176,109 @@ static esp_err_t copy_args(cJSON *root, cJSON *cmd)
     return ESP_OK;
 }
 
+static void mesh_wait_task(void *arg)
+{
+    mesh_wait_task_ctx_t *ctx = (mesh_wait_task_ctx_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    char output_json[768] = {0};
+    esp_err_t wait_err = sensor_mqtt_wait_output_message(ctx->command_id,
+                                                         output_json,
+                                                         sizeof(output_json),
+                                                         ctx->wait_ms);
+    const bool ok = wait_err == ESP_OK;
+    char summary[192] = {0};
+    snprintf(summary, sizeof(summary), "%s command_id=%s action=%s",
+             ok ? "Async mesh task completed" : "Async mesh task timed out",
+             ctx->command_id,
+             ctx->action);
+
+    (void)sensor_mqtt_publish_timeline_event("result",
+                                             "mesh_async_result",
+                                             ok ? "ok" : "timeout",
+                                             summary,
+                                             ctx->command_id,
+                                             ctx->target_role,
+                                             ctx->target_node,
+                                             ctx->action);
+
+    if (ctx->reply_channel[0] && ctx->reply_chat_id[0]) {
+        espagent_msg_t msg = {0};
+        snprintf(msg.channel, sizeof(msg.channel), "%s", ctx->reply_channel);
+        snprintf(msg.chat_id, sizeof(msg.chat_id), "%s", ctx->reply_chat_id);
+        msg.flags = ESPAGENT_MSG_FLAG_INTERNAL_RESULT;
+
+        char content[1152] = {0};
+        if (ok) {
+            snprintf(content, sizeof(content),
+                     "Internal async Mesh result. task_id=%s command_id=%s action=%s output_message=%s\n"
+                     "Please summarize this execution result to the user in one concise Chinese sentence. "
+                     "Do not call mesh_send_command again for this result.",
+                     ctx->task_id,
+                     ctx->command_id,
+                     ctx->action,
+                     output_json);
+        } else {
+            snprintf(content, sizeof(content),
+                     "Internal async Mesh timeout. task_id=%s command_id=%s action=%s wait_ms=%u. "
+                     "Please tell the user that the remote node did not return a result in time.",
+                     ctx->task_id,
+                     ctx->command_id,
+                     ctx->action,
+                     (unsigned)ctx->wait_ms);
+        }
+        msg.content = strdup(content);
+        if (msg.content) {
+            if (message_bus_push_inbound(&msg) != ESP_OK) {
+                free(msg.content);
+            }
+        }
+    }
+
+    free(ctx);
+    vTaskDelete(NULL);
+}
+
+static esp_err_t start_mesh_wait_task(const char *command_id,
+                                      const char *trace_id,
+                                      const char *target_role,
+                                      const char *target_node,
+                                      const char *action,
+                                      const char *reply_channel,
+                                      const char *reply_chat_id,
+                                      uint32_t wait_ms,
+                                      char *task_id,
+                                      size_t task_id_size)
+{
+    mesh_wait_task_ctx_t *ctx = calloc(1, sizeof(*ctx));
+    if (!ctx) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    snprintf(ctx->task_id, sizeof(ctx->task_id), "mesh-task-%s", command_id);
+    snprintf(ctx->command_id, sizeof(ctx->command_id), "%s", command_id);
+    snprintf(ctx->trace_id, sizeof(ctx->trace_id), "%s", trace_id ? trace_id : "");
+    snprintf(ctx->target_role, sizeof(ctx->target_role), "%s", target_role ? target_role : "");
+    snprintf(ctx->target_node, sizeof(ctx->target_node), "%s", target_node ? target_node : "");
+    snprintf(ctx->action, sizeof(ctx->action), "%s", action ? action : "");
+    snprintf(ctx->reply_channel, sizeof(ctx->reply_channel), "%s", reply_channel ? reply_channel : "");
+    snprintf(ctx->reply_chat_id, sizeof(ctx->reply_chat_id), "%s", reply_chat_id ? reply_chat_id : "");
+    ctx->wait_ms = wait_ms;
+
+    if (task_id && task_id_size > 0) {
+        snprintf(task_id, task_id_size, "%s", ctx->task_id);
+    }
+
+    if (xTaskCreate(mesh_wait_task, "mesh_wait", 6 * 1024, ctx, 4, NULL) != pdPASS) {
+        free(ctx);
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                          char *output,
                                          size_t output_size)
@@ -91,6 +300,11 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         snprintf(output, output_size, "Error: action is required");
         return ESP_ERR_INVALID_ARG;
     }
+    if (!is_allowed_mesh_action(action)) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: unsupported mesh action=%s", action);
+        return ESP_ERR_INVALID_ARG;
+    }
     if ((!target_node || !target_node[0]) && (!target_role || !target_role[0]) &&
         strcmp(action, "read_temperature_humidity") == 0) {
         target_role = "sensor_agent";
@@ -105,17 +319,38 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                  action);
         return ESP_ERR_INVALID_ARG;
     }
+    if (target_role && target_role[0]) {
+        if (is_sensor_action(action) && strcmp(target_role, "sensor_agent") != 0) {
+            cJSON_Delete(root);
+            snprintf(output, output_size,
+                     "Error: action=%s must target sensor_agent, got %s",
+                     action, target_role);
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (is_control_action(action) && strcmp(target_role, "control_agent") != 0) {
+            cJSON_Delete(root);
+            snprintf(output, output_size,
+                     "Error: action=%s must target control_agent, got %s",
+                     action, target_role);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
 
     char action_copy[ESPAGENT_MESH_ACTION_MAX] = {0};
     char command_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
+    char trace_id_copy[ESPAGENT_MESH_TRACE_MAX] = {0};
+    char target_role_copy[ESPAGENT_MESH_ROLE_MAX] = {0};
+    char target_node_copy[ESPAGENT_MESH_NODE_MAX] = {0};
     copy_text(action_copy, sizeof(action_copy), action);
+    copy_text(target_role_copy, sizeof(target_role_copy), target_role);
+    copy_text(target_node_copy, sizeof(target_node_copy), target_node);
 
     char topic[160] = {0};
     esp_err_t topic_err = ESP_OK;
-    if (target_node && target_node[0]) {
-        topic_err = espagent_mesh_build_node_topic(target_node, "command", topic, sizeof(topic));
+    if (target_node_copy[0]) {
+        topic_err = espagent_mesh_build_node_topic(target_node_copy, "command", topic, sizeof(topic));
     } else {
-        topic_err = espagent_mesh_build_role_topic(target_role, "command", topic, sizeof(topic));
+        topic_err = espagent_mesh_build_role_topic(target_role_copy, "command", topic, sizeof(topic));
     }
     if (topic_err != ESP_OK) {
         cJSON_Delete(root);
@@ -138,17 +373,49 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     }
     copy_text(command_id_copy, sizeof(command_id_copy), command_id);
 
-    cJSON_AddStringToObject(cmd, "command_id", command_id_copy);
-    if (target_node && target_node[0]) {
-        cJSON_AddStringToObject(cmd, "target_node", target_node);
+    const char *trace_id = json_string(root, "trace_id");
+    char generated_trace_id[48] = {0};
+    if (!trace_id || !trace_id[0]) {
+        snprintf(generated_trace_id, sizeof(generated_trace_id), "trace-%s", command_id_copy);
+        trace_id = generated_trace_id;
     }
-    if (target_role && target_role[0]) {
-        cJSON_AddStringToObject(cmd, "target_role", target_role);
+    copy_text(trace_id_copy, sizeof(trace_id_copy), trace_id);
+
+    int ttl_ms = json_int(root, "ttl_ms", 30000);
+    if (ttl_ms < 1000) {
+        ttl_ms = 1000;
+    } else if (ttl_ms > 30000) {
+        ttl_ms = 30000;
+    }
+    int safety_level = json_int(root, "safety_level", 1);
+    if (safety_level < ESPAGENT_MESH_SAFETY_LOW ||
+        safety_level > ESPAGENT_MESH_SAFETY_HIGH) {
+        cJSON_Delete(cmd);
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: safety_level must be 0, 1, or 2");
+        return ESP_ERR_INVALID_ARG;
+    }
+    bool require_ack = json_bool(root, "require_ack", true);
+    bool async_wait = json_bool(root, "async", true);
+    const char *reply_channel = json_string(root, "reply_channel");
+    const char *reply_chat_id = json_string(root, "reply_chat_id");
+    char reply_channel_copy[16] = {0};
+    char reply_chat_id_copy[96] = {0};
+    copy_text(reply_channel_copy, sizeof(reply_channel_copy), reply_channel);
+    copy_text(reply_chat_id_copy, sizeof(reply_chat_id_copy), reply_chat_id);
+
+    cJSON_AddStringToObject(cmd, "command_id", command_id_copy);
+    cJSON_AddStringToObject(cmd, "trace_id", trace_id_copy);
+    if (target_node_copy[0]) {
+        cJSON_AddStringToObject(cmd, "target_node", target_node_copy);
+    }
+    if (target_role_copy[0]) {
+        cJSON_AddStringToObject(cmd, "target_role", target_role_copy);
     }
     cJSON_AddStringToObject(cmd, "action", action);
-    cJSON_AddNumberToObject(cmd, "ttl_ms", json_int(root, "ttl_ms", 30000));
-    cJSON_AddNumberToObject(cmd, "safety_level", json_int(root, "safety_level", 1));
-    cJSON_AddBoolToObject(cmd, "require_ack", json_bool(root, "require_ack", true));
+    cJSON_AddNumberToObject(cmd, "ttl_ms", ttl_ms);
+    cJSON_AddNumberToObject(cmd, "safety_level", safety_level);
+    cJSON_AddBoolToObject(cmd, "require_ack", require_ack);
 
     esp_err_t args_err = copy_args(root, cmd);
     if (args_err != ESP_OK) {
@@ -166,15 +433,109 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         return ESP_ERR_NO_MEM;
     }
 
+    char policy_json[512] = {0};
+    char policy_reason[160] = {0};
+    esp_err_t policy_err = request_policy_decision(command_id_copy,
+                                                   trace_id_copy,
+                                                   target_role_copy,
+                                                   target_node_copy,
+                                                   action_copy,
+                                                   safety_level,
+                                                   ttl_ms,
+                                                   policy_json,
+                                                   sizeof(policy_json),
+                                                   policy_reason,
+                                                   sizeof(policy_reason));
+    if (policy_err != ESP_OK) {
+        snprintf(output, output_size,
+                 "Error: Guardian policy blocked mesh command action=%s command_id=%s reason=%s decision=%s",
+                 action_copy, command_id_copy, policy_reason, policy_json[0] ? policy_json : "(none)");
+        (void)sensor_mqtt_publish_timeline_event("policy",
+                                                 "policy_check",
+                                                 "blocked",
+                                                 output,
+                                                 command_id_copy,
+                                                 target_role_copy,
+                                                 target_node_copy,
+                                                 action_copy);
+        cJSON_free(payload);
+        return policy_err;
+    }
+
+    (void)sensor_mqtt_publish_timeline_event("policy",
+                                             "policy_check",
+                                             "ok",
+                                             policy_reason[0] ? policy_reason : "Guardian allowed command",
+                                             command_id_copy,
+                                             target_role_copy,
+                                             target_node_copy,
+                                             action_copy);
+
     esp_err_t err = sensor_mqtt_publish_text(topic, payload);
     if (err == ESP_OK) {
         snprintf(output, output_size,
                  "OK: queued MQTT mesh command action=%s topic=%s command_id=%s",
                  action_copy, topic, command_id_copy);
+        (void)sensor_mqtt_publish_timeline_event("dispatch",
+                                                 "mesh_command_queued",
+                                                 "ok",
+                                                 output,
+                                                 command_id_copy,
+                                                 target_role_copy,
+                                                 target_node_copy,
+                                                 action_copy);
+        if (require_ack) {
+            uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
+            if (async_wait) {
+                char task_id[48] = {0};
+                esp_err_t task_err = start_mesh_wait_task(command_id_copy,
+                                                          trace_id_copy,
+                                                          target_role_copy,
+                                                          target_node_copy,
+                                                          action_copy,
+                                                          reply_channel_copy,
+                                                          reply_chat_id_copy,
+                                                          wait_ms,
+                                                          task_id,
+                                                          sizeof(task_id));
+                if (task_err == ESP_OK) {
+                    snprintf(output, output_size,
+                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s async_task_id=%s; result will be injected when OutputMessage arrives",
+                             action_copy, topic, command_id_copy, task_id);
+                } else {
+                    snprintf(output, output_size,
+                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; async wait task failed: %s",
+                             action_copy, topic, command_id_copy, esp_err_to_name(task_err));
+                }
+            } else {
+                char output_json[768] = {0};
+                esp_err_t wait_err = sensor_mqtt_wait_output_message(command_id_copy,
+                                                                     output_json,
+                                                                     sizeof(output_json),
+                                                                     wait_ms);
+                if (wait_err == ESP_OK) {
+                    snprintf(output, output_size,
+                             "OK: mesh command completed command_id=%s output_message=%s",
+                             command_id_copy, output_json);
+                } else {
+                    snprintf(output, output_size,
+                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; OutputMessage wait timed out after %ums",
+                             action_copy, topic, command_id_copy, (unsigned)wait_ms);
+                }
+            }
+        }
     } else {
         snprintf(output, output_size,
                  "Error: failed to queue MQTT mesh command (%s)",
                  esp_err_to_name(err));
+        (void)sensor_mqtt_publish_timeline_event("dispatch",
+                                                 "mesh_command_queued",
+                                                 "error",
+                                                 output,
+                                                 command_id_copy,
+                                                 target_role_copy,
+                                                 target_node_copy,
+                                                 action_copy);
     }
     cJSON_free(payload);
     return err;

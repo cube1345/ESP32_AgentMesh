@@ -150,17 +150,20 @@ CLI settings are stored in NVS flash and take priority over build-time values.
 
 ## OTA Update (over WiFi)
 
-After initial USB flash, future updates can be done over WiFi:
+After initial USB flash, current firmware can update over WiFi only from an HTTPS app `.bin` URL through the serial CLI:
 
 1. Build new firmware: `idf.py build`
-2. Host the `.bin` file on a local HTTP server:
-   ```bash
-   cd build && python3 -m http.server 8080
+2. Publish `build/ESPAgent.bin` at an ESP32-reachable HTTPS URL.
+3. On the serial console, check partitions:
    ```
-3. Use the OTA endpoint/tool with the URL:
+   ota_info
    ```
-   http://YOUR_PC_IP:8080/ESPAgent.bin
+4. Start OTA:
    ```
+   ota_update https://YOUR_HOST/path/ESPAgent.bin
+   ```
+
+Current code rejects plain HTTP URLs. Do not expose OTA through Feishu/LLM until Guardian policy, human confirmation, firmware provenance checks, version checks, and role-profile handling are implemented.
 
 ## Flash Layout
 

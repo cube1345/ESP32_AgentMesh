@@ -20,10 +20,11 @@ The current firmware is the first edge-node phase of the planned LingShu Agent M
 - ESP-NOW environment telemetry sender
 - MQTT mesh telemetry/state topics under `espagent/nodes/<node_id>/...`
 - MQTT Mesh command publishing through `mesh_send_command`
-- Four ESP32-S3 role profiles: `coordinator_agent`, `sensor_agent`, `control_agent`, and `display_agent`
+- HTTPS OTA app update through the serial CLI
+- Four ESP32-S3 role profiles: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`
 - Wi-Fi onboarding/admin AP under the `ESPAgent-XXXX` network name
 
-Current Mesh boundary: the Coordinator can publish a standard MQTT Mesh command to another node or role, and the Sensor role has a whitelisted `read_temperature_humidity` result path. Control-role hardware execution is still intentionally disabled until command queue, authorization, safety interlock, audit events, and result correlation are implemented.
+Current Mesh boundary: the Coordinator can publish a standard MQTT Mesh command to another node or role, Sensor/Control have narrow whitelisted execution paths, and Guardian performs the first `policy_check` / `policy_decision` gate. OTA is intentionally exposed through Serial CLI first, not as a Feishu/LLM tool.
 
 ## Repository Layout
 
@@ -52,7 +53,7 @@ ESPAgent/
 │   ├── onboard/                Wi-Fi onboarding/admin portal
 │   ├── ota/                    HTTPS OTA update support
 │   ├── proxy/                  HTTP CONNECT proxy support
-│   ├── roles/                  coordinator/sensor/control/display role boundaries
+│   ├── roles/                  coordinator/sensor/control/guardian/display boundaries
 │   ├── sensors/                periodic sensor publishing integrations
 │   ├── skills/                 SPIFFS skill summary loader
 │   └── tools/                  AI-callable tool registry and tool handlers
@@ -88,6 +89,17 @@ Flash with:
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
+Serial OTA maintenance commands:
+
+```text
+ota_info
+ota_update <https_url_to_ESPAgent.bin>
+```
+
+The OTA URL must point directly to an HTTPS app `.bin` that fits the 2MB OTA slot.
+
+OTA is currently a maintenance primitive, not an AI code-generation feature. A developer or CI still builds `ESPAgent.bin`; future Agent-side work should only orchestrate checks, Guardian approval, user confirmation, deployment, reboot observation, and result reporting.
+
 ## Configuration
 
 Copy the secrets template when build-time credentials are needed:
@@ -105,11 +117,11 @@ Node identity defaults can be set in `main/espagent_secrets.h`:
 #define ESPAGENT_SECRET_NODE_ROLE "edge_agent"
 #define ESPAGENT_SECRET_NODE_LOCATION "南京市栖霞区"
 #define ESPAGENT_SECRET_MESH_TOPIC_PREFIX "espagent"
-#define ESPAGENT_SECRET_NODE_CAPABILITIES "coordinator,communication,sensor,control,display,telemetry,timeline,alerts"
-#define ESPAGENT_SECRET_NODE_RESPONSIBILITIES "single-node development profile; can chat, sense, control, publish telemetry, and display mesh state"
+#define ESPAGENT_SECRET_NODE_CAPABILITIES "coordinator,communication,sensor,control,guardian,telemetry,timeline,alerts"
+#define ESPAGENT_SECRET_NODE_RESPONSIBILITIES "single-node development profile; can chat, sense, control, publish telemetry, and audit mesh state"
 ```
 
-For a four-ESP32 setup, use the same firmware and assign each board a different node profile: `coordinator_agent`, `sensor_agent`, `control_agent`, and `display_agent`.
+For a four-ESP32 setup, use the same firmware and assign each board a different node profile: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`.
 
 ## Documentation
 

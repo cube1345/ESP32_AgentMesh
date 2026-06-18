@@ -176,10 +176,10 @@
 #define ESPAGENT_SECRET_MESH_TOPIC_PREFIX "espagent"
 #endif
 #ifndef ESPAGENT_SECRET_NODE_CAPABILITIES
-#define ESPAGENT_SECRET_NODE_CAPABILITIES "coordinator,communication,sensor,control,display,telemetry,timeline,alerts"
+#define ESPAGENT_SECRET_NODE_CAPABILITIES "coordinator,communication,sensor,control,guardian,telemetry,timeline,alerts"
 #endif
 #ifndef ESPAGENT_SECRET_NODE_RESPONSIBILITIES
-#define ESPAGENT_SECRET_NODE_RESPONSIBILITIES "single-node development profile; can chat, sense, control, publish telemetry, and display mesh state"
+#define ESPAGENT_SECRET_NODE_RESPONSIBILITIES "single-node development profile; can chat, sense, control, publish telemetry, and audit mesh state"
 #endif
 
 /* WiFi */
@@ -266,6 +266,14 @@
 #define ESPAGENT_HEARTBEAT_FILE          ESPAGENT_SPIFFS_BASE "/HEARTBEAT.md"
 #define ESPAGENT_HEARTBEAT_INTERVAL_MS   (30 * 60 * 1000)
 
+/* Automation Engine */
+#define ESPAGENT_AUTOMATION_FILE         ESPAGENT_SPIFFS_BASE "/automation.json"
+#define ESPAGENT_AUTOMATION_MAX_WORKFLOWS 8
+#define ESPAGENT_AUTOMATION_MAX_RULES    8
+#define ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS 8
+#define ESPAGENT_AUTOMATION_CHECK_INTERVAL_MS (5 * 1000)
+#define ESPAGENT_AUTOMATION_STACK        (12 * 1024)
+
 /* Proactive Agent */
 #define ESPAGENT_PROACTIVE_ENABLED       1
 #define ESPAGENT_PROACTIVE_STACK         (5 * 1024)
@@ -351,6 +359,9 @@
 #define ESPAGENT_MESH_TOPIC_DISPATCH         ESPAGENT_MESH_TOPIC_PREFIX "/agent/dispatch"
 #define ESPAGENT_MESH_TOPIC_TIMELINE         ESPAGENT_MESH_TOPIC_PREFIX "/agent/timeline"
 #define ESPAGENT_MESH_TOPIC_ALERTS           ESPAGENT_MESH_TOPIC_PREFIX "/alerts"
+#define ESPAGENT_MESH_TOPIC_POLICY_CHECK     ESPAGENT_MESH_TOPIC_PREFIX "/security/policy_check"
+#define ESPAGENT_MESH_TOPIC_POLICY_DECISION  ESPAGENT_MESH_TOPIC_PREFIX "/security/decision"
+#define ESPAGENT_MESH_TOPIC_GUARDIAN_STATEBOARD ESPAGENT_MESH_TOPIC_PREFIX "/guardian/stateboard"
 #define ESPAGENT_SENSOR_MQTT_TOPIC_DATA      ESPAGENT_SENSOR_MQTT_TOPIC_TELEMETRY
 #define ESPAGENT_SENSOR_MQTT_TOPIC_ANALYSIS  ESPAGENT_MESH_TOPIC_DISPATCH
 #define ESPAGENT_SENSOR_MQTT_TOPIC_ALERT     ESPAGENT_MESH_TOPIC_ALERTS
@@ -368,7 +379,7 @@
 #define ESPAGENT_WS_MAX_CLIENTS          4
 
 /* Serial CLI */
-#define ESPAGENT_CLI_STACK               (4 * 1024)
+#define ESPAGENT_CLI_STACK               (12 * 1024)
 #define ESPAGENT_CLI_PRIO                3
 #define ESPAGENT_CLI_CORE                0
 
