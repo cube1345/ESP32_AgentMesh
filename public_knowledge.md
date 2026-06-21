@@ -1,6 +1,6 @@
 # Public Knowledge
 
-Last updated: 2026-06-18
+Last updated: 2026-06-21
 
 This file is the required shared handoff document for any AI working in this repository.
 
@@ -62,6 +62,10 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
   - `/dev/ttyUSB2`: `esp32s3-control-01`, `control_agent`
   - `/dev/ttyUSB3`: `esp32s3-guardian-01`, `guardian_agent`
   - `/dev/ttyACM0`: ESP32-P4+C6 Display Terminal project, not an ESP32-S3 role flashing target
+- Latest Lua-runtime build size snapshot:
+  - `build/ESPAgent.bin` about `0x1902c0` - `0x190310`
+  - 2 MB app slot free space about `0x6fd00`, roughly 22%
+  - all four S3 roles still use the same firmware image with different build-time profiles
 - Current temporary MQTT test broker: `broker.emqx.io:1883`
 - Current temporary MQTT topic prefix: `espagent/cube1345`
 - Serial port used for the Feishu/LLM coordinator board: `/dev/ttyUSB0`
@@ -111,7 +115,7 @@ Important for future AI agents:
 - Conversation logging: All user-LLM exchanges logged with `=== CONV ===` tag visible on serial monitor
 - Serial CLI commands including `config_show`, `wifi_status`, and `tool_exec`
 - Automatic SGP30 periodic reading visible in serial logs
-- 26 registered agent tools total, including web search, weather, time, file, GPIO, RGB, servo, sensor, cron, Mesh command, and subagent tools.
+- Agent tools are now mirrored into a capability registry, then filtered by role-visible capability profile. The exact LLM-visible tool count is build/profile dependent; current capabilities include web search, weather, time, file, GPIO, RGB, servo, sensor, cron, Mesh command, subagent, automation, virtual device, memory, and Lua tools.
 - Subagent tool:
   - `spawn_subagent` creates a temporary FreeRTOS task with its own short ReAct loop and returns the result to the main agent through a semaphore.
   - It was ported onto the current `main` architecture by referencing the remote `subagent` branch behavior, without merging that branch or reverting the current Agent Mesh code.
@@ -130,7 +134,8 @@ Important for future AI agents:
 - Sensor-side Mesh result path:
   - `sensor_agent` can execute the whitelisted `read_temperature_humidity` Mesh command through the AHT10/AHT20 tool.
   - It publishes a `mesh_command_result` event to the node events topic and global timeline.
-  - Other node/role commands remain disabled or dry-run until command queue and safety interlock are implemented.
+  - `control_agent` can execute whitelisted low/medium-risk commands such as `set_status_light`, `ws2812_set`, `servo_write`, `gpio_write`, and `virtual_device_control`.
+  - Control execution passes through local command queue admission, duplicate `command_id` rejection, TTL checks, single-actuator interlock, emergency stop latch, actuator state tracking, cached Guardian allow validation, and optional HMAC command verification.
 - Four ESP32 roles are documented in detail in `docs/PUBLIC_KNOWLEDGE_BASE.md`:
   - Coordinator / Communication Agent: Feishu, WebSocket, LLM, dispatch, timeline, proactive, time/weather/search
   - Sensor Agent: sensor sampling, telemetry, cache, threshold events
@@ -162,7 +167,19 @@ Important for future AI agents:
   - Multi-step workflows are executed by per-workflow temporary `workflow_task` workers, not by `rule_task`.
   - Current limits are 8 rules, 8 workflow slots, and 8 steps per workflow.
   - Rules are persistent across reboot; workflows are currently one-shot runtime tasks and are not restored after reboot.
-  - Current rule lifecycle tools are `automation_list` and `automation_remove`; natural-language pause/resume and a richer rule status board are still pending.
+  - Current rule lifecycle tools are `automation_list` and `automation_remove`; `automation_remove` can stop a running workflow before its next step. Natural-language pause/resume, conflict detection, reboot recovery, and a richer rule status board are still pending.
+- esp-claw-like single-board runtime layer:
+  - `main/capability/` mirrors legacy tools into capability descriptors with family, risk, flags, and execute handlers.
+  - `role_capability_profile` filters LLM-visible capabilities by Coordinator/Sensor/Control/Guardian role.
+  - `main/events/` provides a unified lightweight event flow for message bus, tool/capability calls, and traces.
+  - Memory v2 stores structured user profile facts and skill observations.
+  - Dynamic extension catalog records manifest primitives, Lua, and planned complex-protocol boundaries.
+- Managed Lua runtime:
+  - `ESPAGENT_ENABLE_LUA_RUNTIME=1`; `georgik/lua` is linked into the firmware.
+  - AI/CLI-visible tools include `lua_runtime_info`, `lua_list_modules`, `lua_list_scripts`, `lua_run_source`, `lua_run_script`, `lua_run_script_async`, `lua_list_jobs`, `lua_get_job`, and `lua_stop_job`.
+  - Scripts use `require("espagent")` or global `espagent`, then call `espagent.call_capability(name, args_json)`.
+  - Lua does not get raw unrestricted GPIO/I2C/ADC/PWM/RMT/BLE/display/camera/audio authority; hardware access still passes through ESPAgent capability/tool, sandbox, role profile, Guardian/Mesh policy, and Control interlock.
+  - Verified on real boards: USB0 Lua smoke 7/7 PASS after SNTP sync; USB0-3 cross-role Lua smoke 8/8 PASS.
 
 ## Safety Improvement Recently Added
 
@@ -211,7 +228,28 @@ Observed SGP30 sample range during runtime check:
 - eCO2 roughly `400` to `413 ppm`
 - TVOC roughly `0` to `14 ppb`
 
-## Current Progress Snapshot - 2026-06-18
+## Current Progress Snapshot - 2026-06-21
+
+The project is now in the esp-claw-inspired single-board runtime plus four-ESP32 Mesh collaboration stage.
+
+Implemented and verified since the 2026-06-18 snapshot:
+
+- ESPAgent now has a capability registry, role-visible capability profiles, a unified event layer, Memory v2, a dynamic extension catalog, and a managed Lua runtime.
+- `role_capability_profile` filters LLM-visible tools by `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`.
+- Lua runtime is enabled with `georgik/lua`; `lua_runtime_info`, `lua_list_modules`, `lua_list_scripts`, `lua_run_source`, `lua_run_script`, `lua_run_script_async`, `lua_list_jobs`, `lua_get_job`, and `lua_stop_job` are available.
+- Lua scripts must call existing ESPAgent capabilities through `espagent.call_capability(name, args_json)` and cannot bypass Guardian, Mesh policy, sandbox, or Control interlocks.
+- The latest Lua-runtime build uses about 22% of the 2 MB app slot, so further package/profile/UI growth still needs size management.
+- USB0 Lua smoke passed 7/7 after SNTP sync, and the same Lua runtime info/source smoke passed 8/8 across USB0-USB3.
+- The esp-claw-inspired migration is intentionally bounded: Board Descriptor / Board Profile, Lua package metadata, capability lifecycle, manifest primitives, and P4/Android script console are the next useful additions; raw unrestricted hardware modules remain intentionally unlinked.
+- The public knowledge base and architecture docs were updated to reflect that Control already has command queue, interlock, and approval-related foundations, while production broker ACL/TLS, real interlock wiring validation, decision-message authentication, and key rotation are still deployment work.
+
+Current engineering boundary:
+
+- The Agent no longer treats “Lua exists” as “Lua can directly drive hardware”. All hardware access still passes through ESPAgent capability/tool, sandbox, role profile, Guardian/Mesh policy, and Control interlock.
+- The four S3 roles are not four independent Linux-style agents; they are one firmware family with different profiles and Mesh responsibilities.
+- The ESP32-P4/C6 and Android Display Terminals remain display and trace consumers, not replacement control nodes.
+
+## Historical Progress Snapshot - 2026-06-18
 
 The project is now in the four-S3 Agent Mesh plus ESP32-P4/Android Display Terminal stage.
 
@@ -240,7 +278,7 @@ Implemented and verified since the 2026-06-15 snapshot:
 - Automation task stack overflow was reproduced and fixed by setting `ESPAGENT_AUTOMATION_STACK` to `12 * 1024` and using that value when creating the `automation` task.
 - ESP32-P4+C6 can subscribe to `nodes/+/telemetry`, so the AHT20 telemetry is now available to the display data stream. The current P4 UI should still be described carefully: MQTT subscribe/connect is verified, but not every Environment Monitor card is proven dynamically bound to live telemetry yet.
 
-Current engineering boundary:
+Historical engineering boundary from 2026-06-18:
 
 - The Agent does not keep thinking forever to maintain a condition task. The LLM translates the user's request into a stored rule, then firmware runtime executes the rule.
 - This makes background conditions reliable on the MCU, while preserving the Agent's role as planner/interpreter.
@@ -305,8 +343,8 @@ Verified on physical boards:
   - `crashes=0`, `RESULT: PASS`
   - Artifacts were saved under `artifacts/feishu_stress/feishu_stress_205412_ttyUSB*.log`.
 - The Feishu-entry Mesh stress fix and documentation update were pushed to private GitHub `main` as commit `dbe3c41` (`Stabilize Feishu mesh pressure path`).
-- `/dev/ttyUSB1` currently logs `DHT22=ESP_ERR_TIMEOUT` and `MH-Z19=ESP_FAIL`; this means the sensor node is online, but those specific physical sensors are not currently returning data on the configured pins.
-- On 2026-06-15, USB0 was reflashed with the current coordinator firmware containing `spawn_subagent`.
+- At that time, `/dev/ttyUSB1` logged `DHT22=ESP_ERR_TIMEOUT` and `MH-Z19=ESP_FAIL`; this meant the sensor node was online, but those specific physical sensors were not returning data on the configured pins.
+- On 2026-06-15, USB0 was reflashed with the then-current coordinator firmware containing `spawn_subagent`.
 - USB0 boot log verified `Registered tool: spawn_subagent`, `Tools JSON built (26 tools)`, and `Subagent tools JSON built`.
 - USB0 runtime verified `spawn_subagent` through serial CLI:
   - command: `tool_exec spawn_subagent {"task":"Call_get_current_time_and_return_one_sentence"}`
@@ -317,22 +355,22 @@ Verified on physical boards:
   - command: `inject_msg system react_test 请调用get_current_time并回复当前时间`
   - logs showed `Tool use iteration 1`, `LLM tool[0]: get_current_time({})`, `Tool[get_current_time] => 2026-06-15 12:48:18 CST (Monday)`, then final LLM answer
   - final response: `当前时间：**2026年6月15日（星期一）12:48 CST**`
-- Current four-role resource usage snapshot:
-  - Flash is not role-pruned yet. All roles use the same firmware image; latest verified app binary is `0x14f790`, leaving `0xb0870` bytes free in the 2MB app partition.
+- Historical four-role resource usage snapshot from 2026-06-15:
+  - Flash was not role-pruned yet. All roles used the same firmware image; then-verified app binary was `0x14f790`, leaving `0xb0870` bytes free in the 2MB app partition. The current 2026-06-21 Lua-runtime build is larger, about `0x1902c0` - `0x190310`, with about 22% app-slot free space.
   - USB0 Coordinator is the heaviest runtime role: LLM/Feishu/WebSocket/MQTT/SNTP/cron/proactive plus temporary `subagent`; USB0 boot showed PSRAM around 8MB free at startup and about 8.25MB free after the ReAct validation turn.
-  - USB1 Sensor currently runs sensor sampling, presence/environment monitors, MQTT telemetry, and serial CLI; it does not run LLM or Feishu.
-  - USB2 Control currently runs the control boundary, MQTT command receiver, local control tools, and boot servo demo; it does not run LLM or Feishu.
-  - USB3 Display currently runs the display/state/watchdog boundary and MQTT subscriptions, but still lacks real screen UI, timeline store, and watchdog aggregation, so it is the least utilized role.
-  - Current design is not "hardware fully saturated"; it is role-gated with large RAM/PSRAM/Flash headroom so Sensor cache, Control queue/interlock, and Display timeline/UI can still be added safely.
+  - USB1 Sensor ran sensor sampling, presence/environment monitors, MQTT telemetry, and serial CLI; it did not run LLM or Feishu.
+  - USB2 Control ran the control boundary, MQTT command receiver, local control tools, and boot servo demo; it did not run LLM or Feishu.
+  - USB3 Display was the old S3 display role at that point. Current USB3 role is Guardian; ESP32-P4/C6 and Android carry display-terminal responsibilities.
+  - The design was not "hardware fully saturated"; it was role-gated with RAM/PSRAM/Flash headroom for later Sensor cache, Control queue/interlock, and Display timeline/UI work.
 
-Still pending:
+Historical pending list from 2026-06-15; several items below have since been implemented:
 
 - Serial/MQTT proof that `sensor_agent` publishes a successful real `mesh_command_result` with actual AHT10/AHT20 data after a Feishu request.
 - Serial/MQTT proof that `control_agent` executes the remote WS2812 command on `/dev/ttyUSB2` and publishes the final result event.
-- Coordinator result correlation: wait for `mesh_command_result`, correlate `command_id`, and summarize the remote result back to Feishu.
-- `command_queue`, `safety_interlock`, `actuator_state`, authorization, audit events, timeline persistence, richer task-decomposition events, and Coordinator-side result correlation.
+- Coordinator result correlation: wait for `mesh_command_result`, correlate `command_id`, and summarize the remote result back to Feishu. This has since been implemented as async `OutputMessage` reinjection for Mesh results.
+- `command_queue`, `safety_interlock`, `actuator_state`, authorization, audit events, timeline persistence, richer task-decomposition events, and Coordinator-side result correlation. The command queue, actuator state, Guardian decision cache, manual approval queue, HMAC command verification hook, session trace, and lightweight task tree have since landed; production broker ACL/TLS, real interlock wiring validation, decision-message authentication, watchdog aggregation, and full task DAG remain pending.
 
-Best next engineering step:
+Historical next engineering step at that time:
 
 - Monitor `/dev/ttyUSB0-3` with elevated serial reads while sending one Feishu command at a time.
 - For sensor validation, send `读取温湿度` and verify Coordinator command publish, Sensor command receive, and `mesh_command_result`.
@@ -348,7 +386,7 @@ Runtime skills updated on 2026-06-15:
 
 ## Previous Progress Snapshot - 2026-06-14
 
-The project is currently in the two-board Coordinator/Sensor bring-up stage.
+At that time, the project was in the two-board Coordinator/Sensor bring-up stage.
 
 Implemented and verified in code:
 
@@ -359,7 +397,7 @@ Implemented and verified in code:
 - Coordinator prompt guidance tells the model to use `mesh_send_command` for remote sensor/control requests.
 - MQTT node/role command parsing validates JSON shape, `action`, target node, target role, TTL, safety level, acknowledgement flag, and args payload.
 - Sensor role has a narrow direct execution path for `read_temperature_humidity` and publishes `mesh_command_result`.
-- Control role still validates remote commands in dry-run mode and does not directly control hardware from the MQTT callback.
+- At that time, Control role still validated remote commands in dry-run mode and did not directly control hardware from the MQTT callback.
 
 Verified on physical boards:
 
@@ -370,13 +408,13 @@ Verified on physical boards:
 - USB1 boot logs confirmed `sensor_node: Sensor role enabled`; Feishu, LLM, scheduler/proactive, and boot servo demo were skipped by role policy.
 - USB1 started presence and environment monitor tasks.
 - Latest known coordinator build size: `0x14be80`; latest known sensor build size: `0x14be50`; both leave roughly 35% free in the smallest app partition.
-- Current runtime caveat: both boards reported `NO_AP_FOUND` for the configured Wi-Fi SSID during this flash validation, so MQTT state/events were not revalidated in this pass.
+- Runtime caveat from that pass: both boards reported `NO_AP_FOUND` for the configured Wi-Fi SSID during this flash validation, so MQTT state/events were not revalidated in this pass.
 
 Still pending:
 
 - Physical `sensor_agent` boot is now verified, but AHT10/AHT20-backed `read_temperature_humidity` over MQTT is not yet end-to-end verified.
 - Coordinator does not yet wait for `mesh_command_result`, correlate `command_id`, and summarize the remote result back to Feishu.
-- Control role is not currently flashed on USB1 after this pass; it remains the third-role target.
+- Control role was not flashed on USB1 after this pass; it remained the third-role target at that time.
 - Control role does not yet have `command_queue`, `safety_interlock`, `actuator_state`, authorization, or audit-driven hardware execution.
 - Basic `tool_use`/`tool_result`/final-reply timeline publication is implemented; persistent trace storage, richer task-decomposition events, and physical P4 display validation are still pending.
 
@@ -473,7 +511,8 @@ As of 2026-06-15:
 - Runtime caveat from this pass:
   - both boards reported `NO_AP_FOUND` for the configured Wi-Fi SSID during serial validation
   - MQTT connection, `state/events`, and `mesh_command_result` were therefore not revalidated after this role reassignment
-- Local build-time node profile in `main/espagent_secrets.h` is currently left as `esp32s3-sensor-01` / `sensor_agent`, matching the last firmware built and flashed to USB1.
+- Historical note from this pass: local build-time node profile had been left as `esp32s3-sensor-01` / `sensor_agent`.
+- Current flashing scripts restore `main/espagent_secrets.h` to the Coordinator profile after role flashing.
 
 ### 2026-06-09
 

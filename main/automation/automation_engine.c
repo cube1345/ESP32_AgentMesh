@@ -483,6 +483,20 @@ static void publish_rule_event(const automation_rule_t *rule,
                                              rule->name);
 }
 
+static bool workflow_still_active(const char *id)
+{
+    bool active = false;
+    lock();
+    for (int i = 0; i < AUTOMATION_MAX_WORKFLOWS; i++) {
+        if (s_workflows[i].used && strcmp(s_workflows[i].id, id) == 0) {
+            active = true;
+            break;
+        }
+    }
+    unlock();
+    return active;
+}
+
 static void workflow_task(void *arg)
 {
     automation_workflow_t *workflow = (automation_workflow_t *)arg;
@@ -493,9 +507,33 @@ static void workflow_task(void *arg)
 
     char summary[192];
     for (int i = 0; i < workflow->step_count; i++) {
+        if (!workflow_still_active(workflow->id)) {
+            snprintf(summary, sizeof(summary), "workflow=%s canceled before step=%d", workflow->id, i + 1);
+            (void)sensor_mqtt_publish_timeline_event("workflow",
+                                                     "automation_workflow_canceled",
+                                                     "canceled",
+                                                     summary,
+                                                     workflow->id,
+                                                     "control_agent",
+                                                     "",
+                                                     workflow->name);
+            break;
+        }
         automation_step_t *step = &workflow->steps[i];
         if (step->delay_ms > 0) {
             vTaskDelay(pdMS_TO_TICKS(step->delay_ms));
+        }
+        if (!workflow_still_active(workflow->id)) {
+            snprintf(summary, sizeof(summary), "workflow=%s canceled after delay before step=%d", workflow->id, i + 1);
+            (void)sensor_mqtt_publish_timeline_event("workflow",
+                                                     "automation_workflow_canceled",
+                                                     "canceled",
+                                                     summary,
+                                                     workflow->id,
+                                                     "control_agent",
+                                                     "",
+                                                     workflow->name);
+            break;
         }
 
         char output[768] = {0};

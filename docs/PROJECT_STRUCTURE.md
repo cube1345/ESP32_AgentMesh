@@ -39,15 +39,19 @@ main/
 ├── agent/          ReAct loop, prompt construction, OutputMessage handling
 ├── automation/     Persistent rules and delayed workflows
 ├── bus/            FreeRTOS inbound/outbound message queues
+├── capability/     esp-claw-like capability registry and role-visible profiles
 ├── cache/          Runtime cache for prompt fragments and skill summaries
 ├── channels/       External chat channels such as Feishu/Lark
 ├── cli/            USB serial diagnostics and maintenance commands
 ├── cron/           Scheduled injected agent turns
 ├── drivers/        Deterministic low-level peripheral drivers
+├── dynamic/        Runtime extension catalog for manifests/workflows/future Lua
+├── events/         Unified lightweight event router and recent event ring
 ├── espnow/         ESP-NOW telemetry path
 ├── gateway/        Local WebSocket chat gateway
 ├── heartbeat/      Background heartbeat checks
 ├── llm/            LLM provider HTTP client and tool-use parsing
+├── lua/            Optional bounded Lua runtime adapter
 ├── memory/         Long-term memory and session persistence
 ├── mesh/           MQTT Mesh protocol structs, topics, and validation
 ├── node/           Node identity, role, and capability model
@@ -67,7 +71,18 @@ main/
 - Chat ingress belongs in `main/channels/<channel>/`, not in hardware tools.
 - The agent loop decides intent; tools execute bounded actions.
 - Hardware bus code and chip protocols belong in `main/drivers/`.
-- AI-callable wrappers belong in `main/tools/`.
+- AI-callable wrappers belong in `main/tools/`; capability metadata, role-visible
+  tool catalogs, and esp-claw-like callable grouping belong in `main/capability/`.
+- Structured events from message bus, tools, Mesh, automation, or future channels
+  belong in `main/events/`; channels should emit events instead of inventing
+  private trace formats.
+- Runtime hardware extension discovery belongs in `main/dynamic/`; actual
+  deterministic primitive execution remains in `main/tools/tool_virtual_device.c`
+  and low-level bus drivers.
+- Lua script execution belongs in `main/lua/`; AI-facing Lua commands belong in
+  `main/tools/tool_lua.c` and must still pass sandbox/capability policy. Lua is
+  linked through `georgik/lua`; scripts use `require('espagent')` or global
+  `espagent` to call existing capabilities instead of bypassing Mesh/Guardian.
 - Cross-node command schema and topic validation belong in `main/mesh/`.
 - Role-specific startup and local service ownership belong in `main/roles/`.
 - Long-running deterministic behavior belongs in `main/automation/`, `main/cron/`,

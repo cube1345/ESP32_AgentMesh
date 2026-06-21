@@ -1,0 +1,28 @@
+{
+  "manifest_version": 1,
+  "name": "spi_jedec_id_example",
+  "protocol": "spi",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "mosi": 7,
+    "miso": 8,
+    "sclk": 9,
+    "cs": 10
+  },
+  "host": 2,
+  "mode": 0,
+  "frequency_hz": 1000000,
+  "command_bytes": [159],
+  "dummy_bytes": 0,
+  "read_length": 3,
+  "timeout_ms": 1000,
+  "notes": "Generic SPI read example for JEDEC ID style devices. This primitive performs a bounded transfer and returns read bytes as hex."
+}

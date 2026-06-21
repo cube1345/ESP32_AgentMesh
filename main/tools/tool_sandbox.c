@@ -47,7 +47,19 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"web_search", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_NETWORK},
     {"get_weather", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_NETWORK},
     {"get_current_time", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_runtime_info", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_list_modules", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_list_scripts", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_run_source", ESPAGENT_TOOL_RISK_SYSTEM, TOOL_CAP_SYSTEM},
+    {"lua_run_script", ESPAGENT_TOOL_RISK_SYSTEM, TOOL_CAP_SYSTEM},
+    {"lua_run_script_async", ESPAGENT_TOOL_RISK_SYSTEM, TOOL_CAP_SYSTEM},
+    {"lua_list_jobs", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_get_job", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
+    {"lua_stop_job", ESPAGENT_TOOL_RISK_SYSTEM, TOOL_CAP_SYSTEM},
+    {"memory_profile_set", ESPAGENT_TOOL_RISK_PRIVACY, TOOL_CAP_MEMORY_WRITE},
+    {"skill_observation_add", ESPAGENT_TOOL_RISK_PRIVACY, TOOL_CAP_MEMORY_WRITE},
     {"read_temperature_humidity", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR | TOOL_CAP_MESH},
+    {"virtual_device_read", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR | TOOL_CAP_MESH},
     {"read_environment", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
     {"read_air_quality", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
     {"sgp30_read_air_quality", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
@@ -58,6 +70,7 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"gpio_read_all", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
     {"set_status_light", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"ws2812_set", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"virtual_device_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"servo_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"max98357_play_tone", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL},
@@ -149,14 +162,31 @@ static bool path_is_skill(const char *path)
     return path && strstr(path, "/skills/") != NULL;
 }
 
-static bool role_allows_caps(unsigned caps)
+static bool tool_is_lua_system_action(const char *name)
+{
+    return name &&
+           (strcmp(name, "lua_run_source") == 0 ||
+            strcmp(name, "lua_run_script") == 0 ||
+            strcmp(name, "lua_run_script_async") == 0 ||
+            strcmp(name, "lua_stop_job") == 0);
+}
+
+static bool role_allows_caps(const char *name, unsigned caps)
 {
     if (espagent_role_is_edge()) {
         return true;
     }
 
-    if ((caps & (TOOL_CAP_FILE_WRITE | TOOL_CAP_MEMORY_WRITE | TOOL_CAP_SYSTEM)) &&
-        !espagent_role_is_coordinator()) {
+    if ((caps & TOOL_CAP_FILE_WRITE) && !espagent_role_is_coordinator()) {
+        return false;
+    }
+    if ((caps & TOOL_CAP_SYSTEM) &&
+        !espagent_role_is_coordinator() &&
+        !tool_is_lua_system_action(name)) {
+        return false;
+    }
+    if ((caps & TOOL_CAP_MEMORY_WRITE) &&
+        !(espagent_role_is_coordinator() || espagent_role_runs_guardian())) {
         return false;
     }
     if ((caps & TOOL_CAP_AUTOMATION) && !espagent_role_is_coordinator()) {
@@ -226,7 +256,11 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "servo_write") != 0 &&
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
-        strcmp(action, "read_temperature_humidity") != 0) {
+        strcmp(action, "virtual_device_control") != 0 &&
+        strcmp(action, "control_state") != 0 &&
+        strcmp(action, "control_emergency_stop") != 0 &&
+        strcmp(action, "read_temperature_humidity") != 0 &&
+        strcmp(action, "virtual_device_read") != 0) {
         deny(reason, reason_size, "sandbox denied mesh_send_command: unsupported action=%s", action);
         return false;
     }
@@ -289,7 +323,7 @@ esp_err_t tool_sandbox_check(const char *name,
         return ESP_ERR_NOT_FOUND;
     }
 
-    if (!role_allows_caps(rule->caps)) {
+    if (!role_allows_caps(name, rule->caps)) {
         deny(reason, reason_size, "sandbox denied %s: role is not allowed to use %s capability",
              name, tool_sandbox_risk_name(rule->risk));
         return ESP_ERR_INVALID_STATE;

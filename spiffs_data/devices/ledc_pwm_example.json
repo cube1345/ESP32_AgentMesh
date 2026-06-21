@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "name": "ledc_pwm_example",
+  "protocol": "ledc_pwm",
+  "role": "control_agent",
+  "risk": "medium_control",
+  "permissions": ["control"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pin": 6,
+  "frequency_hz": 1000,
+  "default_duty_pct": 25,
+  "ledc_channel": 2,
+  "ledc_timer": 2,
+  "invert": false,
+  "max_duration_ms": 5000,
+  "cooldown_ms": 1000,
+  "notes": "Explicit ledc_pwm alias example. Behavior matches pwm_output but keeps protocol naming close to ESP-IDF LEDC."
+}

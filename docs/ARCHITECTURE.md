@@ -154,6 +154,24 @@ Persistent automation is the first runtime layer for multi-step and always-on co
 
 Automation has two execution paths. Condition-action rules are handled by one long-lived `rule_task`, which scans up to `ESPAGENT_AUTOMATION_MAX_RULES` active rules, respects each rule's `interval_s`, `cooldown_s`, and hysteresis, then runs Sensor/Control Mesh calls serially. Ordered/delayed workflows do not run inside `rule_task`: every accepted workflow starts a temporary `workflow_task`, executes up to `ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS` steps in order, then marks itself complete. Current limits are 8 rules, 8 workflow slots, and 8 steps per workflow. Rules are persisted across reboot; workflow tasks are currently one-shot runtime work and are not restored after reboot.
 
+## esp-claw-Inspired Runtime Direction
+
+ESPAgent adopts the useful engineering ideas from esp-claw without replacing the project identity or bypassing ESPAgent's security model. The migrated layer is a managed single-board runtime: capability descriptors, role-visible capability profiles, event/trace records, Memory v2, dynamic extension discovery, and a bounded Lua runtime. Lua is linked through `georgik/lua` and exposed through AI-callable tools such as `lua_runtime_info`, `lua_list_modules`, `lua_list_scripts`, `lua_run_source`, `lua_run_script`, and async job management tools.
+
+Lua scripts run as system-level extensions, but they do not get raw unrestricted hardware authority. Scripts use `require("espagent")` or the global `espagent` table and call `espagent.call_capability(name, args_json)`. That call enters the same ESPAgent capability/tool path used by Serial CLI, LLM tools, Mesh, and automation, so sandbox checks, role policy, Guardian policy, Mesh validation, and Control local interlocks remain authoritative. Direct esp-claw-style hardware modules such as raw GPIO, I2C, ADC, PWM, RMT, BLE, display, camera, or audio are intentionally not linked unless they can be wrapped behind ESPAgent capability/manifest policy.
+
+Current verification status: the latest Lua runtime build fits the 2 MB app slot with about 22% free space, `/dev/ttyUSB0-3` verify as Coordinator/Sensor/Control/Guardian, USB0 Lua smoke passes 7/7 after SNTP sync, and the same Lua runtime info/source smoke passes 8/8 across all four S3 roles. This verifies the managed runtime layer on every role, but it does not imply all physical sensors, actuators, manifest primitives, or display UI bindings have been hardware-tested.
+
+The next safe esp-claw-inspired improvements are:
+
+- Board descriptors / board profiles for each ESP32-S3 role and ESP32-P4 display terminal, including pins, sensors, actuators, safe ranges, risky actions, and validation status.
+- Lua package layout under `/spiffs/scripts/builtin/`, `/spiffs/scripts/user/`, and `/spiffs/skills/<skill>/scripts/`, with source, version, risk, and confirmation metadata.
+- Developer tooling that can generate a Lua script, manifest primitive, capability schema, skill document, and benchmark case together.
+- Capability lifecycle fields such as `init`, `start`, `health_check`, `stop`, and `benchmark`, so tools are not only registered but also observable.
+- P4/Android debug surfaces for script jobs, capability lists, Guardian decisions, benchmark results, and timeline traces.
+
+The project should not become a direct esp-claw copy. ESPAgent's differentiator remains multi-ESP32 Agent Mesh coordination, Guardian permission management, structured OutputMessage/ReAct closure, MQTT Mesh communication, P4/Android reasoning visualization, and Lua/manifest as a safe extension layer.
+
 For four ESP32-S3 boards, use the same firmware and assign different node profiles in `espagent_secrets.h`: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`. ESP32-P4/Android carry the display-terminal role. See `docs/ESP32_ROLE_PROFILES.md`.
 
 ---

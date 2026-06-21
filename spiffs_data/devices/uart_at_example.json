@@ -1,0 +1,29 @@
+{
+  "manifest_version": 1,
+  "name": "uart_at_example",
+  "protocol": "uart",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "tx": 17,
+    "rx": 16
+  },
+  "uart_port": 2,
+  "baud": 115200,
+  "data_bits": 8,
+  "stop_bits": 1,
+  "parity": "none",
+  "command_ascii": "ATI",
+  "terminator": "\r\n",
+  "post_write_delay_ms": 80,
+  "read_length": 64,
+  "timeout_ms": 500,
+  "notes": "Generic UART query manifest example for read-only AT-style serial modules. UART0 is reserved for the console."
+}

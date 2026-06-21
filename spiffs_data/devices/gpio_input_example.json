@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "name": "gpio_input_example",
+  "protocol": "gpio_input",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pin": 13,
+  "pullup": false,
+  "pulldown": false,
+  "invert": false,
+  "field": "digital_level",
+  "notes": "Generic GPIO input read example. It only reads an allowlisted pin and does not drive output."
+}

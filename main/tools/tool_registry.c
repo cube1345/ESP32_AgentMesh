@@ -5,9 +5,11 @@
 #include "tools/tool_cron.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
+#include "tools/tool_lua.h"
 #include "tools/tool_mesh_command.h"
 #include "tools/tool_sandbox.h"
 #include "tools/tool_subagent.h"
+#include "tools/tool_virtual_device.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_aht10.h"
 #include "tools/tool_environment.h"
@@ -18,6 +20,9 @@
 #include "tools/tool_bh1750.h"
 #include "tools/tool_web_search.h"
 #include "tools/tool_amap_weather.h"
+#include "capability/capability_registry.h"
+#include "events/espagent_event.h"
+#include "memory/memory_v2.h"
 #include "roles/role_config.h"
 
 #include <stdlib.h>
@@ -27,7 +32,7 @@
 
 static const char *TAG = "tools";
 
-#define MAX_TOOLS 40
+#define MAX_TOOLS 56
 
 static espagent_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
@@ -45,6 +50,78 @@ static bool json_bool_value(cJSON *root, const char *key, bool default_value)
         return default_value;
     }
     return cJSON_IsTrue(item);
+}
+
+static const char *json_string_value(cJSON *root, const char *key)
+{
+    cJSON *item = root ? cJSON_GetObjectItem(root, key) : NULL;
+    return cJSON_IsString(item) ? item->valuestring : NULL;
+}
+
+static esp_err_t tool_memory_profile_set_execute(const char *input_json,
+                                                 char *output,
+                                                 size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: invalid JSON");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *key = json_string_value(root, "key");
+    const char *value = json_string_value(root, "value");
+    const char *source = json_string_value(root, "source");
+    cJSON *confidence_item = cJSON_GetObjectItem(root, "confidence");
+    float confidence = cJSON_IsNumber(confidence_item) ? (float)confidence_item->valuedouble : 0.7f;
+    if (!key || !key[0] || !value) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: key and value are required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char key_copy[64];
+    snprintf(key_copy, sizeof(key_copy), "%s", key);
+
+    esp_err_t err = memory_v2_upsert_profile_fact(key, value, source ? source : "agent", confidence);
+    cJSON_Delete(root);
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "OK: structured profile fact saved key=%s", key_copy);
+    } else {
+        snprintf(output, output_size, "Error: profile save failed: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static esp_err_t tool_skill_observation_add_execute(const char *input_json,
+                                                    char *output,
+                                                    size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: invalid JSON");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *skill = json_string_value(root, "skill");
+    const char *status = json_string_value(root, "status");
+    const char *summary = json_string_value(root, "summary");
+    if (!skill || !skill[0]) {
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: skill is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char skill_copy[64];
+    snprintf(skill_copy, sizeof(skill_copy), "%s", skill);
+
+    esp_err_t err = memory_v2_append_skill_observation(skill, status, summary);
+    cJSON_Delete(root);
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "OK: skill observation saved skill=%s", skill_copy);
+    } else {
+        snprintf(output, output_size, "Error: skill observation save failed: %s", esp_err_to_name(err));
+    }
+    return err;
 }
 
 static esp_err_t tool_read_temperature_humidity_execute(const char *input_json,
@@ -207,11 +284,27 @@ static void register_tool(const espagent_tool_t *tool)
     }
 
     s_tools[s_tool_count++] = *tool;
+    esp_err_t cap_err = espagent_capability_register_legacy_tool(tool->name,
+                                                                tool->description,
+                                                                tool->input_schema_json,
+                                                                tool->execute);
+    if (cap_err != ESP_OK) {
+        ESP_LOGW(TAG, "Capability mirror register failed for %s: %s",
+                 tool->name, esp_err_to_name(cap_err));
+    }
     ESP_LOGI(TAG, "Registered tool: %s", tool->name);
 }
 
 static void build_tools_json(void)
 {
+    char *cap_json = espagent_capability_build_llm_tools_json();
+    if (cap_json) {
+        free(s_tools_json);
+        s_tools_json = cap_json;
+        ESP_LOGI(TAG, "Tools JSON built from capability registry (%d tools)", s_tool_count);
+        return;
+    }
+
     cJSON *arr = cJSON_CreateArray();
 
     for (int i = 0; i < s_tool_count; i++) {
@@ -237,6 +330,7 @@ static void build_tools_json(void)
 esp_err_t tool_registry_init(void)
 {
     s_tool_count = 0;
+    espagent_capability_registry_init();
 
     tool_web_search_init();
     tool_amap_weather_init();
@@ -274,6 +368,125 @@ esp_err_t tool_registry_init(void)
     });
 
     register_tool(&(espagent_tool_t){
+        .name = "lua_runtime_info",
+        .description = "Report whether the optional Lua runtime is available on this firmware, plus script roots, size limit, and timeout limits. Call this before lua_run_script when unsure.",
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+        .execute = tool_lua_runtime_info_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_list_modules",
+        .description = "List Lua modules available in this firmware. ESPAgent exposes a safe espagent module and restricted standard libraries; direct hardware modules are intentionally not linked unless shown here.",
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+        .execute = tool_lua_list_modules_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_list_scripts",
+        .description = "List runnable Lua scripts under /spiffs/scripts/ and /spiffs/skills/. Use this before lua_run_script when the path is unknown.",
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+        .execute = tool_lua_list_scripts_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_run_source",
+        .description = "Run bounded inline Lua source with the same safe ESPAgent Lua environment as lua_run_script. Requires confirmed=true. Prefer known script files for production; use inline source for development smoke tests.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"source\":{\"type\":\"string\",\"description\":\"Lua source code, bounded by ESPAGENT_LUA_MAX_SCRIPT_BYTES\"},"
+            "\"args\":{\"type\":\"object\",\"description\":\"Optional arguments exposed to Lua as args and ESPAGENT_ARGS_JSON\"},"
+            "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string exposed to Lua\"},"
+            "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":5000,\"description\":\"Execution timeout, defaults to 1000ms and max 5000ms\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Required because inline Lua is a script execution capability\"}},"
+            "\"required\":[\"source\",\"confirmed\"],\"additionalProperties\":false}",
+        .execute = tool_lua_run_source_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_run_script",
+        .description = "Run a bounded Lua script from SPIFFS. Scripts must be absolute .lua paths under /spiffs/scripts/ or /spiffs/skills/, with no '..'. The runtime is optional: if Lua is not linked, this returns a clear not-supported error instead of pretending to execute. Hardware access must still go through ESPAgent capabilities, sandbox, Mesh, and Guardian; Lua scripts must not bypass safety controls.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute .lua path under /spiffs/scripts/ or /spiffs/skills/\"},"
+            "\"args\":{\"type\":\"object\",\"description\":\"Optional arguments exposed to Lua as ESPAGENT_ARGS_JSON\"},"
+            "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string exposed as ESPAGENT_ARGS_JSON\"},"
+            "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":5000,\"description\":\"Execution timeout, defaults to 1000ms and max 5000ms\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Required because Lua is a script execution capability\"}},"
+            "\"required\":[\"path\",\"confirmed\"],\"additionalProperties\":false}",
+        .execute = tool_lua_run_script_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_run_script_async",
+        .description = "Start a bounded Lua script as a background job. Use this for scripts that may take longer than one tool turn. Requires confirmed=true and the same /spiffs/scripts/ or /spiffs/skills/ path limits as lua_run_script.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"Absolute .lua path under /spiffs/scripts/ or /spiffs/skills/\"},"
+            "\"args\":{\"type\":\"object\",\"description\":\"Optional arguments exposed to Lua as ESPAGENT_ARGS_JSON\"},"
+            "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string exposed as ESPAGENT_ARGS_JSON\"},"
+            "\"timeout_ms\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":5000,\"description\":\"Execution timeout, defaults to 1000ms and max 5000ms\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Required because Lua is a script execution capability\"}},"
+            "\"required\":[\"path\",\"confirmed\"],\"additionalProperties\":false}",
+        .execute = tool_lua_run_script_async_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_list_jobs",
+        .description = "List recent Lua async jobs with state, path, timing, and captured output.",
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+        .execute = tool_lua_list_jobs_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_get_job",
+        .description = "Get one Lua async job by job_id, including state and captured output.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"job_id\":{\"type\":\"string\",\"description\":\"Lua job id returned by lua_run_script_async\"}},"
+            "\"required\":[\"job_id\"],\"additionalProperties\":false}",
+        .execute = tool_lua_get_job_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "lua_stop_job",
+        .description = "Request cooperative stop for a running Lua async job. The runtime hook observes the stop flag when Lua is linked.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"job_id\":{\"type\":\"string\",\"description\":\"Lua job id returned by lua_run_script_async\"}},"
+            "\"required\":[\"job_id\"],\"additionalProperties\":false}",
+        .execute = tool_lua_stop_job_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "memory_profile_set",
+        .description = "Store or update a structured user-profile fact in Memory v2. Use this for stable user preferences, habits, constraints, and repeated contradictions with previous preferences. Keep keys short, such as humidity_min_preferred or morning_weather_preference.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"key\":{\"type\":\"string\",\"description\":\"Stable profile key\"},"
+            "\"value\":{\"type\":\"string\",\"description\":\"Current fact or preference value\"},"
+            "\"source\":{\"type\":\"string\",\"description\":\"Where this fact came from, e.g. feishu, observation, correction\"},"
+            "\"confidence\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1,\"description\":\"Confidence in this fact, defaults to 0.7\"}},"
+            "\"required\":[\"key\",\"value\"],\"additionalProperties\":false}",
+        .execute = tool_memory_profile_set_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "skill_observation_add",
+        .description = "Record a structured observation about a skill, capability, benchmark case, hardware manifest, or validation result. Use this after tests or repeated failures so future prompts know which skills are reliable.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"skill\":{\"type\":\"string\",\"description\":\"Skill or capability name\"},"
+            "\"status\":{\"type\":\"string\",\"description\":\"observed, passed, failed, partial, blocked\"},"
+            "\"summary\":{\"type\":\"string\",\"description\":\"Short validation note\"}},"
+            "\"required\":[\"skill\"],\"additionalProperties\":false}",
+        .execute = tool_skill_observation_add_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
         .name = "read_temperature_humidity",
         .description = "Read temperature and humidity from this board's local AHT10/AHT20 I2C sensor. On a coordinator_agent, do not use this for ordinary Feishu room temperature/humidity requests; route those through mesh_send_command to sensor_agent unless the user explicitly asks for this board, local sensor, or I2C wiring diagnostics. Optional SDA/SCL GPIO overrides can be provided for wiring diagnostics.",
         .input_schema_json =
@@ -295,7 +508,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads and control_agent for actuators.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh command action\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"control_state\",\"control_emergency_stop\"],\"description\":\"Whitelisted mesh command action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -306,6 +519,33 @@ esp_err_t tool_registry_init(void)
             "\"async\":{\"type\":\"boolean\",\"description\":\"When true, return immediately and inject the remote OutputMessage later; defaults to true\"}},"
             "\"required\":[\"action\"],\"additionalProperties\":false}",
         .execute = tool_mesh_send_command_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "virtual_device_read",
+        .description = "Read a simple read-only runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports bounded I2C, UART query, Modbus RTU function 3/4 register reads, SPI transfer-read, ADC one-shot, and GPIO input manifests. The manifest must use manifest_version=1, role=sensor_agent, permissions=[read], and risk=read_only. On a coordinator_agent, this routes to sensor_agent unless local=true is explicitly set. Use this when a developer added a protocol manifest for a new simple sensor or serial module and no dedicated C tool exists.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"device\":{\"type\":\"string\",\"description\":\"Device manifest name, loaded from /spiffs/devices/<device>.json\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly reading this board locally instead of routing to sensor_agent\"}},"
+            "\"required\":[\"device\"],\"additionalProperties\":false}",
+        .execute = tool_virtual_device_read_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "virtual_device_control",
+        .description = "Control a bounded runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports gpio_output, relay_control, pwm_output, and ledc_pwm manifests with allowlisted pins, max_duration_ms, cooldown_ms, safe_level, required SHA-256 sidecar, and confirmed=true requirements for persistent high-impact actions. Bounded duration schedules a background safe-state restore rather than blocking the caller. On a coordinator_agent, this routes to control_agent unless local=true is explicitly set.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"device\":{\"type\":\"string\",\"description\":\"Device manifest name, loaded from /spiffs/devices/<device>.json\"},"
+            "\"level\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":1,\"description\":\"GPIO output level for gpio_output/relay_control\"},"
+            "\"active\":{\"type\":\"boolean\",\"description\":\"Set relay/control device active or safe\"},"
+            "\"duty_pct\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":100,\"description\":\"PWM duty percentage\"},"
+            "\"duration_ms\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":30000,\"description\":\"Bounded duration before returning to safe state; 0 means persistent\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Required for persistent high-impact control\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this board locally instead of routing to control_agent\"}},"
+            "\"required\":[\"device\"],\"additionalProperties\":false}",
+        .execute = tool_virtual_device_control_execute,
     });
 
     register_tool(&(espagent_tool_t){
@@ -656,8 +896,11 @@ void tool_registry_get_tools(const espagent_tool_t **tools, int *count)
     }
 }
 
-esp_err_t tool_registry_execute(const char *name, const char *input_json,
-                                char *output, size_t output_size)
+esp_err_t tool_registry_execute_as(const char *name,
+                                   const char *input_json,
+                                   espagent_capability_caller_t caller,
+                                   char *output,
+                                   size_t output_size)
 {
     for (int i = 0; i < s_tool_count; i++) {
         if (strcmp(s_tools[i].name, name) == 0) {
@@ -673,11 +916,38 @@ esp_err_t tool_registry_execute(const char *name, const char *input_json,
                 return sandbox_err;
             }
             ESP_LOGI(TAG, "Executing tool: %s", name);
-            return s_tools[i].execute(input_json, output, output_size);
+            espagent_event_emit_simple("capability.call",
+                                       "tool_registry",
+                                       "",
+                                       "",
+                                       name,
+                                       input_json ? input_json : "{}");
+            esp_err_t err = espagent_capability_execute(name,
+                                                        input_json,
+                                                        caller,
+                                                        output,
+                                                        output_size);
+            espagent_event_emit_simple(err == ESP_OK ? "capability.result" : "capability.error",
+                                       "tool_registry",
+                                       "",
+                                       "",
+                                       name,
+                                       output ? output : "");
+            return err;
         }
     }
 
     ESP_LOGW(TAG, "Unknown tool: %s", name);
     snprintf(output, output_size, "Error: unknown tool '%s'", name);
     return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t tool_registry_execute(const char *name, const char *input_json,
+                                char *output, size_t output_size)
+{
+    return tool_registry_execute_as(name,
+                                    input_json,
+                                    ESPAGENT_CAP_CALLER_AGENT,
+                                    output,
+                                    output_size);
 }

@@ -1,0 +1,21 @@
+{
+  "manifest_version": 1,
+  "name": "relay_control_example",
+  "protocol": "relay_control",
+  "role": "control_agent",
+  "risk": "high_control",
+  "permissions": ["control"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pin": 5,
+  "active_level": 1,
+  "safe_level": 0,
+  "default_level": 0,
+  "max_duration_ms": 10000,
+  "cooldown_ms": 5000,
+  "notes": "Generic relay example. Persistent active relay control requires confirmed=true; bounded duration_ms is preferred."
+}

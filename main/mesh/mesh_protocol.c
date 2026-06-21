@@ -3,9 +3,11 @@
 #include "cJSON.h"
 #include "esp_err.h"
 #include "espagent_config.h"
+#include "mesh/mesh_auth.h"
 #include "node/node_profile.h"
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -34,6 +36,12 @@ static int json_int(cJSON *root, const char *key, int default_value)
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
     return cJSON_IsNumber(item) ? item->valueint : default_value;
+}
+
+static int64_t json_i64(cJSON *root, const char *key, int64_t default_value)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsNumber(item) ? (int64_t)item->valuedouble : default_value;
 }
 
 static bool json_bool(cJSON *root, const char *key, bool default_value)
@@ -131,6 +139,8 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     copy_field(out->target_node, sizeof(out->target_node), json_string(root, "target_node"));
     copy_field(out->target_role, sizeof(out->target_role), json_string(root, "target_role"));
     copy_field(out->action, sizeof(out->action), action);
+    copy_field(out->signature, sizeof(out->signature), json_string(root, "signature"));
+    out->ts_ms = json_i64(root, "ts_ms", 0);
     out->ttl_ms = json_int(root, "ttl_ms", 30000);
     out->safety_level = json_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
     out->require_ack = json_bool(root, "require_ack", true);
@@ -140,6 +150,23 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     if (args_err != ESP_OK) {
         set_err(err_buf, err_buf_size, "failed to serialize args");
         return args_err;
+    }
+
+    if (out->ttl_ms < 1000 || out->ttl_ms > 30000) {
+        set_err(err_buf, err_buf_size, "ttl_ms must be 1000..30000");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (out->safety_level < ESPAGENT_MESH_SAFETY_LOW ||
+        out->safety_level > ESPAGENT_MESH_SAFETY_HIGH) {
+        set_err(err_buf, err_buf_size, "safety_level must be 0..2");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char auth_reason[96] = {0};
+    esp_err_t auth_err = espagent_mesh_auth_verify_command(out, auth_reason, sizeof(auth_reason));
+    if (auth_err != ESP_OK) {
+        set_err(err_buf, err_buf_size, auth_reason);
+        return auth_err;
     }
 
     if (out->target_node[0] != '\0' && strcmp(out->target_node, espagent_node_id()) != 0) {

@@ -18,6 +18,7 @@
 #include "skills/skill_loader.h"
 #include "ota/ota_manager.h"
 #include "sensors/sensor_mqtt.h"
+#include "guardian/approval_queue.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -819,7 +820,11 @@ static int cmd_tool_exec(int argc, char **argv)
         return 1;
     }
 
-    esp_err_t err = tool_registry_execute(tool_name, input_json, output, 4096);
+    esp_err_t err = tool_registry_execute_as(tool_name,
+                                             input_json,
+                                             ESPAGENT_CAP_CALLER_CLI,
+                                             output,
+                                             4096);
     printf("tool_exec status: %s\n", esp_err_to_name(err));
     printf("%s\n", output[0] ? output : "(empty)");
     free(output);
@@ -1069,6 +1074,108 @@ static int cmd_stateboard_show(int argc, char **argv)
     printf("stateboard_show status: %s\n", esp_err_to_name(err));
     printf("%s\n", err == ESP_OK ? json : "(empty)");
     free(json);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_trace_show(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: trace_show <chat_id> [max_events]\n");
+        return 1;
+    }
+    int max_events = argc >= 3 ? atoi(argv[2]) : 16;
+    if (max_events <= 0) {
+        max_events = 16;
+    }
+
+    char *json = calloc(1, 4096);
+    if (!json) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+    esp_err_t err = session_get_trace_json(argv[1], json, 4096, max_events);
+    printf("trace_show status: %s\n", esp_err_to_name(err));
+    printf("%s\n", json);
+    free(json);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_trace_index(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    char *json = calloc(1, 4096);
+    if (!json) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+    esp_err_t err = session_get_trace_index_json(json, 4096);
+    printf("trace_index status: %s\n", esp_err_to_name(err));
+    printf("%s\n", json);
+    free(json);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_task_tree(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: task_tree <chat_id> [max_events]\n");
+        return 1;
+    }
+    int max_events = argc >= 3 ? atoi(argv[2]) : 32;
+    if (max_events <= 0) {
+        max_events = 32;
+    }
+
+    char *json = calloc(1, 8192);
+    if (!json) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+    esp_err_t err = session_get_task_tree_json(argv[1], json, 8192, max_events);
+    printf("task_tree status: %s\n", esp_err_to_name(err));
+    printf("%s\n", json);
+    free(json);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_approval_list(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    char *json = calloc(1, 4096);
+    if (!json) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+    esp_err_t err = guardian_approval_list_json(json, 4096);
+    printf("approval_list status: %s\n", esp_err_to_name(err));
+    printf("%s\n", err == ESP_OK ? json : "(empty)");
+    free(json);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_approval_confirm(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: approval_confirm <approval_id>\n");
+        return 1;
+    }
+    char out[192] = {0};
+    esp_err_t err = guardian_approval_resolve(argv[1], true, out, sizeof(out));
+    printf("approval_confirm status: %s\n%s\n", esp_err_to_name(err), out);
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_approval_deny(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage: approval_deny <approval_id>\n");
+        return 1;
+    }
+    char out[192] = {0};
+    esp_err_t err = guardian_approval_resolve(argv[1], false, out, sizeof(out));
+    printf("approval_deny status: %s\n%s\n", esp_err_to_name(err), out);
     return err == ESP_OK ? 0 : 1;
 }
 
@@ -1467,6 +1574,49 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_stateboard_show,
     };
     esp_console_cmd_register(&stateboard_show_cmd);
+
+    /* trace_show */
+    esp_console_cmd_t trace_show_cmd = {
+        .command = "trace_show",
+        .help = "Show recent per-session ReAct/tool trace events: trace_show <chat_id> [max_events]",
+        .func = &cmd_trace_show,
+    };
+    esp_console_cmd_register(&trace_show_cmd);
+
+    esp_console_cmd_t trace_index_cmd = {
+        .command = "trace_index",
+        .help = "List persisted per-session trace files",
+        .func = &cmd_trace_index,
+    };
+    esp_console_cmd_register(&trace_index_cmd);
+
+    esp_console_cmd_t task_tree_cmd = {
+        .command = "task_tree",
+        .help = "Show grouped ReAct/Mesh task tree from recent trace events: task_tree <chat_id> [max_events]",
+        .func = &cmd_task_tree,
+    };
+    esp_console_cmd_register(&task_tree_cmd);
+
+    esp_console_cmd_t approval_list_cmd = {
+        .command = "approval_list",
+        .help = "Show pending/resolved Guardian approval requests",
+        .func = &cmd_approval_list,
+    };
+    esp_console_cmd_register(&approval_list_cmd);
+
+    esp_console_cmd_t approval_confirm_cmd = {
+        .command = "approval_confirm",
+        .help = "Mark a Guardian approval request as approved",
+        .func = &cmd_approval_confirm,
+    };
+    esp_console_cmd_register(&approval_confirm_cmd);
+
+    esp_console_cmd_t approval_deny_cmd = {
+        .command = "approval_deny",
+        .help = "Mark a Guardian approval request as denied",
+        .func = &cmd_approval_deny,
+    };
+    esp_console_cmd_register(&approval_deny_cmd);
 
     /* restart */
     esp_console_cmd_t restart_cmd = {

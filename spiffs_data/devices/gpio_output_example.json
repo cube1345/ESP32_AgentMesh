@@ -1,0 +1,20 @@
+{
+  "manifest_version": 1,
+  "name": "gpio_output_example",
+  "protocol": "gpio_output",
+  "role": "control_agent",
+  "risk": "medium_control",
+  "permissions": ["control"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pin": 4,
+  "default_level": 1,
+  "safe_level": 0,
+  "max_duration_ms": 5000,
+  "cooldown_ms": 1000,
+  "notes": "Generic bounded GPIO output example. Persistent output requires deliberate use; prefer duration_ms for safety."
+}

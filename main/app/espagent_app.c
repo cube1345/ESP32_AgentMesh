@@ -25,10 +25,13 @@
 #include "channels/feishu/feishu_bot.h"
 #include "cli/serial_cli.h"
 #include "cron/cron_service.h"
+#include "dynamic/dynamic_extension.h"
+#include "events/espagent_event.h"
 #include "gateway/ws_server.h"
 #include "heartbeat/heartbeat.h"
 #include "llm/llm_proxy.h"
 #include "memory/memory_store.h"
+#include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "onboard/wifi_onboard.h"
 #include "proactive/proactive_service.h"
@@ -304,10 +307,13 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(esp_event_loop_create_default(), TAG, "esp_event_loop_create_default failed");
     ESP_RETURN_ON_ERROR(init_spiffs(), TAG, "init_spiffs failed");
 
+    ESP_RETURN_ON_ERROR(espagent_event_router_init(), TAG, "espagent_event_router_init failed");
     ESP_RETURN_ON_ERROR(message_bus_init(), TAG, "message_bus_init failed");
     ESP_RETURN_ON_ERROR(memory_store_init(), TAG, "memory_store_init failed");
+    ESP_RETURN_ON_ERROR(memory_v2_init(), TAG, "memory_v2_init failed");
     ESP_RETURN_ON_ERROR(cache_store_init(), TAG, "cache_store_init failed");
     ESP_RETURN_ON_ERROR(skill_loader_init(), TAG, "skill_loader_init failed");
+    ESP_RETURN_ON_ERROR(dynamic_extension_init(), TAG, "dynamic_extension_init failed");
     ESP_RETURN_ON_ERROR(session_mgr_init(), TAG, "session_mgr_init failed");
     ESP_RETURN_ON_ERROR(wifi_manager_init(), TAG, "wifi_manager_init failed");
     ESP_RETURN_ON_ERROR(http_proxy_init(), TAG, "http_proxy_init failed");

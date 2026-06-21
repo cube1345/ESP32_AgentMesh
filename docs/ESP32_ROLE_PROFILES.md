@@ -8,7 +8,7 @@
 - 每块板通过 `main/espagent_secrets.h` 设置不同的 `NODE_ID`、`NODE_ROLE`、`NODE_CAPABILITIES` 和 `NODE_RESPONSIBILITIES`。
 - MQTT state/telemetry/event payload 会带上这些字段。
 - 每块板会订阅自己的节点命令 topic 和角色命令 topic。
-- 远程 command 当前已经有基础 schema/目标校验；Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并回传结构化 `OutputMessage`。Control 角色对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write` 已有低/中安全级执行路径并回传结构化 `OutputMessage`。Coordinator 下发 Mesh command 前会先发布 `policy_check`，USB3 Guardian 返回 `policy_decision=allow/deny` 后才继续下发；完整 command queue / safety interlock 仍是下一阶段。
+- 远程 command 当前已经有 schema/目标校验；Sensor 角色对白名单 `read_temperature_humidity` 和 `virtual_device_read` 做受限执行并回传结构化 `OutputMessage`。Control 角色对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write` 和 `virtual_device_control` 已有白名单执行路径并回传结构化 `OutputMessage`。Coordinator 下发 Mesh command 前会先发布 `policy_check`，USB3 Guardian 返回 `policy_decision=allow/deny` 后才继续下发；Control 侧已有 command queue、TTL、去重、单执行器互锁、emergency stop、actuator state、可选 interlock GPIO 和本地 Guardian allow 校验。高风险动作进入 Guardian approval queue，人工确认后通过一次性 `approval_id` 重试。
 
 ## 当前板端进度
 
@@ -114,7 +114,7 @@
 - 订阅全局 timeline 和节点事件。
 - 审计 `OutputMessage`、工具调用结果、Mesh command 和最终回复。
 - 处理 `policy_check` 并发布 `policy_decision`，维护轻量 StateBoard。
-- 对错误事件发布 alerts，后续继续扩展人工确认、隐私脱敏和 watchdog。
+- 对错误事件发布 alerts；当前已扩展人工确认队列，后续继续补更完整的隐私脱敏、决策消息认证和 watchdog 聚合。
 - 不直接执行硬件动作，不替代 P4/Android 显示终端。
 
 建议配置：
@@ -188,7 +188,7 @@ espagent/roles/control_agent/command
 - `main/roles/coordinator_node.c/.h`、`sensor_node.c/.h`、`control_node.c/.h`、`guardian_node.c/.h`、`display_node.c/.h` 已作为职责入口接入启动流程。
 - `main/app/espagent_app.c` 已根据 role/capability 选择性启动 LLM/聊天入口、scheduler/proactive、sensor monitor、control boot demo、guardian/display 边界服务。
 - `main/mesh/mesh_types.h` 和 `main/mesh/mesh_protocol.c/.h` 已定义 Mesh command 类型，并解析/校验 MQTT command。
-- MQTT node/role command 现在会进入 `mesh_protocol` 校验 `action`、`target_node`、`target_role`；Sensor `read_temperature_humidity` 已有白名单执行路径；Control 对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write` 已有直接执行路径，并会在执行前校验本机缓存的 Guardian allow decision；后续仍需 command queue、签名认证、人工确认和 safety interlock。
+- MQTT node/role command 现在会进入 `mesh_protocol` 校验 `action`、`target_node`、`target_role`、`ts_ms` 和可选 HMAC `signature`；Sensor `read_temperature_humidity`/`virtual_device_read` 已有白名单执行路径；Control 对 `set_status_light`、`ws2812_set`、`servo_write`、`gpio_write`、`virtual_device_control` 已有执行路径，并会在执行前经过 command queue、TTL/去重/互锁检查和本机缓存的 Guardian allow decision；高风险动作可通过 Guardian 人工确认队列一次性放行重试。
 - Feishu 通信板 MQTT 桥接已完成第一版：
   - `feishu_inbound` 发布到 `espagent/nodes/<coordinator_id>/events`、`espagent/agent/dispatch`、`espagent/agent/timeline`。
   - `feishu_outbound` 发布到 `espagent/nodes/<coordinator_id>/events`、`espagent/agent/timeline`。
@@ -198,16 +198,17 @@ espagent/roles/control_agent/command
 - Automation runtime 已接入工具层和后台任务：`automation_create_workflow` 处理顺序/延迟动作，`automation_create_rule` 处理持久化条件监控，规则保存到 `/spiffs/automation.json`。
 - Automation 支持多个任务但有明确上限：条件规则由单个 `rule_task` 轮询，最多 8 条；多步 workflow 每个启动一个临时 `workflow_task`，最多 8 个 workflow 槽位，每个最多 8 步。
 - 2026-06-18 已验证湿度条件联动：USB0 创建 `humidity_percent > 40` 规则，USB1 AHT20 返回约 `46.0%RH`，USB2 执行 `set_status_light` 后 WS2812 输出红色 `rgb=(255,0,0)`；该测试规则已删除，说明机制可用于默认后台任务，但不会留下测试副作用。
+- 2026-06-21 已补齐 esp-claw-like 单板 runtime 第一版：`main/capability/` 将 legacy tools 镜像成 capability descriptor，`role_capability_profile` 按角色过滤 LLM 可见能力，`main/events/` 统一事件流，Memory v2 保存用户画像和 skill observation，dynamic extension catalog 记录 manifest/Lua/复杂协议扩展边界。
+- Lua runtime 已部署到四个 ESP32-S3 角色：`ESPAGENT_ENABLE_LUA_RUNTIME=1`，`georgik/lua` 已链接，`lua_runtime_info`、`lua_list_modules`、`lua_list_scripts`、`lua_run_source`、`lua_run_script`、`lua_run_script_async`、`lua_list_jobs`、`lua_get_job`、`lua_stop_job` 进入 tool/capability/sandbox/profile 体系。USB0 Lua smoke 7/7 PASS，USB0-3 跨角色 smoke 8/8 PASS。
 
 尚未完善：
 
-- MQTT command queue。
-- MQTT command 到 message_bus 的安全转发。
-- 完整 command queue、签名认证、人工确认和 safety interlock。
-- Coordinator 已能通过异步 task_id 等待远端 `OutputMessage` 并回灌给 LLM；更完整的超时恢复、trace 查询和任务树聚合仍待实现。
-- Automation 目前支持创建、列出和删除；自然语言暂停/恢复、规则状态面板、复杂多条件表达式、规则冲突检测、运行中 workflow 取消和 workflow 重启恢复仍待完善。
-- 根据 role 自动裁剪工具列表。
-- 更完整的 timeline 持久化、trace 聚合、Guardian StateBoard API 和 watchdog。
+- 生产级 broker ACL/TLS、决策消息认证、真实 interlock 接线验证和密钥轮换 SOP。
+- MQTT command 到 message_bus 的更通用安全转发。
+- Coordinator 已能通过异步 task_id 等待远端 `OutputMessage` 并回灌给 LLM；更完整的超时恢复、跨节点长期 trace 查询和完整任务 DAG 聚合仍待实现。
+- Automation 目前支持创建、列出和删除，`automation_remove` 可让运行中的 workflow 在下一步前停止；自然语言暂停/恢复、规则状态面板、复杂多条件表达式、规则冲突检测和 workflow 重启恢复仍待完善。
+- Role-visible capability profile 已实现；尚未把 role identity 迁移到 NVS，也还没有让 Lua package、manifest 权限和 capability visibility 共享完整 profile 生命周期。
+- 更完整的 timeline 持久化、trace 聚合、Guardian StateBoard API、watchdog 聚合和 P4/Android 展示联动。
 
 ## 资源使用设计
 
@@ -215,7 +216,7 @@ espagent/roles/control_agent/command
 
 当前需要分清“固件体积”和“运行时启用服务”：
 
-- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；加入 OTA CLI 后最新验证构建 `ESPAgent.bin` 为 `0x156bf0`，2MB app 分区剩余 `0xa9410`，约 33%。
+- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；2026-06-21 最新 Lua runtime 构建后 app 镜像约 `0x1902c0` - `0x190310`，2MB app 分区剩余约 `0x6fd00`，约 22%。后续继续加入 Lua package、board profile 和 display console 时需要关注 app 分区余量。
 - 运行时已经按 role/capability 裁剪服务。Coordinator 最重，Sensor/Control 中等，Guardian 目前较轻但已承担审计入口。
 - USB0 Coordinator 启动日志显示 PSRAM 约 8MB 可用，完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用；说明当前并未真正把硬件资源吃满。
 
@@ -232,8 +233,8 @@ espagent/roles/control_agent/command
 |------|--------------|----------------|
 | `coordinator_agent` | LLM、Feishu、WebSocket、MQTT、SNTP、cron/proactive、session/context、临时 subagent | 四者中最高，但仍有较大 PSRAM/Flash 余量 |
 | `sensor_agent` | sensor sampling、environment/presence monitor、MQTT telemetry、serial CLI | 中等，尚缺 sensor cache、滤波统计、阈值事件 |
-| `control_agent` | control boundary、MQTT command receiver、本地 actuator tools、boot servo demo | 中等偏低，尚缺 command queue、safety interlock、actuator_state |
-| `guardian_agent` | guardian boundary、MQTT policy_check/decision、timeline 订阅、OutputMessage audit、错误 alerts、StateBoard | 中等，尚缺人工确认、watchdog 聚合 |
+| `control_agent` | control boundary、MQTT command receiver、本地 actuator tools、command queue、TTL/去重、单执行器互锁、emergency stop、actuator state、可选 interlock GPIO | 中等，仍需真实互锁接线验证 |
+| `guardian_agent` | guardian boundary、MQTT policy_check/decision、timeline 订阅、OutputMessage audit、错误 alerts、StateBoard、approval queue | 中等，尚缺 watchdog 聚合和生产级决策消息认证 |
 
 当前 profile 已经不只是声明能力：`espagent_app` 会根据 role/capability 选择性启动服务。推荐结构仍继续保持：
 
@@ -321,4 +322,4 @@ typedef struct {
 4. 已完成：新增四个 role service 骨架：`coordinator_node`、`sensor_node`、`control_node`、`display_node`。
 5. 已完成：修改 `main/app/espagent_app.c`，按 role/capability 启动对应服务。
 6. 下一步：将 `main/sensors/sensor_mqtt.c` 拆成通用 `mesh_mqtt.c` 和 sensor telemetry service。
-7. 下一步：增加 `command_queue`、`safety_interlock`、`actuator_state`，确认安全链路后再接入真实执行。
+7. 当前已增加 `command_queue`、基础互锁、`actuator_state` 和 Guardian approval queue；下一步是实机验证 interlock GPIO、私有 broker ACL/TLS、决策消息认证和 watchdog 聚合。

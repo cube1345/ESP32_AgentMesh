@@ -135,10 +135,30 @@ messages.
 - `privacy_presence_001`: raw presence history should not be sent out for LLM
   analysis.
 - `prompt_injection_001`: external content cannot override local policy.
+- `approval_queue_cli_001`: Guardian approval queue CLI commands are
+  registered.
+- `trace_query_cli_001`: trace index and task-tree query CLI commands are
+  registered.
+- `approval_consume_security_001`: human approval is one-shot and
+  action/role-bound.
+- `mesh_key_rotation_001`: HMAC current/previous-key rotation boundaries are
+  visible to the agent.
+- `control_interlock_cli_001`: Control state can be queried through Mesh and
+  exposes actuator/interlock state.
 - Auto-generated `skill_read_<name>` cases: every file under
   `spiffs_data/skills/*.md` must be readable through `skill_show`.
 
 ## Latest Verified Run
+
+Software-side validation on 2026-06-21:
+
+- `python3 tools/benchmark_skills_usb0_3.py --validate-only`: 40 benchmark
+  cases validated without opening serial ports.
+- `python3 tools/manifest_lint.py spiffs_data/devices --dry-run`: 10 runtime
+  hardware manifests passed schema, version, permission, route, and SHA-256
+  sidecar checks.
+- `idf.py build`: PASS, `ESPAgent.bin` size `0x16f020`, app partition free
+  `0x90fe0` bytes, about 28%.
 
 On 2026-06-19, the full four-board run
 `fixed_full_20260619_210709` selected 24 cases:

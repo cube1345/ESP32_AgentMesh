@@ -2,7 +2,7 @@
 dependencies:
   ## Required IDF version
   idf:
-    version: '>=5.5.0,<5.6.0'
+    version: '>=6.1.0,<6.2.0'
   # # Put list of dependencies here
   # # For components maintained by Espressif:
   # component: "~1.0.0"
@@ -15,3 +15,4 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   espressif/esp_websocket_client: ^1.4.0
+  georgik/lua: "^5.5.0~7"

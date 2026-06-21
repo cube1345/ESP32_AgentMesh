@@ -17,6 +17,8 @@ timeline events, alerts, or debugging MQTT Mesh behavior.
 - `espagent/agent/dispatch`: Coordinator dispatch events
 - `espagent/agent/timeline`: user-visible execution timeline
 - `espagent/alerts`: alerts and watchdog notifications
+- `espagent/security/policy_check`: Coordinator asks Guardian for permission
+- `espagent/security/decision`: Guardian publishes allow/deny decisions
 
 The active topic prefix may be configured, for example `espagent/cube1345`.
 
@@ -24,11 +26,18 @@ The active topic prefix may be configured, for example `espagent/cube1345`.
 
 1. Validate JSON shape and required `action`.
 2. Validate `target_node` or `target_role`.
-3. Check TTL and safety level.
-4. Keep `args` small and structured.
-5. Publish result or dry-run status as an event.
-6. Do not claim success until the target node publishes a result or a direct
+3. Check `ts_ms`, TTL, safety level, and optional HMAC `signature`.
+4. Send `policy_check` before remote Sensor/Control execution and require
+   Guardian `policy_decision=allow`.
+5. Keep `args` small and structured.
+6. Publish result or dry-run status as `espagent.output.v1` plus timeline event.
+7. Do not claim success until the target node publishes a result or a direct
    local execution succeeds.
+
+When `ESPAGENT_SECRET_MESH_AUTH_KEY` is non-empty, Mesh command signatures are
+required. `ESPAGENT_SECRET_MESH_AUTH_PREVIOUS_KEY` may verify commands during a
+key rotation window. Empty keys keep development compatibility and should not
+be used as the production posture.
 
 ## Result events
 
@@ -44,6 +53,16 @@ Command results should include:
 
 Coordinator should later correlate these result events and summarize them back
 to Feishu/WebSocket.
+
+## Debugging
+
+- Use `trace_show <chat_id> [max_events]` to inspect recent persisted ReAct/tool
+  trace events for one chat.
+- Use `trace_index` to list persisted trace JSONL files.
+- Use `task_tree <chat_id> [max_events]` to group recent trace events by
+  `trace_id` or `command_id`.
+- Use `stateboard_show` on the Guardian role to inspect recent policy, output,
+  alert, and final-reply observations.
 
 ## Security boundary
 

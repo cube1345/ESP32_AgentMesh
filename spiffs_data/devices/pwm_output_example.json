@@ -1,0 +1,23 @@
+{
+  "manifest_version": 1,
+  "name": "pwm_output_example",
+  "protocol": "pwm_output",
+  "role": "control_agent",
+  "risk": "medium_control",
+  "permissions": ["control"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pin": 6,
+  "frequency_hz": 1000,
+  "default_duty_pct": 25,
+  "ledc_channel": 1,
+  "ledc_timer": 1,
+  "invert": false,
+  "max_duration_ms": 5000,
+  "cooldown_ms": 1000,
+  "notes": "Generic LEDC PWM output example. Use duty_pct 0..100 and bounded duration_ms for temporary output."
+}

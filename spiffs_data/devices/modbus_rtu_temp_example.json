@@ -1,0 +1,36 @@
+{
+  "manifest_version": 1,
+  "name": "modbus_rtu_temp_example",
+  "protocol": "modbus_rtu",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "tx": 17,
+    "rx": 16,
+    "de_re": 15
+  },
+  "uart_port": 2,
+  "baud": 9600,
+  "data_bits": 8,
+  "stop_bits": 1,
+  "parity": "none",
+  "slave_id": 1,
+  "function_code": 4,
+  "register": "0x0000",
+  "register_count": 2,
+  "timeout_ms": 800,
+  "decode": {
+    "field": "first_register",
+    "scale": 0.1,
+    "offset": 0,
+    "unit": "raw"
+  },
+  "notes": "Read-only Modbus RTU example for RS485 sensors. Function code is limited to 3 or 4; writes are not supported by virtual_device_read."
+}

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 1,
+  "name": "adc_input_example",
+  "protocol": "adc",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "adc_unit": 1,
+  "channel": 0,
+  "atten_db": 12,
+  "samples": 8,
+  "decode": {
+    "field": "analog_value",
+    "scale": 1,
+    "offset": 0,
+    "unit": "raw"
+  },
+  "notes": "Generic ADC one-shot read example. ADC readings are board- and wiring-dependent and should be calibrated for production use."
+}

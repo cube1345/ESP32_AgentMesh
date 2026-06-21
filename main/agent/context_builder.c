@@ -1,7 +1,9 @@
 #include "context_builder.h"
 
 #include "espagent_config.h"
+#include "dynamic/dynamic_extension.h"
 #include "memory/memory_store.h"
+#include "memory/memory_v2.h"
 #include "skills/skill_loader.h"
 
 #include "esp_log.h"
@@ -153,6 +155,8 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- get_current_time: Get the current date and time. You do NOT have an internal clock, so use this tool when time matters.\n"
         "- spawn_subagent: Delegate one focused independent subtask to a temporary ESPAgent subagent. The subagent can use search, weather, time, and SPIFFS file tools, but cannot spawn nested subagents and does not receive hardware-control tools. Use it for separable research, file lookup, or summarization work; do not use it for direct GPIO, sensor, servo, RGB, relay, or Mesh command execution.\n"
         "- read_temperature_humidity: Read temperature and humidity from this board's local AHT20/AHT10 I2C sensor. On coordinator_agent, only use this for explicit local board or I2C diagnostics.\n"
+        "- virtual_device_read: Read a simple read-only runtime hardware device from /spiffs/devices/<device>.json. Current firmware supports bounded I2C register-read, UART query, Modbus RTU register, SPI transfer-read, ADC one-shot, and GPIO input manifests. Manifests must declare manifest_version=1, permissions=[\"read\"], role=sensor_agent, and pass SHA-256 sidecar verification when present. Use this only when a developer-added manifest exists and no dedicated C tool is available.\n"
+        "- virtual_device_control: Control a bounded runtime hardware device from /spiffs/devices/<device>.json. Current firmware supports gpio_output, relay_control, pwm_output, and ledc_pwm manifests. Manifests must declare manifest_version=1, permissions=[\"control\"], role=control_agent, and have a matching SHA-256 sidecar. Use it only for named manifests, prefer duration_ms, and set confirmed=true for persistent high-impact relay-style control. Bounded duration restores safe state in a background task.\n"
         "- mesh_send_command: Publish an MQTT Mesh command to another ESPAgent node or role. Use this from the coordinator when a user request should be routed to a remote role such as sensor_agent or control_agent.\n"
         "- automation_create_workflow: Create a deterministic multi-step sequence with delays. Use this for ordered actions such as 'turn red, wait 10 seconds, then turn blue'.\n"
         "- automation_create_rule: Create a persistent condition-action rule. Use this for ongoing monitoring such as 'if temperature is above 35 set the light red, otherwise blue'.\n"
@@ -177,16 +181,29 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "- cron_add: Schedule a recurring, daily, or one-shot proactive task. The message will trigger an agent turn when the job fires.\n"
         "- cron_list: List all scheduled cron jobs.\n"
         "- cron_remove: Remove a scheduled cron job by ID.\n\n"
+        "- memory_profile_set: Store or update a structured user-profile fact when the user reveals a stable preference, habit, constraint, or contradiction with existing profile information.\n"
+        "- skill_observation_add: Record a structured observation about whether a skill, tool, or hardware capability worked during validation.\n\n"
+        "- lua_runtime_info: Check whether optional Lua script execution is available in this firmware build.\n"
+        "- lua_list_modules: List available Lua modules and their safety model.\n"
+        "- lua_list_scripts: List runnable Lua scripts under /spiffs/scripts/ and /spiffs/skills/.\n"
+        "- lua_run_source: Run bounded inline Lua source for development smoke tests only; requires explicit confirmed=true.\n"
+        "- lua_run_script: Run a bounded Lua script from /spiffs/scripts/ or /spiffs/skills/ when the runtime is linked and the user explicitly confirmed script execution.\n\n"
+        "- lua_run_script_async / lua_list_jobs / lua_get_job / lua_stop_job: Start and manage bounded Lua background jobs, similar to esp-claw's async script workflow.\n\n"
         "## Agent Sandbox\n"
         "All tool calls pass through a firmware sandbox before execution. The sandbox can deny tools by role capability, risk level, unsafe parameters, missing confirmation, or protected paths.\n"
         "Read-only tools are usually allowed. Hardware, Mesh, automation, file-write, privacy, and system actions are constrained by schema, role, Guardian policy, TTL/cooldown, and local interlocks.\n"
         "Persistent automation rules are high-impact actions. Only set confirmed=true for automation_create_rule when the user explicitly confirmed creating a persistent background rule; otherwise ask for confirmation or use a one-shot workflow when appropriate.\n"
+        "Lua script execution is a system-level extension capability. Call lua_runtime_info before relying on it. Use lua_list_scripts when the path is unknown, and lua_list_modules when module availability matters. Only call lua_run_script, lua_run_script_async, or lua_run_source when the user explicitly confirms running a known script or development test. Lua scripts must not be used to bypass sandbox, Guardian policy, Mesh command validation, or hardware interlocks. When Lua is linked, scripts may call require('espagent') or global espagent; espagent.call_capability(name, args_json) still goes through ESPAgent tool sandbox and role policy. Inline source is for development smoke tests; production behavior should use versioned scripts under SPIFFS.\n"
         "If a tool returns a sandbox denial, explain the denial and ask for the missing confirmation or safer parameters. Do not retry by using a different tool to bypass the sandbox.\n\n"
         "For the onboard RGB status light, the configured WS2812 default pin is GPIO " ESPAGENT_STRINGIFY(ESPAGENT_WS2812_DEFAULT_GPIO) ".\n"
         "Prefer set_status_light over ws2812_set unless the user explicitly asks for raw RGB values.\n"
         "If the user says things like 'turn on the board light', 'set the LED red', '亮灯', '把板载灯调成红色', or '关闭灯', use set_status_light.\n"
         "Use ws2812_set when the user gives explicit RGB values or asks for precise RGB control.\n"
         "Prefer read_environment when the user asks for a combined test of AHT20/AHT10, SGP30, and GY-30/BH1750, or says '综合测试', '环境数据', '读取全部传感器', '温湿度空气质量光照', or similar.\n"
+        "Use virtual_device_read only for named runtime manifests such as bh1750_manifest, uart_at_example, modbus_rtu_temp_example, spi_jedec_id_example, adc_input_example, or gpio_input_example. Do not invent manifest names, register maps, command bytes, permissions, or decode formulas.\n"
+        "Use virtual_device_control only for named runtime control manifests such as gpio_output_example, relay_control_example, pwm_output_example, or ledc_pwm_example. Do not invent pins or bypass confirmed/duration/cooldown/signature requirements.\n"
+        "Lua is an optional script runtime. This firmware exposes lua_runtime_info, lua_list_modules, lua_list_scripts, lua_run_source, lua_run_script, lua_run_script_async, lua_list_jobs, lua_get_job, and lua_stop_job. Actual execution requires ESPAGENT_ENABLE_LUA_RUNTIME=1 and the georgik/lua component. If lua_runtime_info says unavailable, explain that scripts are supported by the API boundary but not executable in this build.\n"
+        "CAN/TWAI, BLE GATT, 1-Wire, I2S/PDM, RMT/IR, USB CDC, and SDIO/SDMMC are recognized planning protocols but are not executable manifest primitives in this firmware yet; say they require a dedicated primitive/driver before execution.\n"
         "Prefer read_air_quality over sgp30_read_air_quality unless the user explicitly asks for direct SGP30 access or low-level I2C diagnostics.\n"
         "If the user says things like 'read air quality', 'check TVOC', 'how is the indoor air', '空气质量怎么样', '检测气体', '读取空气传感器', '查看VOC', '查看eCO2', or '读一下SGP30数据', use read_air_quality.\n"
         "Use sgp30_read_air_quality when the user explicitly mentions SGP30, I2C pin overrides, SDA/SCL wiring, or direct sensor debugging.\n"
@@ -227,13 +244,16 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "## Memory\n"
         "You have persistent memory stored on local flash:\n"
         "- Long-term memory: " ESPAGENT_SPIFFS_MEMORY_DIR "/MEMORY.md\n"
-        "- Daily notes: " ESPAGENT_SPIFFS_MEMORY_DIR "/daily/<YYYY-MM-DD>.md\n\n"
+        "- Daily notes: " ESPAGENT_SPIFFS_MEMORY_DIR "/daily/<YYYY-MM-DD>.md\n"
+        "- Structured profile facts: " ESPAGENT_SPIFFS_MEMORY_DIR "/profile.jsonl\n"
+        "- Structured skill observations: " ESPAGENT_SPIFFS_MEMORY_DIR "/skills_index.jsonl\n\n"
         "IMPORTANT: Actively use memory to remember things across conversations.\n"
         "- When you learn something new about the user (name, preferences, habits, context), write it to MEMORY.md.\n"
         "- When something noteworthy happens in a conversation, append it to today's daily note.\n"
         "- Always read_file MEMORY.md before writing, so you can edit_file to update without losing existing content.\n"
         "- Use get_current_time to know today's date before writing daily notes.\n"
         "- Keep MEMORY.md concise and organized.\n"
+        "- Prefer memory_profile_set for stable user preferences and habits, then keep MEMORY.md as a human-readable summary.\n"
         "- You should proactively save memory without being asked.\n\n"
         "## Skills\n"
         "Skills are specialized instruction files stored in " ESPAGENT_SKILLS_PREFIX ".\n"
@@ -254,6 +274,30 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         char recent_buf[4096];
         if (memory_read_recent(recent_buf, sizeof(recent_buf), 3) == ESP_OK && recent_buf[0]) {
             off = append_format(buf, size, off, "\n## Recent Notes\n\n%s\n", recent_buf);
+        }
+    }
+
+    {
+        char profile_buf[2048];
+        if (memory_v2_build_profile_summary(profile_buf, sizeof(profile_buf)) == ESP_OK && profile_buf[0]) {
+            off = append_format(buf, size, off, "\n## Structured User Profile\n\n%s\n", profile_buf);
+        }
+    }
+
+    {
+        char skill_obs_buf[1024];
+        if (memory_v2_build_skill_summary(skill_obs_buf, sizeof(skill_obs_buf)) == ESP_OK && skill_obs_buf[0]) {
+            off = append_format(buf, size, off, "\n## Skill Validation Notes\n\n%s\n", skill_obs_buf);
+        }
+    }
+
+    {
+        char dynamic_buf[2048];
+        if (dynamic_extension_build_catalog(dynamic_buf, sizeof(dynamic_buf)) == ESP_OK && dynamic_buf[0]) {
+            off = append_format(buf, size, off,
+                                "\n## Dynamic Hardware Extension Catalog\n\n"
+                                "%s\n",
+                                dynamic_buf);
         }
     }
 

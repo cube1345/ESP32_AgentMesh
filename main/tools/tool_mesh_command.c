@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "espagent_config.h"
 #include "bus/message_bus.h"
+#include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
 #include "sensors/sensor_mqtt.h"
 #include "tools/tool_sandbox.h"
@@ -14,6 +15,7 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,13 +57,18 @@ static bool is_control_action(const char *action)
     return action &&
            (strcmp(action, "set_status_light") == 0 ||
             strcmp(action, "ws2812_set") == 0 ||
+            strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
-            strcmp(action, "gpio_write") == 0);
+            strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "control_state") == 0 ||
+            strcmp(action, "control_emergency_stop") == 0);
 }
 
 static bool is_sensor_action(const char *action)
 {
-    return action && strcmp(action, "read_temperature_humidity") == 0;
+    return action &&
+           (strcmp(action, "read_temperature_humidity") == 0 ||
+            strcmp(action, "virtual_device_read") == 0);
 }
 
 static bool is_allowed_mesh_action(const char *action)
@@ -74,6 +81,7 @@ static esp_err_t request_policy_decision(const char *command_id,
                                          const char *target_role,
                                          const char *target_node,
                                          const char *action,
+                                         const char *args_json,
                                          int safety_level,
                                          int ttl_ms,
                                          char *decision_json,
@@ -95,6 +103,7 @@ static esp_err_t request_policy_decision(const char *command_id,
     cJSON_AddStringToObject(policy, "target_role", target_role ? target_role : "");
     cJSON_AddStringToObject(policy, "target_node", target_node ? target_node : "");
     cJSON_AddStringToObject(policy, "action", action);
+    cJSON_AddStringToObject(policy, "args_json", args_json ? args_json : "{}");
     cJSON_AddNumberToObject(policy, "safety_level", safety_level);
     cJSON_AddNumberToObject(policy, "ttl_ms", ttl_ms);
     cJSON_AddNumberToObject(policy, "ts_ms", (double)ts_ms);
@@ -318,7 +327,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         return ESP_ERR_INVALID_ARG;
     }
     if ((!target_node || !target_node[0]) && (!target_role || !target_role[0]) &&
-        strcmp(action, "read_temperature_humidity") == 0) {
+        is_sensor_action(action)) {
         target_role = "sensor_agent";
     } else if ((!target_node || !target_node[0]) && (!target_role || !target_role[0]) &&
                is_control_action(action)) {
@@ -416,6 +425,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     copy_text(reply_channel_copy, sizeof(reply_channel_copy), reply_channel);
     copy_text(reply_chat_id_copy, sizeof(reply_chat_id_copy), reply_chat_id);
 
+    int64_t ts_ms = esp_timer_get_time() / 1000;
     cJSON_AddStringToObject(cmd, "command_id", command_id_copy);
     cJSON_AddStringToObject(cmd, "trace_id", trace_id_copy);
     if (target_node_copy[0]) {
@@ -425,6 +435,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         cJSON_AddStringToObject(cmd, "target_role", target_role_copy);
     }
     cJSON_AddStringToObject(cmd, "action", action);
+    cJSON_AddNumberToObject(cmd, "ts_ms", (double)ts_ms);
     cJSON_AddNumberToObject(cmd, "ttl_ms", ttl_ms);
     cJSON_AddNumberToObject(cmd, "safety_level", safety_level);
     cJSON_AddBoolToObject(cmd, "require_ack", require_ack);
@@ -435,6 +446,32 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: args_json is not valid JSON");
         return args_err;
+    }
+
+    espagent_mesh_command_t sign_cmd = {0};
+    snprintf(sign_cmd.command_id, sizeof(sign_cmd.command_id), "%s", command_id_copy);
+    snprintf(sign_cmd.trace_id, sizeof(sign_cmd.trace_id), "%s", trace_id_copy);
+    snprintf(sign_cmd.target_node, sizeof(sign_cmd.target_node), "%s", target_node_copy);
+    snprintf(sign_cmd.target_role, sizeof(sign_cmd.target_role), "%s", target_role_copy);
+    snprintf(sign_cmd.action, sizeof(sign_cmd.action), "%s", action_copy);
+    sign_cmd.ttl_ms = ttl_ms;
+    sign_cmd.safety_level = safety_level;
+    sign_cmd.require_ack = require_ack;
+    sign_cmd.ts_ms = ts_ms;
+    cJSON *args_for_sign = cJSON_GetObjectItem(cmd, "args");
+    char *args_printed = args_for_sign ? cJSON_PrintUnformatted(args_for_sign) : NULL;
+    snprintf(sign_cmd.args_json, sizeof(sign_cmd.args_json), "%s", args_printed ? args_printed : "{}");
+    cJSON_free(args_printed);
+    char signature[ESPAGENT_MESH_SIGNATURE_MAX] = {0};
+    esp_err_t sign_err = espagent_mesh_auth_sign_command(&sign_cmd, signature, sizeof(signature));
+    if (sign_err != ESP_OK) {
+        cJSON_Delete(cmd);
+        cJSON_Delete(root);
+        snprintf(output, output_size, "Error: failed to sign mesh command (%s)", esp_err_to_name(sign_err));
+        return sign_err;
+    }
+    if (signature[0]) {
+        cJSON_AddStringToObject(cmd, "signature", signature);
     }
 
     char *payload = cJSON_PrintUnformatted(cmd);
@@ -452,6 +489,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                    target_role_copy,
                                                    target_node_copy,
                                                    action_copy,
+                                                   sign_cmd.args_json,
                                                    safety_level,
                                                    ttl_ms,
                                                    policy_json,

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "capability/capability_registry.h"
 #include "esp_err.h"
 #include <stddef.h>
 
@@ -42,3 +43,9 @@ void tool_registry_get_tools(const espagent_tool_t **tools, int *count);
  */
 esp_err_t tool_registry_execute(const char *name, const char *input_json,
                                 char *output, size_t output_size);
+
+esp_err_t tool_registry_execute_as(const char *name,
+                                   const char *input_json,
+                                   espagent_capability_caller_t caller,
+                                   char *output,
+                                   size_t output_size);

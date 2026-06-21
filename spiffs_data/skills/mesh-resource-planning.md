@@ -73,15 +73,16 @@ diagnostics, and watchdog work.
 
 - Flash is not role-pruned yet; all roles still use the same firmware image.
 - Coordinator is currently the heaviest runtime role.
-- Sensor and Control roles are partially utilized.
+- Sensor and Control roles are partially utilized; Control now has command
+  queue, actuator state, emergency stop, and configurable interlock checks.
 - Display role has the most remaining headroom.
 - The project is not yet "fully saturated"; keep enough RAM/PSRAM/Flash margin
   for robust queues, logs, and error recovery.
 
 ## Roadmap
 
-1. Add Coordinator result correlation by `command_id`.
-2. Add Control `command_queue`, `safety_interlock`, and `actuator_state`.
+1. Strengthen Coordinator result correlation by `command_id` and `trace_id`.
+2. Hardware-verify Control interlock wiring and actuator state behavior.
 3. Add Sensor sample cache and anomaly events.
 4. Add Display timeline store and watchdog dashboard.
 5. Later, add role-pruned builds only after common-code stability is high.

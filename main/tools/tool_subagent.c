@@ -179,8 +179,11 @@ static void subagent_task(void *arg)
             const llm_tool_call_t *call = &resp.calls[i];
             tool_output[0] = '\0';
             if (subagent_tool_allowed(call->name)) {
-                tool_registry_execute(call->name, call->input ? call->input : "{}",
-                                      tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
+                tool_registry_execute_as(call->name,
+                                         call->input ? call->input : "{}",
+                                         ESPAGENT_CAP_CALLER_SUBAGENT,
+                                         tool_output,
+                                         ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
             } else {
                 snprintf(tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE,
                          "Error: tool '%s' is not available to subagents",

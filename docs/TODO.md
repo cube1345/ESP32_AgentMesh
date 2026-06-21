@@ -123,7 +123,7 @@
 ### [ ] LingShu Agent Mesh Coordinator
 - **Target**: Expand the current ESP32-S3 Edge Agent Node into a multi-node system with Coordinator Agent, Sensor Agent, Control Agent, Memory Agent, Communication Agent, and Display Agent.
 - **Current**: Phase 1.7 is implemented and board-verified in firmware: node identity and role profile exist; MQTT publishes state/telemetry/events under `espagent/nodes/<node_id>/...`; node/role command topics are subscribed; `main/mesh` parses and validates command JSON; `main/roles` provides coordinator/sensor/control/guardian service boundaries; `espagent_app` starts LLM/chat, scheduler, sensor monitors, control outputs, and guardian/display boundaries according to role/capability. `mesh_send_command` is registered as an LLM-callable Coordinator tool, publishes Guardian `policy_check`, defaults to async `async_task_id`, waits for structured `espagent.output.v1` in a background task, and injects the result back through `message_bus`. `sensor_agent` and `control_agent` can execute their whitelisted Mesh commands; Control locally verifies cached Guardian allow decisions before actuator execution. Local tools, remote Mesh results, and final replies now publish structured OutputMessage; session trace JSONL and Guardian StateBoard exist.
-- **Recommendation**: Keep high-risk hardware execution disabled until command queue, authorization/signature checks, human confirmation, richer audit events, safety interlock, and message_bus/tool_guard routing are implemented. Next priority is trace/stateboard queryability and watchdog aggregation for ESP32-P4/Android display.
+- **Recommendation**: Treat command queue, authorization/signature checks, human confirmation, richer audit events, safety interlock, and structured trace as implemented foundations, not final production safety. Next priority is private broker ACL/TLS, real interlock wiring validation, decision-message authentication, watchdog aggregation, and ESP32-P4/Android display verification.
 
 ### [ ] MCU Edge AI / TinyML Path
 - **Target**: Add optional local inference for small, bounded tasks such as sensor anomaly detection, wake word/command spotting, or low-dimensional classification.
@@ -174,6 +174,13 @@
 - [x] Humidity condition automation verified from USB0 -> USB1 AHT20 -> Guardian -> USB2 WS2812
 - [x] Bounded Subagent Tool (`spawn_subagent`) with filtered search/weather/time/file tool access
 - [x] Four-ESP32 role profile configuration (`coordinator_agent`, `sensor_agent`, `control_agent`, `guardian_agent`)
+- [x] Role-visible capability profile (`main/capability/role_capability_profile.c`) filtering LLM-visible tools by Coordinator/Sensor/Control/Guardian role
+- [x] esp-claw-like capability registry compatibility layer (`main/capability/`) with legacy `tool_registry` fallback
+- [x] Unified lightweight event layer (`main/events/`) for message bus, tool/capability calls, and trace emission
+- [x] Memory v2 for structured user facts and skill observations
+- [x] Dynamic extension catalog for manifest primitives, Lua, and planned complex-protocol boundaries
+- [x] Managed Lua Runtime (`georgik/lua`) with `lua_runtime_info`, `lua_list_modules`, `lua_list_scripts`, `lua_run_source`, `lua_run_script`, `lua_run_script_async`, `lua_list_jobs`, `lua_get_job`, and `lua_stop_job`
+- [x] Lua runtime four-role smoke verification: USB0 7/7 PASS after SNTP sync; USB0-3 8/8 PASS for runtime info and inline source execution
 - [x] WebSocket Gateway (port 18789, JSON protocol)
 - [x] Serial CLI (esp_console, debug/maintenance commands)
 - [x] HTTP CONNECT Proxy (Feishu + LLM API + search APIs via proxy tunnel)
@@ -200,12 +207,16 @@
 11. [done] Coordinator `mesh_send_command` publish tool
 12. [done] Sensor whitelisted `read_temperature_humidity` command result event
 13. [done] Bounded `spawn_subagent` tool on current `main` architecture
-14. Coordinator result wait/correlation by `command_id` and Feishu summary reply
+14. [done] Coordinator result wait/correlation by `command_id` and Feishu summary reply
 15. [done] Flash and verify a real `sensor_agent` board with AHT20 over MQTT
 16. [done] Add deterministic automation workflow/rule tools for delayed actions and temperature/humidity conditions
 17. Natural-language automation pause/resume/remove, status board, conflict detection, workflow cancellation/recovery, and richer multi-condition rules
-18. Mesh command queue + authorization + safety interlock + actuator state for `control_agent`
+18. [done] Mesh command queue + authorization + safety interlock + actuator state for `control_agent`
 19. Async subagent task_id + `message_bus`/timeline result injection
-20. Full timeline events for tool_use/tool_result/remote result
-21. Other enhancements
+20. [partial] Full timeline events for tool_use/tool_result/remote result
+21. [done] esp-claw-like capability/event/Memory v2/dynamic-extension runtime foundation
+22. [done] Managed Lua runtime with capability-gated script execution
+23. Board Descriptor / Board Profile for S3 roles and P4 display terminal
+24. Lua package metadata and developer generator/lint flow
+25. P4/Android Script Console for Lua jobs, capability list, Guardian decisions, benchmark, and trace
 ```

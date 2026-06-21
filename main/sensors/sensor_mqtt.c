@@ -1,12 +1,15 @@
 #include "sensors/sensor_mqtt.h"
 
 #include "espagent_config.h"
+#include "control/command_queue.h"
+#include "guardian/approval_queue.h"
 #include "mesh/mesh_protocol.h"
 #include "node/node_profile.h"
 #include "roles/role_config.h"
 #include "tools/tool_environment.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_servo.h"
+#include "tools/tool_virtual_device.h"
 
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -501,6 +504,27 @@ static int json_optional_int(cJSON *root, const char *key, int default_value)
     return cJSON_IsNumber(item) ? item->valueint : default_value;
 }
 
+static bool json_extract_approval_id(const char *args_json,
+                                     char *approval_id,
+                                     size_t approval_id_size)
+{
+    if (!args_json || !args_json[0] || !approval_id || approval_id_size == 0) {
+        return false;
+    }
+    cJSON *args = cJSON_Parse(args_json);
+    if (!args || !cJSON_IsObject(args)) {
+        cJSON_Delete(args);
+        return false;
+    }
+    const char *id = json_optional_string(args, "approval_id");
+    bool found = id[0] != '\0';
+    if (found) {
+        snprintf(approval_id, approval_id_size, "%s", id);
+    }
+    cJSON_Delete(args);
+    return found;
+}
+
 static bool guardian_should_audit_event(cJSON *root)
 {
     const char *event = json_optional_string(root, "event");
@@ -973,7 +997,9 @@ esp_err_t sensor_mqtt_publish_timeline_event(const char *phase,
 
 static bool policy_is_sensor_action(const char *action)
 {
-    return action && strcmp(action, "read_temperature_humidity") == 0;
+    return action &&
+           (strcmp(action, "read_temperature_humidity") == 0 ||
+            strcmp(action, "virtual_device_read") == 0);
 }
 
 static bool policy_is_control_action(const char *action)
@@ -981,8 +1007,61 @@ static bool policy_is_control_action(const char *action)
     return action &&
            (strcmp(action, "set_status_light") == 0 ||
             strcmp(action, "ws2812_set") == 0 ||
+            strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
-            strcmp(action, "gpio_write") == 0);
+            strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "control_state") == 0 ||
+            strcmp(action, "control_emergency_stop") == 0);
+}
+
+static bool guardian_control_args_allowed(const char *action,
+                                          const char *args_json,
+                                          char *reason,
+                                          size_t reason_size)
+{
+    if (!action || !args_json || !args_json[0]) {
+        return true;
+    }
+    if (strcmp(action, "control_state") == 0 ||
+        strcmp(action, "control_emergency_stop") == 0) {
+        snprintf(reason, reason_size, "allowed control-plane command");
+        return true;
+    }
+
+    cJSON *args = cJSON_Parse(args_json);
+    if (!args || !cJSON_IsObject(args)) {
+        cJSON_Delete(args);
+        snprintf(reason, reason_size, "control args_json is not a JSON object");
+        return false;
+    }
+
+    bool allowed = true;
+    snprintf(reason, reason_size, "allowed whitelisted low/medium-risk control action");
+    int duration_ms = json_optional_int(args, "duration_ms", 0);
+    if (duration_ms < 0 || duration_ms > 30000) {
+        allowed = false;
+        snprintf(reason, reason_size, "duration_ms must be 0..30000");
+    }
+
+    if (allowed && strcmp(action, "virtual_device_control") == 0) {
+        const char *device = json_optional_string(args, "device");
+        cJSON *confirmed_item = cJSON_GetObjectItem(args, "confirmed");
+        bool confirmed = cJSON_IsTrue(confirmed_item);
+        if (!device[0]) {
+            allowed = false;
+            snprintf(reason, reason_size, "virtual_device_control requires device");
+        } else if ((strcmp(device, "relay_control_example") == 0 ||
+                    strstr(device, "relay") != NULL) &&
+                   duration_ms == 0 &&
+                   !confirmed) {
+            allowed = false;
+            snprintf(reason, reason_size,
+                     "persistent relay control requires confirmed=true or bounded duration_ms");
+        }
+    }
+
+    cJSON_Delete(args);
+    return allowed;
 }
 
 static void handle_guardian_policy_check(const char *payload, size_t payload_len)
@@ -1003,6 +1082,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     const char *action = json_optional_string(root, "action");
     const char *target_role = json_optional_string(root, "target_role");
     const char *target_node = json_optional_string(root, "target_node");
+    const char *args_json = json_optional_string(root, "args_json");
     int safety_level = json_optional_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
 
     char command_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
@@ -1018,6 +1098,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
 
     const char *decision = "deny";
     const char *reason = "deny by default";
+    char dynamic_reason[160] = {0};
     bool allowed = false;
 
     if (command_id_copy[0] == '\0') {
@@ -1036,14 +1117,63 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         }
     } else if (policy_is_control_action(action_copy)) {
         if (strcmp(target_role_copy, ESPAGENT_ROLE_CONTROL) == 0) {
-            decision = "allow";
-            reason = "allowed whitelisted low/medium-risk control action";
-            allowed = true;
+            char arg_reason[160] = {0};
+            if (guardian_control_args_allowed(action_copy, args_json, arg_reason, sizeof(arg_reason))) {
+                decision = "allow";
+                snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
+                         arg_reason[0] ? arg_reason : "allowed whitelisted low/medium-risk control action");
+                reason = dynamic_reason;
+                allowed = true;
+            } else {
+                snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
+                         arg_reason[0] ? arg_reason : "control arguments denied");
+                reason = dynamic_reason;
+            }
         } else {
             reason = "control action must target control_agent";
         }
     } else {
         reason = "unsupported action";
+    }
+
+    if (!allowed &&
+        policy_is_control_action(action_copy) &&
+        strcmp(target_role_copy, ESPAGENT_ROLE_CONTROL) == 0) {
+        char supplied_approval_id[32] = {0};
+        if (json_extract_approval_id(args_json, supplied_approval_id, sizeof(supplied_approval_id))) {
+            char approval_reason[160] = {0};
+            esp_err_t approval_err = guardian_approval_consume(supplied_approval_id,
+                                                               action_copy,
+                                                               target_role_copy,
+                                                               approval_reason,
+                                                               sizeof(approval_reason));
+            snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
+                     approval_reason[0] ? approval_reason : esp_err_to_name(approval_err));
+            reason = dynamic_reason;
+            if (approval_err == ESP_OK) {
+                decision = "allow";
+                allowed = true;
+            }
+        } else {
+            char approval_id[32] = {0};
+            if (guardian_approval_add(command_id_copy,
+                                      trace_id_copy,
+                                      action_copy,
+                                      target_role_copy,
+                                      args_json,
+                                      reason,
+                                      approval_id,
+                                      sizeof(approval_id)) == ESP_OK) {
+                char prev_reason[160] = {0};
+                snprintf(prev_reason, sizeof(prev_reason), "%s", reason);
+                snprintf(dynamic_reason,
+                         sizeof(dynamic_reason),
+                         "%.104s; pending approval_id=%.31s",
+                         prev_reason,
+                         approval_id);
+                reason = dynamic_reason;
+            }
+        }
     }
 
     cJSON *out = cJSON_CreateObject();
@@ -1154,12 +1284,18 @@ static bool handle_sensor_mesh_command(const espagent_mesh_command_t *cmd)
     if (!espagent_role_is_sensor()) {
         return false;
     }
-    if (strcmp(cmd->action, "read_temperature_humidity") != 0) {
+    if (strcmp(cmd->action, "read_temperature_humidity") != 0 &&
+        strcmp(cmd->action, "virtual_device_read") != 0) {
         return false;
     }
 
     char result[384] = {0};
-    esp_err_t err = read_temperature_humidity_result(result, sizeof(result));
+    esp_err_t err = ESP_OK;
+    if (strcmp(cmd->action, "virtual_device_read") == 0) {
+        err = tool_virtual_device_read_execute(cmd->args_json[0] ? cmd->args_json : "{}", result, sizeof(result));
+    } else {
+        err = read_temperature_humidity_result(result, sizeof(result));
+    }
     ESP_LOGI(TAG, "Mesh sensor command executed: id=%s action=%s status=%s result=%s",
              cmd->command_id[0] ? cmd->command_id : "(none)",
              cmd->action,
@@ -1230,38 +1366,65 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
     return allowed;
 }
 
+static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd,
+                                              void *ctx,
+                                              char *result,
+                                              size_t result_size)
+{
+    (void)ctx;
+
+    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
+    const char *args = cmd->args_json[0] ? cmd->args_json : "{}";
+
+    char policy_reason[192] = {0};
+    if (!control_command_has_guardian_allow(cmd, policy_reason, sizeof(policy_reason))) {
+        snprintf(result, result_size,
+                 "Error: control command denied before local execution: %s",
+                 policy_reason);
+        err = ESP_ERR_INVALID_STATE;
+    } else if (strcmp(cmd->action, "control_state") == 0) {
+        err = control_command_queue_state_json(result, result_size);
+    } else if (strcmp(cmd->action, "control_emergency_stop") == 0) {
+        err = control_command_queue_emergency_stop(result, result_size);
+    } else if (strcmp(cmd->action, "set_status_light") == 0) {
+        err = tool_set_status_light_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "ws2812_set") == 0) {
+        err = tool_ws2812_set_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "virtual_device_control") == 0) {
+        err = tool_virtual_device_control_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "servo_write") == 0) {
+        err = tool_servo_write_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "gpio_write") == 0) {
+        err = tool_gpio_write_execute(args, result, result_size);
+    } else {
+        snprintf(result, result_size, "Error: unsupported control action=%s", cmd->action);
+        err = ESP_ERR_NOT_SUPPORTED;
+    }
+    return err;
+}
+
 static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
 {
     if (!espagent_role_is_control()) {
         return false;
     }
 
-    esp_err_t err = ESP_ERR_NOT_SUPPORTED;
-    char result[384] = {0};
-    const char *args = cmd->args_json[0] ? cmd->args_json : "{}";
-
-    char policy_reason[192] = {0};
-    if (!control_command_has_guardian_allow(cmd, policy_reason, sizeof(policy_reason))) {
-        snprintf(result, sizeof(result),
-                 "Error: control command denied before local execution: %s",
-                 policy_reason);
-        err = ESP_ERR_INVALID_STATE;
-    } else if (cmd->safety_level > ESPAGENT_MESH_SAFETY_MEDIUM) {
-        snprintf(result, sizeof(result),
-                 "Error: command safety_level=%d requires a future safety interlock",
-                 cmd->safety_level);
-        err = ESP_ERR_INVALID_ARG;
-    } else if (strcmp(cmd->action, "set_status_light") == 0) {
-        err = tool_set_status_light_execute(args, result, sizeof(result));
-    } else if (strcmp(cmd->action, "ws2812_set") == 0) {
-        err = tool_ws2812_set_execute(args, result, sizeof(result));
-    } else if (strcmp(cmd->action, "servo_write") == 0) {
-        err = tool_servo_write_execute(args, result, sizeof(result));
-    } else if (strcmp(cmd->action, "gpio_write") == 0) {
-        err = tool_gpio_write_execute(args, result, sizeof(result));
-    } else {
+    if (strcmp(cmd->action, "set_status_light") != 0 &&
+        strcmp(cmd->action, "ws2812_set") != 0 &&
+        strcmp(cmd->action, "virtual_device_control") != 0 &&
+        strcmp(cmd->action, "servo_write") != 0 &&
+        strcmp(cmd->action, "gpio_write") != 0 &&
+        strcmp(cmd->action, "control_state") != 0 &&
+        strcmp(cmd->action, "control_emergency_stop") != 0) {
         return false;
     }
+
+    char result[384] = {0};
+    esp_err_t err = control_command_queue_submit(cmd,
+                                                 execute_control_mesh_command,
+                                                 NULL,
+                                                 result,
+                                                 sizeof(result));
 
     ESP_LOGI(TAG, "Mesh control command executed: id=%s action=%s status=%s result=%s",
              cmd->command_id[0] ? cmd->command_id : "(none)",
@@ -1301,7 +1464,7 @@ static void handle_mesh_command(const char *source, const char *payload, size_t 
         return;
     }
 
-    ESP_LOGI(TAG, "Mesh command execution remains disabled until command_queue and safety_interlock are implemented");
+    ESP_LOGI(TAG, "Mesh command was valid but is not handled by local role/action whitelist");
 }
 
 static int mqtt_connect_tcp(void)

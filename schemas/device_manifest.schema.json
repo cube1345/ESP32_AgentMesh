@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ESPAgent Device Manifest",
+  "type": "object",
+  "required": ["manifest_version", "name", "protocol", "role", "risk", "permissions"],
+  "additionalProperties": true,
+  "properties": {
+    "manifest_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]{1,47}$"
+    },
+    "protocol": {
+      "type": "string",
+      "enum": [
+        "i2c",
+        "uart",
+        "modbus_rtu",
+        "spi",
+        "adc",
+        "gpio_input",
+        "gpio_output",
+        "relay_control",
+        "pwm_output",
+        "ledc_pwm",
+        "can_twai",
+        "ble_gatt",
+        "one_wire",
+        "i2s_pdm",
+        "rmt_ir",
+        "usb_cdc",
+        "sdmmc"
+      ]
+    },
+    "role": {
+      "type": "string",
+      "enum": ["sensor_agent", "control_agent"]
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["read_only", "low_control", "medium_control", "high_control"]
+    },
+    "permissions": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["read", "control"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "publisher": {
+      "type": "string"
+    },
+    "trust": {
+      "type": "object",
+      "properties": {
+        "source": {"type": "string"},
+        "integrity": {"type": "string"},
+        "review": {"type": "string"}
+      }
+    },
+    "pins": {
+      "type": "object"
+    },
+    "pin": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_duration_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 30000
+    },
+    "cooldown_ms": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 60000
+    },
+    "notes": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "manifest_version": 1,
+  "name": "bh1750_manifest",
+  "protocol": "i2c",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "sda": 11,
+    "scl": 12
+  },
+  "i2c_port": 0,
+  "scl_hz": 100000,
+  "address": "0x23",
+  "timeout_ms": 100,
+  "internal_pullup": true,
+  "operations": [
+    {"type": "write", "bytes": [32]},
+    {"type": "delay_ms", "value": 180},
+    {"type": "read", "length": 2}
+  ],
+  "decode": {
+    "type": "raw_u16_be",
+    "field": "light_lux",
+    "scale": 0.833333,
+    "offset": 0,
+    "unit": "lux"
+  },
+  "notes": "Generic I2C manifest example for BH1750/GY-30 one-time high-resolution light read."
+}

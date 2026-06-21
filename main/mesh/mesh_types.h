@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #define ESPAGENT_MESH_ID_MAX          40
 #define ESPAGENT_MESH_NODE_MAX        32
@@ -8,6 +9,7 @@
 #define ESPAGENT_MESH_ACTION_MAX      32
 #define ESPAGENT_MESH_TRACE_MAX       48
 #define ESPAGENT_MESH_ARGS_JSON_MAX   256
+#define ESPAGENT_MESH_SIGNATURE_MAX   65
 
 typedef enum {
     ESPAGENT_MESH_SAFETY_LOW = 0,
@@ -22,6 +24,8 @@ typedef struct {
     char target_role[ESPAGENT_MESH_ROLE_MAX];
     char action[ESPAGENT_MESH_ACTION_MAX];
     char args_json[ESPAGENT_MESH_ARGS_JSON_MAX];
+    char signature[ESPAGENT_MESH_SIGNATURE_MAX];
+    int64_t ts_ms;
     int ttl_ms;
     int safety_level;
     bool require_ack;

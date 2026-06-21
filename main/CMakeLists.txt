@@ -10,15 +10,22 @@ set(ESPAGENT_CORE_SRCS
 set(ESPAGENT_AGENT_SRCS
     "agent/agent_loop.c"
     "agent/context_builder.c"
+    "capability/capability_registry.c"
+    "capability/role_capability_profile.c"
+    "events/espagent_event.c"
+    "dynamic/dynamic_extension.c"
     "llm/llm_proxy.c"
+    "lua/espagent_lua_runtime.c"
     "cache/cache_store.c"
     "memory/memory_store.c"
+    "memory/memory_v2.c"
     "memory/session_mgr.c"
     "skills/skill_loader.c"
 )
 
 set(ESPAGENT_MESH_ROLE_SRCS
     "mesh/mesh_protocol.c"
+    "mesh/mesh_auth.c"
     "node/node_profile.c"
     "roles/role_config.c"
     "roles/coordinator_node.c"
@@ -26,6 +33,8 @@ set(ESPAGENT_MESH_ROLE_SRCS
     "roles/control_node.c"
     "roles/display_node.c"
     "roles/guardian_node.c"
+    "guardian/approval_queue.c"
+    "control/command_queue.c"
     "sensors/sensor_mqtt.c"
     "espnow/espnow_sender.c"
 )
@@ -54,8 +63,10 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_amap_weather.c"
     "tools/tool_web_search.c"
     "tools/tool_get_time.c"
+    "tools/tool_lua.c"
     "tools/tool_files.c"
     "tools/tool_mesh_command.c"
+    "tools/tool_virtual_device.c"
     "tools/tool_subagent.c"
     "tools/gpio_policy.c"
     "tools/tool_gpio.c"
@@ -90,5 +101,6 @@ idf_component_register(
         nvs_flash esp_wifi esp_netif esp_http_client esp_http_server
         esp_https_ota esp_event spiffs console vfs app_update esp-tls
         esp_timer esp_websocket_client esp_driver_gpio esp_driver_rmt esp_driver_i2c
+        esp_driver_spi esp_adc
         esp_driver_ledc esp_driver_uart esp_driver_i2s
 )

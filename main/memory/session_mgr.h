@@ -38,6 +38,22 @@ esp_err_t session_append_trace(const char *chat_id,
 esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, int max_msgs);
 
 /**
+ * Load recent structured trace events as a JSON array string.
+ * Trace events include tool_use, tool_result, async_result, and final_reply.
+ */
+esp_err_t session_get_trace_json(const char *chat_id, char *buf, size_t size, int max_events);
+
+/**
+ * Build a lightweight task tree by grouping recent trace events by trace_id or command_id.
+ */
+esp_err_t session_get_task_tree_json(const char *chat_id, char *buf, size_t size, int max_events);
+
+/**
+ * List persisted trace files under the session store.
+ */
+esp_err_t session_get_trace_index_json(char *buf, size_t size);
+
+/**
  * Clear a session (delete the file).
  */
 esp_err_t session_clear(const char *chat_id);
