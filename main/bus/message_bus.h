@@ -9,6 +9,7 @@
 #define ESPAGENT_CHAN_FEISHU     "feishu"
 #define ESPAGENT_CHAN_WEBSOCKET  "websocket"
 #define ESPAGENT_CHAN_CLI        "cli"
+#define ESPAGENT_CHAN_VOICE      "voice"
 #define ESPAGENT_CHAN_SYSTEM     "system"
 
 /* Message flags */

@@ -38,6 +38,7 @@
 #include "memory/session_mgr.h"
 #include "onboard/wifi_onboard.h"
 #include "proactive/proactive_service.h"
+#include "voice/voice_bridge.h"
 #include "proxy/http_proxy.h"
 #include "roles/control_node.h"
 #include "roles/coordinator_node.h"
@@ -324,6 +325,9 @@ static void outbound_dispatch_task(void *arg)
             if (ws_err != ESP_OK) {
                 ESP_LOGW(TAG, "WS send failed for %s: %s", msg.chat_id, esp_err_to_name(ws_err));
             }
+        } else if (strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
+            ESP_LOGI(TAG, "Voice outbound handled via MQTT TTS bridge [%s]: %.96s",
+                     msg.chat_id, msg.content);
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);
         } else {

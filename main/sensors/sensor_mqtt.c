@@ -13,6 +13,7 @@
 #include "tools/tool_servo.h"
 #include "tools/tool_virtual_device.h"
 #include "device/device_registry.h"
+#include "voice/voice_bridge.h"
 
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -2044,6 +2045,10 @@ static void mqtt_poll_inbound(int fd)
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_POLICY_DECISION)) {
                 policy_cache_maybe_store_payload(msg, msg_len);
                 ESP_LOGI(TAG, "Policy decision received: %.*s", (int)msg_len, msg);
+            } else if (espagent_voice_handle_mqtt_message((const char *)topic,
+                                                          topic_len,
+                                                          msg,
+                                                          msg_len)) {
             } else {
                 char nodes_state_filter[160] = {0};
                 char nodes_telemetry_filter[160] = {0};
@@ -2325,9 +2330,13 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 6);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT, 7);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 8);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_EVENTS, 9);
         } else if (espagent_role_is_control()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 5);
         } else if (espagent_role_is_guardian()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
@@ -2340,6 +2349,8 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_CHECK, 6);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 7);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT, 8);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 9);
         }
         if (espagent_role_runs_guardian() || espagent_role_is_coordinator()) {
             char nodes_state_filter[160] = {0};
@@ -2348,8 +2359,8 @@ static void sensor_mqtt_task(void *arg)
                      "%s/nodes/+/state", ESPAGENT_MESH_TOPIC_PREFIX);
             snprintf(nodes_telemetry_filter, sizeof(nodes_telemetry_filter),
                      "%s/nodes/+/telemetry", ESPAGENT_MESH_TOPIC_PREFIX);
-            mqtt_subscribe(fd, nodes_state_filter, 8);
-            mqtt_subscribe(fd, nodes_telemetry_filter, 9);
+            mqtt_subscribe(fd, nodes_state_filter, 10);
+            mqtt_subscribe(fd, nodes_telemetry_filter, 11);
         }
         mqtt_set_connected(true);
         publish_node_state(fd, "online");

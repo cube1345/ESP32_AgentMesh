@@ -9,6 +9,7 @@
 #include "sensors/sensor_mqtt.h"
 #include "espagent_config.h"
 #include "tools/tool_registry.h"
+#include "voice/voice_bridge.h"
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -1512,6 +1513,13 @@ static void agent_loop_task(void *arg) {
                                                ESP_OK,
                                                out.content,
                                                out.content);
+      if (ESPAGENT_VOICE_AUTO_TTS &&
+          strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
+        (void)espagent_voice_publish_tts_request(out.content,
+                                                 msg.channel,
+                                                 msg.chat_id,
+                                                 NULL);
+      }
       (void)session_append_trace(msg.chat_id, "final_reply",
                                  "Assistant final reply", out.content);
       if (message_bus_push_outbound(&out) != ESP_OK) {
@@ -1540,6 +1548,13 @@ static void agent_loop_task(void *arg) {
                                                  ESP_FAIL,
                                                  out.content,
                                                  out.content);
+        if (ESPAGENT_VOICE_AUTO_TTS &&
+            strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
+          (void)espagent_voice_publish_tts_request(out.content,
+                                                   msg.channel,
+                                                   msg.chat_id,
+                                                   NULL);
+        }
         (void)session_append_trace(msg.chat_id, "final_error",
                                    "Assistant error reply", out.content);
         if (message_bus_push_outbound(&out) != ESP_OK) {
