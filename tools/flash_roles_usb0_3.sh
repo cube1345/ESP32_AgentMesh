@@ -51,6 +51,34 @@ NODE_RESPONSIBILITIES=(
   "enforce policy decisions, audit OutputMessages, watch node health, and protect private data"
 )
 
+THINK_LED_GPIO_1=(
+  "-1"
+  "-1"
+  "-1"
+  "-1"
+)
+
+THINK_LED_GPIO_2=(
+  "-1"
+  "-1"
+  "-1"
+  "-1"
+)
+
+THINK_LED_GPIO_3=(
+  "-1"
+  "-1"
+  "-1"
+  "-1"
+)
+
+THINK_LED_ACTIVE_LEVEL=(
+  "1"
+  "1"
+  "1"
+  "1"
+)
+
 SELECTED_INDICES=("$@")
 if [[ "${#SELECTED_INDICES[@]}" -eq 0 ]]; then
   SELECTED_INDICES=(0 1 2 3)
@@ -116,14 +144,27 @@ set_profile() {
   local node_role="$2"
   local capabilities="$3"
   local responsibilities="$4"
+  local think_led_1="$5"
+  local think_led_2="$6"
+  local think_led_3="$7"
+  local think_led_active_level="$8"
 
-  "${PYTHON:-python3}" - "$SECRETS_FILE" "$node_id" "$node_role" "$capabilities" "$responsibilities" <<'PY'
+  "${PYTHON:-python3}" - "$SECRETS_FILE" "$node_id" "$node_role" "$capabilities" "$responsibilities" "$think_led_1" "$think_led_2" "$think_led_3" "$think_led_active_level" <<'PY'
 import re
 import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-node_id, node_role, capabilities, responsibilities = sys.argv[2:6]
+(
+    node_id,
+    node_role,
+    capabilities,
+    responsibilities,
+    think_led_1,
+    think_led_2,
+    think_led_3,
+    think_led_active_level,
+) = sys.argv[2:10]
 text = path.read_text()
 
 replacements = {
@@ -131,11 +172,19 @@ replacements = {
     "ESPAGENT_SECRET_NODE_ROLE": node_role,
     "ESPAGENT_SECRET_NODE_CAPABILITIES": capabilities,
     "ESPAGENT_SECRET_NODE_RESPONSIBILITIES": responsibilities,
+    "ESPAGENT_SECRET_THINK_LED_GPIO_1": think_led_1,
+    "ESPAGENT_SECRET_THINK_LED_GPIO_2": think_led_2,
+    "ESPAGENT_SECRET_THINK_LED_GPIO_3": think_led_3,
+    "ESPAGENT_SECRET_THINK_LED_ACTIVE_LEVEL": think_led_active_level,
 }
 
 for key, value in replacements.items():
-    pattern = rf'(#define\s+{re.escape(key)}\s+)".*?"'
-    text, count = re.subn(pattern, rf'\1"{value}"', text, count=1)
+    if re.fullmatch(r"-?\d+", value):
+        pattern = rf'(#define\s+{re.escape(key)}\s+)\(?-?\d+\)?\b'
+        text, count = re.subn(pattern, rf'\g<1>{value}', text, count=1)
+    else:
+        pattern = rf'(#define\s+{re.escape(key)}\s+)".*?"'
+        text, count = re.subn(pattern, rf'\1"{value}"', text, count=1)
     if count != 1:
         raise SystemExit(f"ERROR: failed to replace {key}")
 
@@ -150,6 +199,10 @@ flash_one() {
   local node_role="${NODE_ROLES[$index]}"
   local capabilities="${NODE_CAPABILITIES[$index]}"
   local responsibilities="${NODE_RESPONSIBILITIES[$index]}"
+  local think_led_1="${THINK_LED_GPIO_1[$index]}"
+  local think_led_2="${THINK_LED_GPIO_2[$index]}"
+  local think_led_3="${THINK_LED_GPIO_3[$index]}"
+  local think_led_active_level="${THINK_LED_ACTIVE_LEVEL[$index]}"
   local flash_target
   local flash_label
   flash_target="$(flash_target_for_mode)"
@@ -161,7 +214,8 @@ flash_one() {
   require_file "$port"
   echo
   echo "==> Flashing USB${index}: ${port} -> ${node_id} / ${node_role} (mode=${ESPAGENT_FLASH_MODE}, target=${flash_label})"
-  set_profile "$node_id" "$node_role" "$capabilities" "$responsibilities"
+  set_profile "$node_id" "$node_role" "$capabilities" "$responsibilities" \
+    "$think_led_1" "$think_led_2" "$think_led_3" "$think_led_active_level"
 
   if [[ "${ESPAGENT_FLASH_FULLCLEAN:-0}" == "1" ]]; then
     (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" fullclean)
@@ -207,7 +261,11 @@ restore_coordinator_profile() {
     "esp32s3-coordinator-01" \
     "coordinator_agent" \
     "coordinator,communication,llm,dispatch,timeline,alerts" \
-    "receive user messages, call LLM, plan dispatch, publish timeline, and notify users"
+    "receive user messages, call LLM, plan dispatch, publish timeline, and notify users" \
+    "-1" \
+    "-1" \
+    "-1" \
+    "1"
 }
 
 cleanup_on_error() {

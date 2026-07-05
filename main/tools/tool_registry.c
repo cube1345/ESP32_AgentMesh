@@ -83,12 +83,30 @@ static esp_err_t tool_memory_profile_set_execute(const char *input_json,
         return ESP_ERR_INVALID_ARG;
     }
     char key_copy[64];
-    snprintf(key_copy, sizeof(key_copy), "%s", key);
+    memory_v2_normalize_profile_key(key, key_copy, sizeof(key_copy));
+    if (key_copy[0] == '\0') {
+        snprintf(key_copy, sizeof(key_copy), "%s", key);
+    }
 
-    esp_err_t err = memory_v2_upsert_profile_fact(key, value, source ? source : "agent", confidence);
+    char change_note[192] = {0};
+    esp_err_t err = memory_v2_upsert_profile_fact(key_copy,
+                                                  value,
+                                                  source ? source : "agent",
+                                                  confidence,
+                                                  change_note,
+                                                  sizeof(change_note));
     cJSON_Delete(root);
     if (err == ESP_OK) {
-        snprintf(output, output_size, "OK: structured profile fact saved key=%s", key_copy);
+        snprintf(output, output_size, "OK: structured profile fact saved key=%s%s%s",
+                 key_copy,
+                 change_note[0] ? " (" : "",
+                 change_note[0] ? change_note : "");
+        if (change_note[0]) {
+            size_t len = strlen(output);
+            if (len + 1 < output_size) {
+                snprintf(output + len, output_size - len, ")");
+            }
+        }
     } else {
         snprintf(output, output_size, "Error: profile save failed: %s", esp_err_to_name(err));
     }
@@ -509,11 +527,11 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "memory_profile_set",
-        .description = "Store or update a structured user-profile fact in Memory v2. Use this for stable user preferences, habits, constraints, and repeated contradictions with previous preferences. Keep keys short, such as humidity_min_preferred or morning_weather_preference.",
+        .description = "Store or update a structured user-profile fact in Memory v2. Use this for stable user preferences, habits, constraints, and repeated contradictions with previous preferences. Keys are normalized into stable namespaces such as env.humidity_preference, env.temperature_preference, habit.sleep_schedule, device.light_preference, device.humidifier_policy, and privacy.data_sharing.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"key\":{\"type\":\"string\",\"description\":\"Stable profile key\"},"
-            "\"value\":{\"type\":\"string\",\"description\":\"Current fact or preference value\"},"
+            "\"properties\":{\"key\":{\"type\":\"string\",\"description\":\"Stable profile key. Prefer env.humidity_preference, env.temperature_preference, env.light_preference, env.air_quality_preference, habit.sleep_schedule, habit.wake_schedule, device.light_preference, device.humidifier_policy, device.fan_policy, device.ac_policy, or privacy.data_sharing.\"},"
+            "\"value\":{\"type\":\"string\",\"description\":\"Current fact or preference value. Keep it short and specific, for example humidity<40 => open humidifier, preferred_color=blue, bedtime=23:30.\"},"
             "\"source\":{\"type\":\"string\",\"description\":\"Where this fact came from, e.g. feishu, observation, correction\"},"
             "\"confidence\":{\"type\":\"number\",\"minimum\":0,\"maximum\":1,\"description\":\"Confidence in this fact, defaults to 0.7\"}},"
             "\"required\":[\"key\",\"value\"],\"additionalProperties\":false}",
@@ -554,7 +572,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"

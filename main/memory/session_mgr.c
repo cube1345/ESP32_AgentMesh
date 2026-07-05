@@ -8,12 +8,19 @@
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdarg.h>
 #include <sys/stat.h>
 #include <time.h>
 #include "esp_log.h"
 #include "cJSON.h"
 
 static const char *TAG = "session";
+
+#define SESSION_BRIEF_MAX_HISTORY 12
+#define SESSION_BRIEF_MAX_USER_ITEMS 3
+#define SESSION_BRIEF_MAX_ASSISTANT_ITEMS 2
+#define SESSION_BRIEF_MAX_TASKS 3
+#define SESSION_BRIEF_ITEM_CHARS 160
 
 static uint64_t session_hash_chat_id(const char *chat_id)
 {
@@ -54,6 +61,20 @@ static void session_trace_path(const char *chat_id, char *buf, size_t size)
     }
 }
 
+static void session_brief_path(const char *chat_id, char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return;
+    }
+
+    uint64_t hash = session_hash_chat_id(chat_id);
+    int n = snprintf(buf, size, "%s/brief_%016" PRIx64 ".md",
+                     ESPAGENT_SPIFFS_SESSION_DIR, hash);
+    if (n < 0 || (size_t)n >= size) {
+        buf[0] = '\0';
+    }
+}
+
 static bool session_legacy_chat_id_is_safe(const char *chat_id)
 {
     if (!chat_id || chat_id[0] == '\0') {
@@ -85,6 +106,63 @@ static void session_legacy_path(const char *chat_id, char *buf, size_t size)
     if (n < 0 || (size_t)n >= size) {
         buf[0] = '\0';
     }
+}
+
+static void compact_line_text(const char *src, char *dst, size_t dst_size)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+
+    size_t wi = 0;
+    bool last_space = false;
+    for (const unsigned char *p = (const unsigned char *)src; *p && wi + 1 < dst_size; p++) {
+        unsigned char c = *p;
+        if (c == '\r' || c == '\n' || c == '\t') {
+            c = ' ';
+        }
+        if (c == ' ') {
+            if (last_space) {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        dst[wi++] = (char)c;
+    }
+    while (wi > 0 && dst[wi - 1] == ' ') {
+        wi--;
+    }
+    dst[wi] = '\0';
+}
+
+static size_t append_brief_line(char *buf, size_t size, size_t off, const char *fmt, ...)
+{
+    if (!buf || size == 0) {
+        return 0;
+    }
+    if (off >= size - 1) {
+        buf[size - 1] = '\0';
+        return size - 1;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, size - off, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        return off;
+    }
+    if ((size_t)n >= size - off) {
+        buf[size - 1] = '\0';
+        return size - 1;
+    }
+    return off + (size_t)n;
 }
 
 esp_err_t session_mgr_init(void)
@@ -431,6 +509,37 @@ static void task_tree_add_event(cJSON *tasks, cJSON *trace)
     cJSON_AddItemToArray(events, ev);
 }
 
+static bool text_has_query_token_local(const char *text, const char *query)
+{
+    if (!text || !query || !query[0]) {
+        return false;
+    }
+    char token[48];
+    size_t ti = 0;
+    for (const unsigned char *p = (const unsigned char *)query; ; p++) {
+        unsigned char c = *p;
+        bool token_char = (c >= '0' && c <= '9') ||
+                          (c >= 'A' && c <= 'Z') ||
+                          (c >= 'a' && c <= 'z') ||
+                          (c & 0x80);
+        if (token_char && ti + 1 < sizeof(token)) {
+            token[ti++] = (char)c;
+            continue;
+        }
+        if (ti > 0) {
+            token[ti] = '\0';
+            if (ti >= 2 && strstr(text, token)) {
+                return true;
+            }
+            ti = 0;
+        }
+        if (c == '\0') {
+            break;
+        }
+    }
+    return false;
+}
+
 esp_err_t session_get_task_tree_json(const char *chat_id, char *buf, size_t size, int max_events)
 {
     if (!buf || size == 0) {
@@ -486,6 +595,89 @@ esp_err_t session_get_task_tree_json(const char *chat_id, char *buf, size_t size
     snprintf(buf, size, "%s", json);
     free(json);
     return ESP_OK;
+}
+
+esp_err_t session_build_relevant_task_brief(const char *chat_id,
+                                            const char *query,
+                                            char *buf,
+                                            size_t size)
+{
+    if (!buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    buf[0] = '\0';
+    if (!query || !query[0]) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char task_tree_json[8192] = {0};
+    esp_err_t err = session_get_task_tree_json(chat_id, task_tree_json, sizeof(task_tree_json), 24);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    cJSON *root = cJSON_Parse(task_tree_json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+    cJSON *tasks = cJSON_GetObjectItem(root, "tasks");
+    if (!cJSON_IsArray(tasks)) {
+        cJSON_Delete(root);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t off = 0;
+    int matched = 0;
+    cJSON *task = NULL;
+    cJSON_ArrayForEach(task, tasks) {
+        if (!cJSON_IsObject(task)) {
+            continue;
+        }
+        cJSON *task_key = cJSON_GetObjectItem(task, "task_key");
+        cJSON *events = cJSON_GetObjectItem(task, "events");
+        if (!cJSON_IsString(task_key) || !cJSON_IsArray(events) || cJSON_GetArraySize(events) <= 0) {
+            continue;
+        }
+
+        bool relevant = text_has_query_token_local(task_key->valuestring, query);
+        cJSON *last_ev = cJSON_GetArrayItem(events, cJSON_GetArraySize(events) - 1);
+        cJSON *event = last_ev ? cJSON_GetObjectItem(last_ev, "event") : NULL;
+        cJSON *action = last_ev ? cJSON_GetObjectItem(last_ev, "action") : NULL;
+        cJSON *status = last_ev ? cJSON_GetObjectItem(last_ev, "status") : NULL;
+        cJSON *summary = last_ev ? cJSON_GetObjectItem(last_ev, "summary") : NULL;
+        if (!relevant) {
+            relevant = (cJSON_IsString(event) && text_has_query_token_local(event->valuestring, query)) ||
+                       (cJSON_IsString(action) && text_has_query_token_local(action->valuestring, query)) ||
+                       (cJSON_IsString(summary) && text_has_query_token_local(summary->valuestring, query));
+        }
+        if (!relevant) {
+            continue;
+        }
+
+        if (matched == 0) {
+            off = append_brief_line(buf, size, off, "## Relevant Task State\n\n");
+        }
+        char compact[SESSION_BRIEF_ITEM_CHARS + 1];
+        compact_line_text(cJSON_IsString(summary) ? summary->valuestring : "",
+                          compact,
+                          sizeof(compact));
+        off = append_brief_line(buf, size, off,
+                                "- %s -> %s/%s/%s%s%s\n",
+                                task_key->valuestring,
+                                cJSON_IsString(event) ? event->valuestring : "event",
+                                cJSON_IsString(action) ? action->valuestring : "",
+                                cJSON_IsString(status) ? status->valuestring : "unknown",
+                                compact[0] ? ": " : "",
+                                compact);
+        matched++;
+        if (matched >= SESSION_BRIEF_MAX_TASKS || off >= size - 1) {
+            break;
+        }
+    }
+
+    cJSON_Delete(root);
+    return matched > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t session_get_trace_index_json(char *buf, size_t size)
@@ -545,6 +737,190 @@ esp_err_t session_get_trace_index_json(char *buf, size_t size)
     snprintf(buf, size, "%s", json);
     free(json);
     return ESP_OK;
+}
+
+static esp_err_t build_context_brief_uncached(const char *chat_id, char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    buf[0] = '\0';
+
+    char history_json[8192] = {0};
+    esp_err_t history_err = session_get_history_json(chat_id,
+                                                     history_json,
+                                                     sizeof(history_json),
+                                                     SESSION_BRIEF_MAX_HISTORY);
+    if (history_err != ESP_OK && history_err != ESP_ERR_NOT_FOUND) {
+        return history_err;
+    }
+
+    char task_tree_json[8192] = {0};
+    esp_err_t task_err = session_get_task_tree_json(chat_id,
+                                                    task_tree_json,
+                                                    sizeof(task_tree_json),
+                                                    16);
+    if (task_err != ESP_OK && task_err != ESP_ERR_NOT_FOUND &&
+        task_err != ESP_ERR_INVALID_RESPONSE) {
+        return task_err;
+    }
+
+    cJSON *history = cJSON_Parse(history_json);
+    cJSON *task_tree = cJSON_Parse(task_tree_json);
+    size_t off = 0;
+    bool wrote = false;
+
+    if (history && cJSON_IsArray(history)) {
+        char recent_user[SESSION_BRIEF_MAX_USER_ITEMS][SESSION_BRIEF_ITEM_CHARS + 1];
+        char recent_asst[SESSION_BRIEF_MAX_ASSISTANT_ITEMS][SESSION_BRIEF_ITEM_CHARS + 1];
+        int user_count = 0;
+        int asst_count = 0;
+
+        cJSON *item = NULL;
+        cJSON_ArrayForEach(item, history) {
+            cJSON *role = cJSON_GetObjectItem(item, "role");
+            cJSON *content = cJSON_GetObjectItem(item, "content");
+            if (!cJSON_IsString(role) || !cJSON_IsString(content) ||
+                content->valuestring[0] == '\0') {
+                continue;
+            }
+            if (strcmp(role->valuestring, "user") == 0) {
+                compact_line_text(content->valuestring,
+                                  recent_user[user_count % SESSION_BRIEF_MAX_USER_ITEMS],
+                                  sizeof(recent_user[0]));
+                user_count++;
+            } else if (strcmp(role->valuestring, "assistant") == 0) {
+                compact_line_text(content->valuestring,
+                                  recent_asst[asst_count % SESSION_BRIEF_MAX_ASSISTANT_ITEMS],
+                                  sizeof(recent_asst[0]));
+                asst_count++;
+            }
+        }
+
+        int kept_user = user_count < SESSION_BRIEF_MAX_USER_ITEMS ? user_count : SESSION_BRIEF_MAX_USER_ITEMS;
+        int kept_asst = asst_count < SESSION_BRIEF_MAX_ASSISTANT_ITEMS ? asst_count : SESSION_BRIEF_MAX_ASSISTANT_ITEMS;
+        if (kept_user > 0 || kept_asst > 0) {
+            off = append_brief_line(buf, size, off, "## Session Brief\n\n");
+            wrote = true;
+        }
+
+        if (kept_user > 0) {
+            off = append_brief_line(buf, size, off, "- Recent user goals:\n");
+            int start = user_count > kept_user ? user_count - kept_user : 0;
+            for (int i = 0; i < kept_user; i++) {
+                int idx = (start + i) % SESSION_BRIEF_MAX_USER_ITEMS;
+                off = append_brief_line(buf, size, off, "  - %s\n", recent_user[idx]);
+            }
+        }
+
+        if (kept_asst > 0) {
+            off = append_brief_line(buf, size, off, "- Recent assistant conclusions:\n");
+            int start = asst_count > kept_asst ? asst_count - kept_asst : 0;
+            for (int i = 0; i < kept_asst; i++) {
+                int idx = (start + i) % SESSION_BRIEF_MAX_ASSISTANT_ITEMS;
+                off = append_brief_line(buf, size, off, "  - %s\n", recent_asst[idx]);
+            }
+        }
+    }
+
+    if (task_tree && cJSON_IsObject(task_tree)) {
+        cJSON *tasks = cJSON_GetObjectItem(task_tree, "tasks");
+        if (tasks && cJSON_IsArray(tasks) && cJSON_GetArraySize(tasks) > 0) {
+            if (!wrote) {
+                off = append_brief_line(buf, size, off, "## Session Brief\n\n");
+                wrote = true;
+            }
+            off = append_brief_line(buf, size, off, "- Recent task traces:\n");
+            int total = cJSON_GetArraySize(tasks);
+            int start = total > SESSION_BRIEF_MAX_TASKS ? total - SESSION_BRIEF_MAX_TASKS : 0;
+            for (int i = start; i < total; i++) {
+                cJSON *task = cJSON_GetArrayItem(tasks, i);
+                if (!cJSON_IsObject(task)) {
+                    continue;
+                }
+                cJSON *task_key = cJSON_GetObjectItem(task, "task_key");
+                cJSON *events = cJSON_GetObjectItem(task, "events");
+                if (!cJSON_IsString(task_key) || !cJSON_IsArray(events) || cJSON_GetArraySize(events) <= 0) {
+                    continue;
+                }
+                cJSON *last_ev = cJSON_GetArrayItem(events, cJSON_GetArraySize(events) - 1);
+                cJSON *event = last_ev ? cJSON_GetObjectItem(last_ev, "event") : NULL;
+                cJSON *status = last_ev ? cJSON_GetObjectItem(last_ev, "status") : NULL;
+                cJSON *summary = last_ev ? cJSON_GetObjectItem(last_ev, "summary") : NULL;
+                char compact[SESSION_BRIEF_ITEM_CHARS + 1];
+                compact_line_text(cJSON_IsString(summary) ? summary->valuestring : "",
+                                  compact,
+                                  sizeof(compact));
+                off = append_brief_line(buf, size, off,
+                                        "  - %s -> %s/%s%s%s\n",
+                                        task_key->valuestring,
+                                        cJSON_IsString(event) ? event->valuestring : "event",
+                                        cJSON_IsString(status) ? status->valuestring : "unknown",
+                                        compact[0] ? ": " : "",
+                                        compact);
+            }
+        }
+    }
+
+    cJSON_Delete(history);
+    cJSON_Delete(task_tree);
+
+    if (!wrote) {
+        buf[0] = '\0';
+        return ESP_ERR_NOT_FOUND;
+    }
+    return ESP_OK;
+}
+
+esp_err_t session_refresh_context_brief(const char *chat_id)
+{
+    char brief[4096] = {0};
+    esp_err_t err = build_context_brief_uncached(chat_id, brief, sizeof(brief));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char path[128];
+    session_brief_path(chat_id, path, sizeof(path));
+    if (path[0] == '\0') {
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return ESP_FAIL;
+    }
+    fputs(brief, f);
+    fclose(f);
+    return ESP_OK;
+}
+
+esp_err_t session_build_context_brief(const char *chat_id, char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    buf[0] = '\0';
+
+    char path[128];
+    session_brief_path(chat_id, path, sizeof(path));
+    if (path[0] != '\0') {
+        FILE *f = fopen(path, "r");
+        if (f) {
+            size_t n = fread(buf, 1, size - 1, f);
+            buf[n] = '\0';
+            fclose(f);
+            if (buf[0]) {
+                return ESP_OK;
+            }
+        }
+    }
+
+    esp_err_t err = build_context_brief_uncached(chat_id, buf, size);
+    if (err == ESP_OK) {
+        (void)session_refresh_context_brief(chat_id);
+    }
+    return err;
 }
 
 esp_err_t session_clear(const char *chat_id)

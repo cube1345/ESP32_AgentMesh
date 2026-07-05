@@ -3,11 +3,13 @@
 #include "agent/slash_command.h"
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
+#include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "proactive/proactive_service.h"
 #include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
 #include "espagent_config.h"
+#include "tools/tool_gpio.h"
 #include "tools/tool_registry.h"
 #include "voice/voice_bridge.h"
 
@@ -141,6 +143,34 @@ static bool message_has_any_keyword(const char *message,
   }
 
   return false;
+}
+
+static void build_relevance_query(const char *input, char *out,
+                                  size_t out_size) {
+  if (!out || out_size == 0) {
+    return;
+  }
+  out[0] = '\0';
+  snprintf(out, out_size, "%s", input ? input : "");
+
+  const char *suffix = "";
+  if (espagent_role_is_sensor()) {
+    suffix =
+        " sensor telemetry temperature humidity air quality light presence i2c uart adc";
+  } else if (espagent_role_is_control()) {
+    suffix =
+        " control actuator gpio ws2812 servo relay pwm ir uart emergency stop";
+  } else if (espagent_role_is_guardian()) {
+    suffix =
+        " guardian security policy privacy audit approval sandbox watchdog stateboard";
+  } else if (espagent_role_is_coordinator()) {
+    suffix = " coordinator mesh dispatch timeline gateway voice status";
+  }
+
+  size_t off = strnlen(out, out_size - 1);
+  if (suffix[0] && off < out_size - 1) {
+    snprintf(out + off, out_size - off, "%s", suffix);
+  }
 }
 
 static bool tool_guard_match_light_sensor_request(const char *message) {
@@ -1309,6 +1339,7 @@ static void agent_loop_task(void *arg) {
              "=== CONV ==================================================");
     ESP_LOGI(TAG, "=== CONV === [%s/%s] >> USER: %s", msg.channel, msg.chat_id,
              msg.content);
+    (void)tool_status_indicator_thinking_start();
 
     bool proactive_turn = (msg.flags & ESPAGENT_MSG_FLAG_PROACTIVE) != 0;
     bool internal_result_turn =
@@ -1330,6 +1361,7 @@ static void agent_loop_task(void *arg) {
                    slash.command[0] ? slash.command : "help");
           (void)message_bus_push_outbound(&out);
         }
+        (void)tool_status_indicator_thinking_stop();
         free(msg.content);
         ESP_LOGI(TAG, "Free PSRAM: %d bytes",
                  (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -1357,6 +1389,69 @@ static void agent_loop_task(void *arg) {
     /* 2. Load session history into cJSON array */
     session_get_history_json(msg.chat_id, history_json,
                              ESPAGENT_LLM_STREAM_BUF_SIZE, ESPAGENT_AGENT_MAX_HISTORY);
+    char relevance_query[1024] = {0};
+    build_relevance_query(msg.content, relevance_query, sizeof(relevance_query));
+    {
+      char session_brief[2048] = {0};
+      if (session_build_context_brief(msg.chat_id,
+                                      session_brief,
+                                      sizeof(session_brief)) == ESP_OK &&
+          session_brief[0]) {
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n%s\n",
+                             session_brief);
+      }
+    }
+    {
+      char relevant_profile[1024] = {0};
+      if (memory_v2_build_relevant_profile_summary(relevance_query,
+                                                   relevant_profile,
+                                                   sizeof(relevant_profile)) == ESP_OK &&
+          relevant_profile[0]) {
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n## Relevant User Profile For This Turn\n\n%s\n",
+                             relevant_profile);
+      }
+    }
+    {
+      char relevant_conflicts[768] = {0};
+      if (memory_v2_build_relevant_profile_conflict_summary(relevance_query,
+                                                            relevant_conflicts,
+                                                            sizeof(relevant_conflicts)) == ESP_OK &&
+          relevant_conflicts[0]) {
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n## Relevant Profile Changes For This Turn\n\n%s\n",
+                             relevant_conflicts);
+      }
+    }
+    {
+      char relevant_skills[1024] = {0};
+      if (memory_v2_build_relevant_skill_summary(relevance_query,
+                                                 relevant_skills,
+                                                 sizeof(relevant_skills)) == ESP_OK &&
+          relevant_skills[0]) {
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n## Relevant Skill Notes For This Turn\n\n%s\n",
+                             relevant_skills);
+      }
+    }
+    {
+      char relevant_tasks[1024] = {0};
+      if (session_build_relevant_task_brief(msg.chat_id,
+                                            relevance_query,
+                                            relevant_tasks,
+                                            sizeof(relevant_tasks)) == ESP_OK &&
+          relevant_tasks[0]) {
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n%s\n",
+                             relevant_tasks);
+      }
+    }
     append_pending_clarification_prompt(system_prompt,
                                         ESPAGENT_CONTEXT_BUF_SIZE,
                                         history_json);
@@ -1472,6 +1567,7 @@ static void agent_loop_task(void *arg) {
         free(final_text);
         final_text = NULL;
         free(msg.content);
+        (void)tool_status_indicator_thinking_stop();
         ESP_LOGI(TAG, "Free PSRAM: %d bytes",
                  (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         continue;
@@ -1491,6 +1587,7 @@ static void agent_loop_task(void *arg) {
                  esp_err_to_name(save_asst));
       } else {
         ESP_LOGI(TAG, "Session saved for chat %s", msg.chat_id);
+        (void)session_refresh_context_brief(msg.chat_id);
       }
 
       /* Push response to outbound */
@@ -1522,6 +1619,7 @@ static void agent_loop_task(void *arg) {
       }
       (void)session_append_trace(msg.chat_id, "final_reply",
                                  "Assistant final reply", out.content);
+      (void)session_refresh_context_brief(msg.chat_id);
       if (message_bus_push_outbound(&out) != ESP_OK) {
         ESP_LOGW(TAG, "Outbound queue full, drop final response");
         free(final_text);
@@ -1557,6 +1655,7 @@ static void agent_loop_task(void *arg) {
         }
         (void)session_append_trace(msg.chat_id, "final_error",
                                    "Assistant error reply", out.content);
+        (void)session_refresh_context_brief(msg.chat_id);
         if (message_bus_push_outbound(&out) != ESP_OK) {
           ESP_LOGW(TAG, "Outbound queue full, drop error response");
           free(out.content);
@@ -1566,6 +1665,7 @@ static void agent_loop_task(void *arg) {
 
     /* Free inbound message content */
     free(msg.content);
+    (void)tool_status_indicator_thinking_stop();
 
     /* Log memory status */
     ESP_LOGI(TAG, "Free PSRAM: %d bytes",

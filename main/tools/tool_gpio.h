@@ -27,3 +27,8 @@ esp_err_t tool_ws2812_set_execute(const char *input_json, char *output, size_t o
 /* High-level chat-friendly status light alias.
  * Input JSON: {"color"?:<string>,"brightness"?:<0-255>,"pin"?:<int>,"r"?:<0-255>,"g"?:<0-255>,"b"?:<0-255>} */
 esp_err_t tool_set_status_light_execute(const char *input_json, char *output, size_t output_size);
+
+/* Start / stop internal rapid thinking animation on configured ordinary GPIO LEDs.
+ * This is for local firmware state indication, not LLM-facing tool use. */
+esp_err_t tool_status_indicator_thinking_start(void);
+esp_err_t tool_status_indicator_thinking_stop(void);

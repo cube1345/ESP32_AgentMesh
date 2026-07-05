@@ -1820,6 +1820,8 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = control_command_queue_state_json(result, result_size);
     } else if (strcmp(cmd->action, "control_emergency_stop") == 0) {
         err = control_command_queue_emergency_stop(result, result_size);
+    } else if (strcmp(cmd->action, "control_clear_emergency_stop") == 0) {
+        err = control_command_queue_clear_emergency_stop(result, result_size);
     } else if (strcmp(cmd->action, "set_status_light") == 0) {
         err = tool_set_status_light_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "ws2812_set") == 0) {
@@ -1869,7 +1871,8 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
         strcmp(cmd->action, "gpio_write") != 0 &&
         strcmp(cmd->action, "gree_ac_control") != 0 &&
         strcmp(cmd->action, "control_state") != 0 &&
-        strcmp(cmd->action, "control_emergency_stop") != 0) {
+        strcmp(cmd->action, "control_emergency_stop") != 0 &&
+        strcmp(cmd->action, "control_clear_emergency_stop") != 0) {
         return false;
     }
 

@@ -265,6 +265,7 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "gree_ac_control") != 0 &&
         strcmp(action, "control_state") != 0 &&
         strcmp(action, "control_emergency_stop") != 0 &&
+        strcmp(action, "control_clear_emergency_stop") != 0 &&
         strcmp(action, "read_temperature_humidity") != 0 &&
         strcmp(action, "virtual_device_read") != 0 &&
         strcmp(action, "agent_task") != 0) {

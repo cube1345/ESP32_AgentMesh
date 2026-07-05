@@ -276,6 +276,21 @@ esp_err_t control_command_queue_emergency_stop(char *output, size_t output_size)
     return ESP_OK;
 }
 
+esp_err_t control_command_queue_clear_emergency_stop(char *output, size_t output_size)
+{
+    esp_err_t err = ensure_lock();
+    if (err != ESP_OK) {
+        return err;
+    }
+    lock();
+    s_emergency_stop = false;
+    unlock();
+    if (output && output_size) {
+        snprintf(output, output_size, "OK: control emergency_stop cleared; new control commands are allowed");
+    }
+    return ESP_OK;
+}
+
 esp_err_t control_command_queue_state_json(char *output, size_t output_size)
 {
     if (!output || output_size == 0) {

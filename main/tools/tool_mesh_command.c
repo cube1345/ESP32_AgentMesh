@@ -168,7 +168,8 @@ static bool is_control_action(const char *action)
             strcmp(action, "gpio_write") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
-            strcmp(action, "control_emergency_stop") == 0);
+            strcmp(action, "control_emergency_stop") == 0 ||
+            strcmp(action, "control_clear_emergency_stop") == 0);
 }
 
 static bool is_sensor_action(const char *action)

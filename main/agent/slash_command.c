@@ -67,6 +67,94 @@ static const slash_command_spec_t s_commands[] = {
             "不要默认路由到其它 AgentMesh 角色。若调用支持 local=true 的工具，应显式使用 local=true。"
             "用户原始请求：%s",
     },
+    {
+        .name = "mesh",
+        .usage = "/mesh <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /mesh 指令。请优先把下面这条请求理解为跨节点 AgentMesh 协作任务。"
+            "若属于确定性的远程传感器读取、执行器控制、Guardian 审计或控制状态查询，优先调用 mesh_send_command，"
+            "不要只给口头分析。用户原始请求：%s",
+    },
+    {
+        .name = "status",
+        .usage = "/status <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、网关、语音桥、Guardian 或控制面状态。"
+            "优先考虑 gateway_status、voice_status、automation_list，"
+            "以及对 control_agent 使用 mesh_send_command(action=control_state)。用户原始请求：%s",
+    },
+    {
+        .name = "stop",
+        .usage = "/stop <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /stop 指令。请把下面请求优先理解为停止、刹停、取消或进入安全状态。"
+            "若是停止第三角色的硬件动作或进入执行器锁定，优先调用 mesh_send_command 到 control_agent，"
+            "action=control_emergency_stop。若是停止 Lua 任务，优先使用 lua_stop_job。"
+            "若是停止 workflow/rule，优先使用 automation_list/automation_remove。用户原始请求：%s",
+    },
+    {
+        .name = "resume",
+        .usage = "/resume <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /resume 指令。请把下面请求优先理解为恢复、解锁或解除刹停。"
+            "若是恢复第三角色的硬件执行权限，优先调用 mesh_send_command 到 control_agent，"
+            "action=control_clear_emergency_stop。用户原始请求：%s",
+    },
+    {
+        .name = "device",
+        .usage = "/device <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /device 指令。请优先从 runtime device manifest、协议外设、virtual_device_read、"
+            "virtual_device_control、GPIO/UART/I2C/SPI 扩展设备角度处理下面请求。不要假装设备已经被内建驱动支持。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "profile",
+        .usage = "/profile <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /profile 指令。请优先从用户画像、长期偏好、习惯、约束、冲突修正的角度处理下面请求。"
+            "若用户透露稳定偏好或修正旧偏好，优先使用 memory_profile_set；不要只把信息留在临时对话里。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "skills",
+        .usage = "/skills <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /skills 指令。请优先从 skills、benchmark、验证记录、硬件支持边界、"
+            "manifest capability 和已知限制的角度处理下面请求。必要时优先使用 skill_observation_add 记录结果。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "privacy",
+        .usage = "/privacy <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /privacy 指令。请从隐私、脱敏、最小化上云、权限、Guardian policy 和数据边界角度处理下面请求。"
+            "若涉及分享或上传敏感信息，先给出风险判断和更安全方案。用户原始请求：%s",
+    },
+    {
+        .name = "lua",
+        .usage = "/lua <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /lua 指令。请优先从 Lua runtime、脚本列表、Lua job 管理角度处理下面请求。"
+            "先确认 lua_runtime_info，再决定是否需要 lua_list_scripts、lua_run_script、lua_run_script_async 或 lua_stop_job。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "trace",
+        .usage = "/trace <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /trace 指令。请优先从 timeline、StateBoard、Mesh trace、控制状态、"
+            "自动化状态、网关状态角度处理下面请求。必要时组合 gateway_status、automation_list、"
+            "以及对 control_agent 的 control_state 查询。用户原始请求：%s",
+    },
+    {
+        .name = "ota",
+        .usage = "/ota <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /ota 指令。请优先从 OTA 计划、升级目标、版本、Guardian 审批、"
+            "gateway timeline 角度处理下面请求。优先考虑 ota_gateway_plan，而不是声称已经真正升级。"
+            "用户原始请求：%s",
+    },
 };
 
 static void build_help_text(espagent_slash_result_t *result)

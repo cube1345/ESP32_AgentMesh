@@ -6,8 +6,12 @@
 #include "driver/gpio.h"
 #include "driver/rmt_encoder.h"
 #include "driver/rmt_tx.h"
+#include "esp_check.h"
 #include "esp_log.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -48,10 +52,42 @@ typedef struct {
     int gpio_num;
 } ws2812_state_t;
 
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint8_t brightness;
+    bool valid;
+} ws2812_base_color_t;
+
+typedef struct {
+    int pins[3];
+    size_t count;
+    int active_level;
+    bool warned_invalid;
+} status_led_config_t;
+
 static ws2812_state_t s_ws2812 = {
     .channel = NULL,
     .encoder = NULL,
     .gpio_num = -1,
+};
+static ws2812_base_color_t s_ws2812_base = {
+    .r = 0,
+    .g = 0,
+    .b = 0,
+    .brightness = 255,
+    .valid = false,
+};
+static SemaphoreHandle_t s_indicator_mutex = NULL;
+static TaskHandle_t s_indicator_task = NULL;
+static int s_indicator_refcount = 0;
+static int s_indicator_generation = 0;
+static status_led_config_t s_status_led = {
+    .pins = {ESPAGENT_THINK_LED_GPIO_1, ESPAGENT_THINK_LED_GPIO_2, ESPAGENT_THINK_LED_GPIO_3},
+    .count = 0,
+    .active_level = ESPAGENT_THINK_LED_ACTIVE_LEVEL ? 1 : 0,
+    .warned_invalid = false,
 };
 
 static bool get_required_int(cJSON *root, const char *key, int *value)
@@ -115,6 +151,79 @@ static esp_err_t ensure_output_gpio(int pin)
     };
 
     return gpio_config(&cfg);
+}
+
+static int status_led_idle_level(void)
+{
+    return s_status_led.active_level ? 0 : 1;
+}
+
+static esp_err_t status_led_apply_mask(uint32_t mask)
+{
+    if (s_status_led.count == 0) {
+        return ESP_OK;
+    }
+
+    for (size_t i = 0; i < s_status_led.count; i++) {
+        int pin = s_status_led.pins[i];
+        int level = ((mask >> i) & 0x1U) ? s_status_led.active_level : status_led_idle_level();
+        esp_err_t err = gpio_set_level((gpio_num_t)pin, level);
+        if (err != ESP_OK) {
+            return err;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static void status_led_off_no_output(void)
+{
+    (void)status_led_apply_mask(0);
+}
+
+static uint32_t status_led_mask_for_step(size_t step)
+{
+    if (s_status_led.count == 0) {
+        return 0;
+    }
+    if (s_status_led.count == 1) {
+        return (step % 2 == 0) ? 0x1U : 0x0U;
+    }
+
+    return (1U << (step % s_status_led.count));
+}
+
+static void status_led_configure_once(void)
+{
+    if (s_status_led.count > 0 || s_status_led.warned_invalid) {
+        return;
+    }
+
+    for (size_t i = 0; i < sizeof(s_status_led.pins) / sizeof(s_status_led.pins[0]); i++) {
+        int pin = s_status_led.pins[i];
+        if (pin < 0) {
+            continue;
+        }
+        if (!GPIO_IS_VALID_OUTPUT_GPIO(pin) || !gpio_policy_pin_is_allowed(pin)) {
+            if (!s_status_led.warned_invalid) {
+                ESP_LOGW(TAG, "thinking LED GPIO %d ignored: invalid or forbidden by policy", pin);
+            }
+            s_status_led.warned_invalid = true;
+            continue;
+        }
+        if (ensure_output_gpio(pin) != ESP_OK) {
+            if (!s_status_led.warned_invalid) {
+                ESP_LOGW(TAG, "thinking LED GPIO %d ignored: failed to configure output", pin);
+            }
+            s_status_led.warned_invalid = true;
+            continue;
+        }
+        s_status_led.pins[s_status_led.count++] = pin;
+    }
+
+    if (s_status_led.count > 0) {
+        status_led_off_no_output();
+    }
 }
 
 static uint8_t clamp_u8(int value)
@@ -280,6 +389,56 @@ static esp_err_t ws2812_apply_color(int pin, int red, int green, int blue, int b
     return err;
 }
 
+static void ws2812_note_base_color(int red, int green, int blue, int brightness)
+{
+    s_ws2812_base.r = clamp_u8(red);
+    s_ws2812_base.g = clamp_u8(green);
+    s_ws2812_base.b = clamp_u8(blue);
+    s_ws2812_base.brightness = clamp_u8(brightness);
+    s_ws2812_base.valid = true;
+}
+
+static void status_indicator_task(void *arg)
+{
+    int generation = (int)(intptr_t)arg;
+    size_t step = 0;
+    const TickType_t period = pdMS_TO_TICKS(80);
+
+    while (1) {
+        if (!s_indicator_mutex) {
+            break;
+        }
+        if (xSemaphoreTake(s_indicator_mutex, portMAX_DELAY) == pdTRUE) {
+            bool should_run = (s_indicator_refcount > 0 && generation == s_indicator_generation);
+            xSemaphoreGive(s_indicator_mutex);
+            if (!should_run) {
+                break;
+            }
+        }
+
+        (void)status_led_apply_mask(status_led_mask_for_step(step++));
+        vTaskDelay(period);
+    }
+
+    if (s_indicator_mutex &&
+        xSemaphoreTake(s_indicator_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        if (generation == s_indicator_generation) {
+            s_indicator_task = NULL;
+        }
+        xSemaphoreGive(s_indicator_mutex);
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t ensure_indicator_mutex(void)
+{
+    if (s_indicator_mutex) {
+        return ESP_OK;
+    }
+    s_indicator_mutex = xSemaphoreCreateMutex();
+    return s_indicator_mutex ? ESP_OK : ESP_ERR_NO_MEM;
+}
+
 static bool resolve_named_color(const char *color, int *r, int *g, int *b)
 {
     if (!color) {
@@ -329,7 +488,12 @@ static bool resolve_named_color(const char *color, int *r, int *g, int *b)
 
 esp_err_t tool_gpio_init(void)
 {
-    ESP_LOGI(TAG, "GPIO tools ready (default WS2812 GPIO=%d)", ESPAGENT_WS2812_DEFAULT_GPIO);
+    status_led_configure_once();
+    (void)ensure_indicator_mutex();
+    ESP_LOGI(TAG,
+             "GPIO tools ready (default WS2812 GPIO=%d, thinking_leds=%u)",
+             ESPAGENT_WS2812_DEFAULT_GPIO,
+             (unsigned)s_status_led.count);
     return ESP_OK;
 }
 
@@ -549,6 +713,9 @@ esp_err_t tool_ws2812_set_execute(const char *input_json, char *output, size_t o
     (void)get_optional_int(root, "brightness", &brightness);
 
     esp_err_t err = ws2812_apply_color(pin, red, green, blue, brightness, output, output_size, NULL);
+    if (err == ESP_OK && pin == ESPAGENT_WS2812_DEFAULT_GPIO) {
+        ws2812_note_base_color(red, green, blue, brightness);
+    }
     cJSON_Delete(root);
     return err;
 }
@@ -586,6 +753,68 @@ esp_err_t tool_set_status_light_execute(const char *input_json, char *output, si
 
     esp_err_t err = ws2812_apply_color(pin, red, green, blue, brightness, output, output_size,
                                        color && color[0] != '\0' ? color : "custom");
+    if (err == ESP_OK && pin == ESPAGENT_WS2812_DEFAULT_GPIO) {
+        ws2812_note_base_color(red, green, blue, brightness);
+    }
     cJSON_Delete(root);
     return err;
+}
+
+esp_err_t tool_status_indicator_thinking_start(void)
+{
+    status_led_configure_once();
+    if (s_status_led.count == 0) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_indicator_mutex(), TAG, "indicator mutex");
+
+    if (xSemaphoreTake(s_indicator_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    s_indicator_refcount++;
+    if (!s_indicator_task) {
+        s_indicator_generation++;
+        BaseType_t ok = xTaskCreate(status_indicator_task,
+                                    "status_indicator",
+                                    3072,
+                                    (void *)(intptr_t)s_indicator_generation,
+                                    3,
+                                    &s_indicator_task);
+        if (ok != pdPASS) {
+            s_indicator_refcount--;
+            xSemaphoreGive(s_indicator_mutex);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    xSemaphoreGive(s_indicator_mutex);
+    return ESP_OK;
+}
+
+esp_err_t tool_status_indicator_thinking_stop(void)
+{
+    if (s_status_led.count == 0) {
+        return ESP_OK;
+    }
+
+    ESP_RETURN_ON_ERROR(ensure_indicator_mutex(), TAG, "indicator mutex");
+
+    if (xSemaphoreTake(s_indicator_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+
+    if (s_indicator_refcount > 0) {
+        s_indicator_refcount--;
+    }
+    bool should_restore = (s_indicator_refcount == 0);
+    if (should_restore) {
+        s_indicator_generation++;
+    }
+    xSemaphoreGive(s_indicator_mutex);
+
+    if (should_restore) {
+        status_led_off_no_output();
+    }
+    return ESP_OK;
 }

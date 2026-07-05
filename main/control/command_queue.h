@@ -19,5 +19,6 @@ esp_err_t control_command_queue_submit(const espagent_mesh_command_t *cmd,
                                        size_t output_size);
 
 esp_err_t control_command_queue_emergency_stop(char *output, size_t output_size);
+esp_err_t control_command_queue_clear_emergency_stop(char *output, size_t output_size);
 
 esp_err_t control_command_queue_state_json(char *output, size_t output_size);

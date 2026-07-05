@@ -54,6 +54,18 @@ esp_err_t session_get_task_tree_json(const char *chat_id, char *buf, size_t size
 esp_err_t session_get_trace_index_json(char *buf, size_t size);
 
 /**
+ * Build a compact session brief for prompt injection. This is lighter than
+ * raw history and focuses on recent user goals, recent assistant conclusions,
+ * and recent task/trace state.
+ */
+esp_err_t session_build_context_brief(const char *chat_id, char *buf, size_t size);
+esp_err_t session_refresh_context_brief(const char *chat_id);
+esp_err_t session_build_relevant_task_brief(const char *chat_id,
+                                            const char *query,
+                                            char *buf,
+                                            size_t size);
+
+/**
  * Clear a session (delete the file).
  */
 esp_err_t session_clear(const char *chat_id);
