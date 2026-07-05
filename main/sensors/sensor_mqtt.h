@@ -1,10 +1,13 @@
 #pragma once
 
 #include "esp_err.h"
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 
 esp_err_t sensor_mqtt_start(void);
+bool sensor_mqtt_is_connected(void);
+esp_err_t sensor_mqtt_wait_connected(uint32_t timeout_ms);
 esp_err_t sensor_mqtt_publish_text(const char *topic, const char *payload);
 esp_err_t sensor_mqtt_wait_output_message(const char *command_id,
                                           char *output_json,

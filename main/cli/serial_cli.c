@@ -64,7 +64,9 @@ static int cmd_wifi_set(int argc, char **argv)
 
     wifi_manager_set_credentials(ssid, argv[argc - 1]);
     printf("WiFi credentials saved to SSID: %s\n", ssid);
-    printf("Restart to apply.\n");
+    wifi_manager_stop();
+    esp_err_t err = wifi_manager_start();
+    printf("WiFi reconnect: %s\n", esp_err_to_name(err));
     return 0;
 }
 

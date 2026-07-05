@@ -1,4 +1,5 @@
 #include "tools/tool_sgp30.h"
+#include "tools/tool_environment.h"
 #include "drivers/sgp30.h"
 #include "espagent_config.h"
 
@@ -31,6 +32,85 @@ static bool get_optional_int(cJSON *root, const char *key, int *value)
     return true;
 }
 
+static bool has_key(cJSON *root, const char *key)
+{
+    return root && cJSON_GetObjectItem(root, key) != NULL;
+}
+
+static esp_err_t tool_sgp30_read_air_quality_direct(cJSON *root,
+                                                    char *output,
+                                                    size_t output_size)
+{
+    if (!s_sgp30.bus && !s_sgp30.dev) {
+        sgp30_dev_init_default(&s_sgp30);
+    }
+
+    int sda_gpio = ESPAGENT_SGP30_DEFAULT_SDA_GPIO;
+    int scl_gpio = ESPAGENT_SGP30_DEFAULT_SCL_GPIO;
+    int i2c_port = ESPAGENT_SGP30_DEFAULT_I2C_PORT;
+    int scl_hz = ESPAGENT_SGP30_DEFAULT_SCL_HZ;
+
+    (void)get_optional_int(root, "sda_gpio", &sda_gpio);
+    (void)get_optional_int(root, "scl_gpio", &scl_gpio);
+    (void)get_optional_int(root, "i2c_port", &i2c_port);
+    (void)get_optional_int(root, "scl_hz", &scl_hz);
+
+    if (!sgp30_valid_gpio_pair(sda_gpio, scl_gpio)) {
+        snprintf(output, output_size,
+                 "Error: SGP30 SDA/SCL GPIOs are not configured. Set ESPAGENT_SECRET_SGP30_SDA_GPIO and ESPAGENT_SECRET_SGP30_SCL_GPIO, or call with {\"sda_gpio\":x,\"scl_gpio\":y}.");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    sgp30_config_t cfg = {
+        .sda_gpio = sda_gpio,
+        .scl_gpio = scl_gpio,
+        .i2c_port = i2c_port,
+        .scl_hz = scl_hz,
+        .enable_internal_pullup = true,
+    };
+
+    esp_err_t err = sgp30_init(&s_sgp30, &cfg);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NOT_FOUND) {
+            snprintf(output, output_size,
+                     "Error: SGP30 not found at I2C address 0x58 on SDA=%d SCL=%d", sda_gpio, scl_gpio);
+        } else {
+            snprintf(output, output_size,
+                     "Error: failed to initialize SGP30 on SDA=%d SCL=%d (%s)",
+                     sda_gpio, scl_gpio, esp_err_to_name(err));
+        }
+        return err;
+    }
+
+    sgp30_reading_t reading = {0};
+    err = sgp30_read_air_quality(&s_sgp30, &reading);
+    if (err != ESP_OK) {
+        snprintf(output, output_size, "Error: failed to read SGP30 sample (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    if (reading.warming_up) {
+        snprintf(output, output_size,
+                 "OK: SGP30 warming up on SDA=%d SCL=%d. CO2eq=%u ppm, TVOC=%u ppb, %.1f s remaining%s",
+                 sda_gpio, scl_gpio,
+                 (unsigned)reading.co2eq_ppm,
+                 (unsigned)reading.tvoc_ppb,
+                 (double)reading.warmup_remaining_us / 1000000.0,
+                 reading.cached ? " (cached)" : "");
+    } else {
+        snprintf(output, output_size,
+                 "OK: SGP30 air quality on SDA=%d SCL=%d -> CO2eq=%u ppm, TVOC=%u ppb%s",
+                 sda_gpio, scl_gpio,
+                 (unsigned)reading.co2eq_ppm,
+                 (unsigned)reading.tvoc_ppb,
+                 reading.cached ? " (cached)" : "");
+    }
+
+    ESP_LOGI(TAG, "sgp30 direct read sda=%d scl=%d port=%d freq=%d -> %s",
+             sda_gpio, scl_gpio, i2c_port, scl_hz, output);
+    return ESP_OK;
+}
+
 
 /**
  * @brief 执行 ESPAgent 的 SGP30 空气质量读取工具。
@@ -53,82 +133,60 @@ static bool get_optional_int(cJSON *root, const char *key, int *value)
  */
 esp_err_t tool_sgp30_read_air_quality_execute(const char *input_json, char *output, size_t output_size)
 {
-    if (!s_sgp30.bus && !s_sgp30.dev) {
-        sgp30_dev_init_default(&s_sgp30);
-    }
-
     cJSON *root = cJSON_Parse(input_json);
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");
         return ESP_ERR_INVALID_ARG;
     }
 
-    int sda_gpio = ESPAGENT_SGP30_DEFAULT_SDA_GPIO;
-    int scl_gpio = ESPAGENT_SGP30_DEFAULT_SCL_GPIO;
-    int i2c_port = ESPAGENT_SGP30_DEFAULT_I2C_PORT;
-    int scl_hz = ESPAGENT_SGP30_DEFAULT_SCL_HZ;
-
-    (void)get_optional_int(root, "sda_gpio", &sda_gpio);
-    (void)get_optional_int(root, "scl_gpio", &scl_gpio);
-    (void)get_optional_int(root, "i2c_port", &i2c_port);
-    (void)get_optional_int(root, "scl_hz", &scl_hz);
-
-    if (!sgp30_valid_gpio_pair(sda_gpio, scl_gpio)) {
-        snprintf(output, output_size,
-                 "Error: SGP30 SDA/SCL GPIOs are not configured. Set ESPAGENT_SECRET_SGP30_SDA_GPIO and ESPAGENT_SECRET_SGP30_SCL_GPIO, or call with {\"sda_gpio\":x,\"scl_gpio\":y}.");
+    bool has_override = has_key(root, "sda_gpio") ||
+                        has_key(root, "scl_gpio") ||
+                        has_key(root, "i2c_port") ||
+                        has_key(root, "scl_hz");
+    if (has_override) {
+        esp_err_t direct_err = tool_sgp30_read_air_quality_direct(root, output, output_size);
         cJSON_Delete(root);
-        return ESP_ERR_INVALID_STATE;
+        return direct_err;
     }
 
-    sgp30_config_t cfg = {
-        .sda_gpio = sda_gpio,
-        .scl_gpio = scl_gpio,
-        .i2c_port = i2c_port,
-        .scl_hz = scl_hz,
-        .enable_internal_pullup = true,
-    };
-
-    esp_err_t err = sgp30_init(&s_sgp30, &cfg);
+    tool_environment_values_t values = {0};
+    char status[96] = {0};
+    esp_err_t err = tool_environment_read_values(&values, status, sizeof(status));
     if (err != ESP_OK) {
-        if (err == ESP_ERR_NOT_FOUND) {
-            snprintf(output, output_size,
-                     "Error: SGP30 not found at I2C address 0x58 on SDA=%d SCL=%d", sda_gpio, scl_gpio);
-        } else {
-            snprintf(output, output_size,
-                     "Error: failed to initialize SGP30 on SDA=%d SCL=%d (%s)",
-                     sda_gpio, scl_gpio, esp_err_to_name(err));
-        }
+        snprintf(output, output_size,
+                 "Error: failed to read environment air-quality telemetry (%s)",
+                 status[0] ? status : esp_err_to_name(err));
         cJSON_Delete(root);
         return err;
     }
 
-    sgp30_reading_t reading = {0};
-    err = sgp30_read_air_quality(&s_sgp30, &reading);
-    if (err != ESP_OK) {
-        snprintf(output, output_size, "Error: failed to read SGP30 sample (%s)", esp_err_to_name(err));
+    if (values.co2eq_ppm < 0 || values.tvoc_ppb < 0) {
+        snprintf(output, output_size,
+                 "Error: SGP30 air-quality telemetry unavailable [%s]",
+                 status[0] ? status : "sgp30 unavailable");
         cJSON_Delete(root);
-        return err;
+        return ESP_ERR_NOT_FOUND;
     }
 
-    if (reading.warming_up) {
+    if (values.sgp30_warming_up) {
         snprintf(output, output_size,
-                 "OK: SGP30 warming up on SDA=%d SCL=%d. CO2eq=%u ppm, TVOC=%u ppb, %.1f s remaining%s",
-                 sda_gpio, scl_gpio,
-                 (unsigned)reading.co2eq_ppm,
-                 (unsigned)reading.tvoc_ppb,
-                 (double)reading.warmup_remaining_us / 1000000.0,
-                 reading.cached ? " (cached)" : "");
+                 "OK: SGP30 warming up on SDA=%d SCL=%d. CO2eq=%d ppm, TVOC=%d ppb [%s]",
+                 ESPAGENT_SGP30_DEFAULT_SDA_GPIO,
+                 ESPAGENT_SGP30_DEFAULT_SCL_GPIO,
+                 values.co2eq_ppm,
+                 values.tvoc_ppb,
+                 status);
     } else {
         snprintf(output, output_size,
-                 "OK: SGP30 air quality on SDA=%d SCL=%d -> CO2eq=%u ppm, TVOC=%u ppb%s",
-                 sda_gpio, scl_gpio,
-                 (unsigned)reading.co2eq_ppm,
-                 (unsigned)reading.tvoc_ppb,
-                 reading.cached ? " (cached)" : "");
+                 "OK: SGP30 air quality on SDA=%d SCL=%d -> CO2eq=%d ppm, TVOC=%d ppb [%s]",
+                 ESPAGENT_SGP30_DEFAULT_SDA_GPIO,
+                 ESPAGENT_SGP30_DEFAULT_SCL_GPIO,
+                 values.co2eq_ppm,
+                 values.tvoc_ppb,
+                 status);
     }
 
-    ESP_LOGI(TAG, "sgp30_read_air_quality sda=%d scl=%d port=%d freq=%d -> %s",
-             sda_gpio, scl_gpio, i2c_port, scl_hz, output);
+    ESP_LOGI(TAG, "sgp30 env-backed read -> %s", output);
     cJSON_Delete(root);
     return ESP_OK;
 }

@@ -1,5 +1,6 @@
 #include "sensors/sensor_mqtt.h"
 
+#include "bus/message_bus.h"
 #include "espagent_config.h"
 #include "control/command_queue.h"
 #include "guardian/approval_queue.h"
@@ -8,8 +9,10 @@
 #include "roles/role_config.h"
 #include "tools/tool_environment.h"
 #include "tools/tool_gpio.h"
+#include "tools/tool_gree_ac.h"
 #include "tools/tool_servo.h"
 #include "tools/tool_virtual_device.h"
+#include "device/device_registry.h"
 
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -18,6 +21,7 @@
 #include "esp_rom_sys.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
@@ -35,20 +39,26 @@
 static const char *TAG = "sensor_mqtt";
 
 #define DHT22_MAX_RETRIES      3
-#define MQTT_BUF_SIZE          1024
+#define MQTT_BUF_SIZE          2048
 #define MQTT_CLIENT_ID         "ESPAgent-" ESPAGENT_NODE_ID
 #define MQTT_KEEPALIVE_S       30
 #define MHZ19_CMD_LEN          9
 #define MHZ19_UART_BUF_SIZE    128
 #define MQTT_PUB_TOPIC_SIZE    160
-#define MQTT_PUB_PAYLOAD_SIZE   768
-#define MQTT_PUB_QUEUE_DEPTH    8
+#define MQTT_PUB_PAYLOAD_SIZE   1024
+#define MQTT_PUB_QUEUE_DEPTH    32
 #define MQTT_OUTPUT_CACHE_DEPTH 8
-#define MQTT_OUTPUT_JSON_SIZE   768
+#define MQTT_OUTPUT_JSON_SIZE   1024
 #define MQTT_POLICY_CACHE_DEPTH 8
-#define MQTT_POLICY_JSON_SIZE   512
+#define MQTT_POLICY_JSON_SIZE   1024
 #define MQTT_STATEBOARD_DEPTH   12
 #define MQTT_STATEBOARD_JSON_SIZE 384
+#define MQTT_SENSOR_CACHE_DEPTH 8
+#define MQTT_WATCHDOG_DEPTH     8
+#define MQTT_COMMAND_DEDUP_DEPTH 16
+#define MQTT_CONNECTED_BIT      BIT0
+#define MQTT_WATCHDOG_STATEBOARD_STATE_MS     30000
+#define MQTT_WATCHDOG_STATEBOARD_TELEMETRY_MS 30000
 
 typedef struct {
     char topic[MQTT_PUB_TOPIC_SIZE];
@@ -78,9 +88,34 @@ typedef struct {
     char summary[MQTT_STATEBOARD_JSON_SIZE];
 } stateboard_item_t;
 
+typedef struct {
+    bool valid;
+    int64_t ts_ms;
+    int temp_x10;
+    int humidity_x10;
+    int light_x10;
+    int co2_ppm;
+    int tvoc_ppb;
+} sensor_sample_t;
+
+typedef struct {
+    bool used;
+    char node_id[ESPAGENT_MESH_NODE_MAX];
+    char role[ESPAGENT_MESH_ROLE_MAX];
+    char last_state[24];
+    int64_t last_state_ms;
+    int64_t last_telemetry_ms;
+    int64_t last_stateboard_state_ms;
+    int64_t last_stateboard_telemetry_ms;
+    uint32_t telemetry_count;
+    uint32_t error_count;
+} watchdog_node_t;
+
 static portMUX_TYPE s_dht22_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool s_mhz19_uart_ready = false;
 static QueueHandle_t s_pub_queue = NULL;
+static EventGroupHandle_t s_mqtt_event_group = NULL;
+static volatile bool s_mqtt_connected = false;
 static SemaphoreHandle_t s_output_mutex = NULL;
 static SemaphoreHandle_t s_policy_mutex = NULL;
 static output_cache_item_t s_output_cache[MQTT_OUTPUT_CACHE_DEPTH];
@@ -89,12 +124,68 @@ static stateboard_item_t s_stateboard[MQTT_STATEBOARD_DEPTH];
 static uint32_t s_output_cache_next = 0;
 static uint32_t s_policy_cache_next = 0;
 static uint32_t s_stateboard_next = 0;
+static sensor_sample_t s_sensor_samples[MQTT_SENSOR_CACHE_DEPTH];
+static uint32_t s_sensor_sample_next = 0;
+static uint32_t s_sensor_sample_count = 0;
+static double s_temp_ewma_x10 = 0.0;
+static double s_humidity_ewma_x10 = 0.0;
+static double s_light_ewma_x10 = 0.0;
+static int s_last_temp_band = 0;
+static int s_last_humidity_band = 0;
+static int s_last_light_band = 0;
+static watchdog_node_t s_watchdog_nodes[MQTT_WATCHDOG_DEPTH];
+static uint32_t s_watchdog_next = 0;
+static char s_seen_command_ids[MQTT_COMMAND_DEDUP_DEPTH][ESPAGENT_MESH_ID_MAX];
+static uint32_t s_seen_command_next = 0;
 
+static bool mqtt_topic_is_critical(const char *topic);
 static void json_add_optional_string(cJSON *root, const char *key, const char *value);
 static void stateboard_note_event(const char *event_type,
                                   const char *status,
                                   const char *summary,
                                   const char *command_id);
+
+static void mqtt_set_connected(bool connected)
+{
+    s_mqtt_connected = connected;
+    if (!s_mqtt_event_group) {
+        return;
+    }
+    if (connected) {
+        xEventGroupSetBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+    } else {
+        xEventGroupClearBits(s_mqtt_event_group, MQTT_CONNECTED_BIT);
+    }
+}
+
+bool sensor_mqtt_is_connected(void)
+{
+    return s_mqtt_connected;
+}
+
+esp_err_t sensor_mqtt_wait_connected(uint32_t timeout_ms)
+{
+    if (ESPAGENT_SENSOR_MQTT_BROKER[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_mqtt_event_group) {
+        s_mqtt_event_group = xEventGroupCreate();
+        if (!s_mqtt_event_group) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_mqtt_connected) {
+        return ESP_OK;
+    }
+
+    TickType_t ticks = timeout_ms == UINT32_MAX ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    EventBits_t bits = xEventGroupWaitBits(s_mqtt_event_group,
+                                           MQTT_CONNECTED_BIT,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           ticks);
+    return (bits & MQTT_CONNECTED_BIT) ? ESP_OK : ESP_ERR_TIMEOUT;
+}
 
 static int wait_level_timeout(int pin, int level, int timeout_us)
 {
@@ -317,6 +408,20 @@ static int mqtt_read_remaining_len(int fd, size_t *out)
     return -1;
 }
 
+static void mqtt_discard_bytes(int fd, size_t bytes)
+{
+    uint8_t scratch[128];
+    size_t left = bytes;
+    while (left > 0) {
+        size_t chunk = left < sizeof(scratch) ? left : sizeof(scratch);
+        int n = recv(fd, scratch, chunk, MSG_WAITALL);
+        if (n <= 0) {
+            return;
+        }
+        left -= (size_t)n;
+    }
+}
+
 static int mqtt_send_connect(int fd)
 {
     uint8_t payload[128];
@@ -424,26 +529,54 @@ static esp_err_t mqtt_queue_publish(const char *topic, const char *payload)
     snprintf(item.topic, sizeof(item.topic), "%s", topic);
     snprintf(item.payload, sizeof(item.payload), "%s", payload);
 
-    if (xQueueSend(s_pub_queue, &item, 0) != pdPASS) {
+    const bool critical = mqtt_topic_is_critical(topic);
+    TickType_t wait_ticks = 0;
+    if (critical ||
+        (topic && (strcmp(topic, ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS) == 0 ||
+                  strcmp(topic, ESPAGENT_MESH_TOPIC_ALERTS) == 0 ||
+                  strcmp(topic, ESPAGENT_MESH_TOPIC_DISPATCH) == 0))) {
+        wait_ticks = pdMS_TO_TICKS(40);
+    } else if (topic && (strcmp(topic, ESPAGENT_MESH_TOPIC_TIMELINE) == 0 ||
+                         strcmp(topic, ESPAGENT_MESH_TOPIC_GUARDIAN_STATEBOARD) == 0 ||
+                         strcmp(topic, ESPAGENT_SENSOR_MQTT_TOPIC_STATE) == 0 ||
+                         strcmp(topic, ESPAGENT_SENSOR_MQTT_TOPIC_TELEMETRY) == 0)) {
+        wait_ticks = pdMS_TO_TICKS(5);
+    }
+
+    BaseType_t queued = critical ? xQueueSendToFront(s_pub_queue, &item, wait_ticks)
+                                 : xQueueSend(s_pub_queue, &item, wait_ticks);
+    if (queued != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
 }
 
-static void mqtt_flush_queued_publishes(int fd)
+static bool mqtt_topic_is_critical(const char *topic)
+{
+    return topic &&
+           (strstr(topic, "/command") != NULL ||
+            strcmp(topic, ESPAGENT_MESH_TOPIC_POLICY_CHECK) == 0 ||
+            strcmp(topic, ESPAGENT_MESH_TOPIC_POLICY_DECISION) == 0);
+}
+
+static bool mqtt_flush_queued_publishes(int fd)
 {
     if (!s_pub_queue) {
-        return;
+        return true;
     }
 
     mqtt_pub_item_t item;
     while (xQueueReceive(s_pub_queue, &item, 0) == pdPASS) {
         if (mqtt_publish(fd, item.topic, item.payload) != 0) {
             ESP_LOGW(TAG, "Queued MQTT publish failed: topic=%s", item.topic);
-            continue;
+            if (mqtt_topic_is_critical(item.topic)) {
+                (void)xQueueSendToFront(s_pub_queue, &item, 0);
+            }
+            return false;
         }
         ESP_LOGI(TAG, "MQTT publish %s: %s", item.topic, item.payload);
     }
+    return true;
 }
 
 esp_err_t sensor_mqtt_publish_text(const char *topic, const char *payload)
@@ -502,6 +635,40 @@ static int json_optional_int(cJSON *root, const char *key, int default_value)
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
     return cJSON_IsNumber(item) ? item->valueint : default_value;
+}
+
+static double json_optional_number(cJSON *root, const char *key, double default_value)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsNumber(item) ? item->valuedouble : default_value;
+}
+
+static bool mqtt_topic_matches_filter(const uint8_t *topic, size_t topic_len, const char *filter)
+{
+    if (!topic || !filter) {
+        return false;
+    }
+
+    size_t ti = 0;
+    size_t fi = 0;
+    while (filter[fi] != '\0') {
+        if (filter[fi] == '#') {
+            return filter[fi + 1] == '\0';
+        }
+        if (filter[fi] == '+') {
+            while (ti < topic_len && topic[ti] != '/') {
+                ti++;
+            }
+            fi++;
+            continue;
+        }
+        if (ti >= topic_len || (char)topic[ti] != filter[fi]) {
+            return false;
+        }
+        ti++;
+        fi++;
+    }
+    return ti == topic_len;
 }
 
 static bool json_extract_approval_id(const char *args_json,
@@ -601,6 +768,109 @@ static void guardian_audit_timeline_payload(const char *payload, size_t payload_
     }
     ESP_LOGI(TAG, "Guardian audited timeline event: %s", json);
     cJSON_free(json);
+}
+
+static watchdog_node_t *watchdog_find_or_alloc(const char *node_id, const char *role)
+{
+    if (!node_id || !node_id[0]) {
+        return NULL;
+    }
+    for (int i = 0; i < MQTT_WATCHDOG_DEPTH; i++) {
+        if (s_watchdog_nodes[i].used && strcmp(s_watchdog_nodes[i].node_id, node_id) == 0) {
+            return &s_watchdog_nodes[i];
+        }
+    }
+
+    watchdog_node_t *slot = &s_watchdog_nodes[s_watchdog_next % MQTT_WATCHDOG_DEPTH];
+    memset(slot, 0, sizeof(*slot));
+    slot->used = true;
+    snprintf(slot->node_id, sizeof(slot->node_id), "%s", node_id);
+    snprintf(slot->role, sizeof(slot->role), "%s", role ? role : "");
+    s_watchdog_next++;
+    return slot;
+}
+
+static void guardian_watchdog_note_payload(const char *kind,
+                                           const char *payload,
+                                           size_t payload_len)
+{
+    if (!espagent_role_is_guardian() || !payload || payload_len == 0) {
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(payload, payload_len);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *node_id = json_optional_string(root, "node_id");
+    const char *role = json_optional_string(root, "role");
+    watchdog_node_t *slot = watchdog_find_or_alloc(node_id, role);
+    if (!slot) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (role[0]) {
+        snprintf(slot->role, sizeof(slot->role), "%s", role);
+    }
+
+    char summary[MQTT_STATEBOARD_JSON_SIZE] = {0};
+    const char *status = "ok";
+    bool should_publish_stateboard = false;
+    if (strcmp(kind, "state") == 0) {
+        const char *state = json_optional_string(root, "state");
+        snprintf(slot->last_state, sizeof(slot->last_state), "%s", state[0] ? state : "unknown");
+        slot->last_state_ms = now_ms;
+        if (state[0] && strcmp(state, "online") != 0) {
+            status = "watch";
+            slot->error_count++;
+            should_publish_stateboard = true;
+        } else if (slot->last_stateboard_state_ms == 0 ||
+                   now_ms - slot->last_stateboard_state_ms >= MQTT_WATCHDOG_STATEBOARD_STATE_MS) {
+            should_publish_stateboard = true;
+        }
+        snprintf(summary, sizeof(summary),
+                 "node=%s role=%s state=%s telemetry_count=%u errors=%u",
+                 slot->node_id,
+                 slot->role,
+                 slot->last_state[0] ? slot->last_state : "unknown",
+                 (unsigned)slot->telemetry_count,
+                 (unsigned)slot->error_count);
+    } else {
+        slot->last_telemetry_ms = now_ms;
+        slot->telemetry_count++;
+        if (slot->last_stateboard_telemetry_ms == 0 ||
+            now_ms - slot->last_stateboard_telemetry_ms >= MQTT_WATCHDOG_STATEBOARD_TELEMETRY_MS) {
+            should_publish_stateboard = true;
+        }
+        double temp = json_optional_number(root, "temp", NAN);
+        double humidity = json_optional_number(root, "humidity", NAN);
+        double light = json_optional_number(root, "light_lux", NAN);
+        snprintf(summary, sizeof(summary),
+                 "node=%s role=%s telemetry=%u temp=%.1f humidity=%.1f light=%.1f",
+                 slot->node_id,
+                 slot->role,
+                 (unsigned)slot->telemetry_count,
+                 isnan(temp) ? -999.0 : temp,
+                 isnan(humidity) ? -999.0 : humidity,
+                 isnan(light) ? -999.0 : light);
+    }
+
+    if (should_publish_stateboard) {
+        if (strcmp(kind, "state") == 0) {
+            slot->last_stateboard_state_ms = now_ms;
+        } else {
+            slot->last_stateboard_telemetry_ms = now_ms;
+        }
+        stateboard_note_event(strcmp(kind, "state") == 0 ? "watchdog_node_state" : "watchdog_node_telemetry",
+                              status,
+                              summary,
+                              "");
+    }
+    cJSON_Delete(root);
 }
 
 static void output_cache_store_json(cJSON *root)
@@ -1010,8 +1280,51 @@ static bool policy_is_control_action(const char *action)
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0);
+}
+
+static bool policy_is_agent_task_action(const char *action)
+{
+    return action && strcmp(action, "agent_task") == 0;
+}
+
+static bool policy_agent_task_target_allowed(const char *target_role)
+{
+    return target_role &&
+           (strcmp(target_role, ESPAGENT_ROLE_SENSOR) == 0 ||
+            strcmp(target_role, ESPAGENT_ROLE_CONTROL) == 0 ||
+            strcmp(target_role, ESPAGENT_ROLE_GUARDIAN) == 0);
+}
+
+static bool guardian_agent_task_args_allowed(const char *args_json,
+                                             char *reason,
+                                             size_t reason_size)
+{
+    cJSON *args = cJSON_Parse(args_json && args_json[0] ? args_json : "{}");
+    if (!args || !cJSON_IsObject(args)) {
+        cJSON_Delete(args);
+        snprintf(reason, reason_size, "agent_task args_json is not a JSON object");
+        return false;
+    }
+
+    const char *task = json_optional_string(args, "task");
+    if (!task[0]) {
+        cJSON_Delete(args);
+        snprintf(reason, reason_size, "agent_task requires args.task");
+        return false;
+    }
+
+    if (strlen(task) > 220) {
+        cJSON_Delete(args);
+        snprintf(reason, reason_size, "agent_task task is too long");
+        return false;
+    }
+
+    cJSON_Delete(args);
+    snprintf(reason, reason_size, "allowed role-local AI agent task");
+    return true;
 }
 
 static bool guardian_control_args_allowed(const char *action,
@@ -1100,22 +1413,48 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     const char *reason = "deny by default";
     char dynamic_reason[160] = {0};
     bool allowed = false;
+    int risk_score = safety_level * 20;
 
     if (command_id_copy[0] == '\0') {
         reason = "missing command_id";
+        risk_score += 30;
     } else if (action_copy[0] == '\0') {
         reason = "missing action";
+        risk_score += 30;
     } else if (safety_level > ESPAGENT_MESH_SAFETY_MEDIUM) {
         reason = "safety_level requires human confirmation";
+        risk_score += 40;
     } else if (policy_is_sensor_action(action_copy)) {
+        risk_score += 5;
         if (strcmp(target_role_copy, ESPAGENT_ROLE_SENSOR) == 0) {
             decision = "allow";
             reason = "allowed low-risk sensor read";
             allowed = true;
         } else {
             reason = "sensor action must target sensor_agent";
+            risk_score += 20;
+        }
+    } else if (policy_is_agent_task_action(action_copy)) {
+        risk_score += 10;
+        if (!policy_agent_task_target_allowed(target_role_copy)) {
+            reason = "agent_task must target sensor_agent, control_agent, or guardian_agent";
+            risk_score += 30;
+        } else {
+            char arg_reason[160] = {0};
+            if (guardian_agent_task_args_allowed(args_json, arg_reason, sizeof(arg_reason))) {
+                decision = "allow";
+                snprintf(dynamic_reason, sizeof(dynamic_reason), "%s", arg_reason);
+                reason = dynamic_reason;
+                allowed = true;
+            } else {
+                snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
+                         arg_reason[0] ? arg_reason : "agent_task arguments denied");
+                reason = dynamic_reason;
+                risk_score += 30;
+            }
         }
     } else if (policy_is_control_action(action_copy)) {
+        risk_score += 30;
         if (strcmp(target_role_copy, ESPAGENT_ROLE_CONTROL) == 0) {
             char arg_reason[160] = {0};
             if (guardian_control_args_allowed(action_copy, args_json, arg_reason, sizeof(arg_reason))) {
@@ -1128,12 +1467,39 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
                          arg_reason[0] ? arg_reason : "control arguments denied");
                 reason = dynamic_reason;
+                risk_score += 30;
             }
         } else {
             reason = "control action must target control_agent";
+            risk_score += 30;
         }
     } else {
         reason = "unsupported action";
+        risk_score += 40;
+    }
+
+    if (policy_is_control_action(action_copy) && args_json && args_json[0]) {
+        cJSON *args = cJSON_Parse(args_json);
+        if (args && cJSON_IsObject(args)) {
+            int duration_ms = json_optional_int(args, "duration_ms", 0);
+            bool confirmed = cJSON_IsTrue(cJSON_GetObjectItem(args, "confirmed"));
+            const char *device = json_optional_string(args, "device");
+            if (duration_ms == 0) {
+                risk_score += 15;
+            }
+            if (strstr(device, "relay") != NULL) {
+                risk_score += 20;
+            }
+            if (confirmed) {
+                risk_score -= 10;
+            }
+        }
+        cJSON_Delete(args);
+    }
+    if (risk_score < 0) {
+        risk_score = 0;
+    } else if (risk_score > 100) {
+        risk_score = 100;
     }
 
     if (!allowed &&
@@ -1202,6 +1568,8 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     cJSON_AddBoolToObject(out, "allowed", allowed);
     cJSON_AddStringToObject(out, "reason", reason);
     cJSON_AddNumberToObject(out, "safety_level", safety_level);
+    cJSON_AddNumberToObject(out, "risk_score", risk_score);
+    cJSON_AddStringToObject(out, "privacy_mode", "metadata_only");
     cJSON_AddNumberToObject(out, "ts_ms", (double)ts_ms);
 
     char *json = cJSON_PrintUnformatted(out);
@@ -1249,6 +1617,71 @@ static void publish_mesh_command_result(const espagent_mesh_command_t *cmd,
                                              cmd->target_role,
                                              cmd->target_node,
                                              cmd->action);
+}
+
+static bool handle_agent_task_mesh_command(const espagent_mesh_command_t *cmd)
+{
+    if (!cmd || strcmp(cmd->action, "agent_task") != 0) {
+        return false;
+    }
+
+    cJSON *args = cJSON_Parse(cmd->args_json[0] ? cmd->args_json : "{}");
+    if (!args || !cJSON_IsObject(args)) {
+        cJSON_Delete(args);
+        publish_mesh_command_result(cmd, ESP_ERR_INVALID_ARG,
+                                    "Error: agent_task args must be a JSON object with task");
+        return true;
+    }
+
+    const char *task = json_optional_string(args, "task");
+    const char *reply_channel = json_optional_string(args, "reply_channel");
+    const char *reply_chat_id = json_optional_string(args, "reply_chat_id");
+    if (!task[0]) {
+        cJSON_Delete(args);
+        publish_mesh_command_result(cmd, ESP_ERR_INVALID_ARG,
+                                    "Error: agent_task requires args.task");
+        return true;
+    }
+
+    espagent_msg_t msg = {0};
+    snprintf(msg.channel, sizeof(msg.channel), "%s",
+             reply_channel[0] ? reply_channel : ESPAGENT_CHAN_SYSTEM);
+    snprintf(msg.chat_id, sizeof(msg.chat_id), "%s",
+             reply_chat_id[0] ? reply_chat_id : cmd->command_id);
+    msg.flags = ESPAGENT_MSG_FLAG_INTERNAL_RESULT;
+
+    char content[512] = {0};
+    snprintf(content, sizeof(content),
+             "Role-local Mesh agent task. command_id=%s trace_id=%s source=coordinator target_role=%s.\n"
+             "Task: %s\n"
+             "Use only tools visible to this node role. Return a concise result and do not call mesh_send_command unless the task explicitly requires forwarding.",
+             cmd->command_id,
+             cmd->trace_id,
+             espagent_node_role(),
+             task);
+    msg.content = strdup(content);
+    cJSON_Delete(args);
+    if (!msg.content) {
+        publish_mesh_command_result(cmd, ESP_ERR_NO_MEM,
+                                    "Error: out of memory queuing role-local agent task");
+        return true;
+    }
+
+    esp_err_t err = message_bus_push_inbound(&msg);
+    if (err != ESP_OK) {
+        free(msg.content);
+        publish_mesh_command_result(cmd, err,
+                                    "Error: failed to queue role-local agent task");
+        return true;
+    }
+
+    ESP_LOGI(TAG, "Mesh agent_task injected into local agent_loop: id=%s role=%s task=%s",
+             cmd->command_id[0] ? cmd->command_id : "(none)",
+             espagent_node_role(),
+             task);
+    publish_mesh_command_result(cmd, ESP_OK,
+                                "OK: role-local AI task queued into this node's agent_loop");
+    return true;
 }
 
 static esp_err_t read_temperature_humidity_result(char *result, size_t result_size)
@@ -1318,7 +1751,7 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
     esp_err_t err = sensor_mqtt_wait_policy_decision(cmd->command_id,
                                                      decision_json,
                                                      sizeof(decision_json),
-                                                     300);
+                                                     2000);
     if (err != ESP_OK) {
         snprintf(reason, reason_size,
                  "missing Guardian allow decision for command_id=%s",
@@ -1396,11 +1829,30 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = tool_servo_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "gpio_write") == 0) {
         err = tool_gpio_write_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "gree_ac_control") == 0) {
+        err = tool_gree_ac_control_execute(args, result, result_size);
     } else {
         snprintf(result, result_size, "Error: unsupported control action=%s", cmd->action);
         err = ESP_ERR_NOT_SUPPORTED;
     }
     return err;
+}
+
+static void publish_control_state_snapshot(const espagent_mesh_command_t *cmd,
+                                           esp_err_t result_err)
+{
+    char state_json[MQTT_PUB_PAYLOAD_SIZE] = {0};
+    esp_err_t state_err = control_command_queue_state_json(state_json, sizeof(state_json));
+    if (state_err != ESP_OK) {
+        return;
+    }
+
+    (void)sensor_mqtt_publish_text(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, state_json);
+    (void)sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_TIMELINE, state_json);
+    stateboard_note_event("control_state",
+                          result_err == ESP_OK ? "ok" : "error",
+                          state_json,
+                          cmd ? cmd->command_id : "");
 }
 
 static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
@@ -1414,6 +1866,7 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
         strcmp(cmd->action, "virtual_device_control") != 0 &&
         strcmp(cmd->action, "servo_write") != 0 &&
         strcmp(cmd->action, "gpio_write") != 0 &&
+        strcmp(cmd->action, "gree_ac_control") != 0 &&
         strcmp(cmd->action, "control_state") != 0 &&
         strcmp(cmd->action, "control_emergency_stop") != 0) {
         return false;
@@ -1432,7 +1885,29 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
              esp_err_to_name(err),
              result);
     publish_mesh_command_result(cmd, err, result);
+    publish_control_state_snapshot(cmd, err);
     return true;
+}
+
+static bool mesh_command_seen_and_record(const char *command_id)
+{
+    if (!command_id || command_id[0] == '\0') {
+        return false;
+    }
+
+    for (size_t i = 0; i < MQTT_COMMAND_DEDUP_DEPTH; i++) {
+        if (s_seen_command_ids[i][0] != '\0' &&
+            strcmp(s_seen_command_ids[i], command_id) == 0) {
+            return true;
+        }
+    }
+
+    snprintf(s_seen_command_ids[s_seen_command_next % MQTT_COMMAND_DEDUP_DEPTH],
+             ESPAGENT_MESH_ID_MAX,
+             "%s",
+             command_id);
+    s_seen_command_next++;
+    return false;
 }
 
 static void handle_mesh_command(const char *source, const char *payload, size_t payload_len)
@@ -1457,6 +1932,16 @@ static void handle_mesh_command(const char *source, const char *payload, size_t 
              cmd.ttl_ms,
              cmd.args_json);
 
+    if (mesh_command_seen_and_record(cmd.command_id)) {
+        ESP_LOGI(TAG, "Duplicate mesh command ignored: id=%s action=%s",
+                 cmd.command_id[0] ? cmd.command_id : "(none)",
+                 cmd.action);
+        return;
+    }
+
+    if (handle_agent_task_mesh_command(&cmd)) {
+        return;
+    }
     if (handle_sensor_mesh_command(&cmd)) {
         return;
     }
@@ -1523,6 +2008,7 @@ static void mqtt_poll_inbound(int fd)
     uint8_t payload[MQTT_BUF_SIZE];
     if (remaining >= sizeof(payload)) {
         ESP_LOGW(TAG, "MQTT inbound packet too large: %d bytes", (int)remaining);
+        mqtt_discard_bytes(fd, remaining);
         return;
     }
     n = recv(fd, payload, remaining, MSG_WAITALL);
@@ -1559,6 +2045,19 @@ static void mqtt_poll_inbound(int fd)
                 policy_cache_maybe_store_payload(msg, msg_len);
                 ESP_LOGI(TAG, "Policy decision received: %.*s", (int)msg_len, msg);
             } else {
+                char nodes_state_filter[160] = {0};
+                char nodes_telemetry_filter[160] = {0};
+                snprintf(nodes_state_filter, sizeof(nodes_state_filter),
+                         "%s/nodes/+/state", ESPAGENT_MESH_TOPIC_PREFIX);
+                snprintf(nodes_telemetry_filter, sizeof(nodes_telemetry_filter),
+                         "%s/nodes/+/telemetry", ESPAGENT_MESH_TOPIC_PREFIX);
+                if (mqtt_topic_matches_filter(topic, topic_len, nodes_state_filter)) {
+                    guardian_watchdog_note_payload("state", msg, msg_len);
+                    (void)espagent_device_registry_note_mqtt_payload("state", msg, msg_len);
+                } else if (mqtt_topic_matches_filter(topic, topic_len, nodes_telemetry_filter)) {
+                    guardian_watchdog_note_payload("telemetry", msg, msg_len);
+                    (void)espagent_device_registry_note_mqtt_payload("telemetry", msg, msg_len);
+                }
                 ESP_LOGI(TAG, "MQTT inbound %.*s: %.*s",
                          (int)topic_len, (const char *)topic,
                          (int)msg_len, msg);
@@ -1598,6 +2097,152 @@ static esp_err_t publish_node_event(int fd, const char *event_type, const char *
     return ESP_OK;
 }
 
+static void sensor_cache_update(const tool_environment_values_t *values,
+                                double *temp_avg,
+                                double *humidity_avg,
+                                double *light_avg,
+                                uint32_t *sample_count)
+{
+    if (!values) {
+        return;
+    }
+
+    sensor_sample_t *slot = &s_sensor_samples[s_sensor_sample_next % MQTT_SENSOR_CACHE_DEPTH];
+    memset(slot, 0, sizeof(*slot));
+    slot->valid = true;
+    slot->ts_ms = esp_timer_get_time() / 1000;
+    slot->temp_x10 = values->temperature_c_x10;
+    slot->humidity_x10 = values->humidity_percent_x10;
+    slot->light_x10 = values->light_lux_x10;
+    slot->co2_ppm = values->co2eq_ppm;
+    slot->tvoc_ppb = values->tvoc_ppb;
+    s_sensor_sample_next++;
+    if (s_sensor_sample_count < MQTT_SENSOR_CACHE_DEPTH) {
+        s_sensor_sample_count++;
+    }
+
+    const double alpha = 0.35;
+    if (s_sensor_sample_count == 1) {
+        s_temp_ewma_x10 = (double)slot->temp_x10;
+        s_humidity_ewma_x10 = (double)slot->humidity_x10;
+        s_light_ewma_x10 = (double)slot->light_x10;
+    } else {
+        s_temp_ewma_x10 = alpha * (double)slot->temp_x10 + (1.0 - alpha) * s_temp_ewma_x10;
+        s_humidity_ewma_x10 = alpha * (double)slot->humidity_x10 + (1.0 - alpha) * s_humidity_ewma_x10;
+        if (slot->light_x10 >= 0) {
+            s_light_ewma_x10 = alpha * (double)slot->light_x10 + (1.0 - alpha) * s_light_ewma_x10;
+        }
+    }
+
+    if (temp_avg) {
+        *temp_avg = s_temp_ewma_x10 / 10.0;
+    }
+    if (humidity_avg) {
+        *humidity_avg = s_humidity_ewma_x10 / 10.0;
+    }
+    if (light_avg) {
+        *light_avg = s_light_ewma_x10 / 10.0;
+    }
+    if (sample_count) {
+        *sample_count = s_sensor_sample_count;
+    }
+}
+
+static void publish_sensor_threshold_event(const char *metric,
+                                           const char *status,
+                                           double value,
+                                           double threshold,
+                                           const char *unit)
+{
+    char summary[160] = {0};
+    snprintf(summary, sizeof(summary), "%s %s: %.1f%s threshold %.1f%s",
+             metric, status, value, unit ? unit : "", threshold, unit ? unit : "");
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return;
+    }
+    int64_t ts_ms = esp_timer_get_time() / 1000;
+    cJSON_AddStringToObject(root, "schema", "espagent.sensor_event.v1");
+    cJSON_AddStringToObject(root, "event", "sensor_threshold");
+    cJSON_AddStringToObject(root, "node_id", espagent_node_id());
+    cJSON_AddStringToObject(root, "role", espagent_node_role());
+    cJSON_AddStringToObject(root, "metric", metric);
+    cJSON_AddStringToObject(root, "status", status);
+    cJSON_AddNumberToObject(root, "value", value);
+    cJSON_AddNumberToObject(root, "threshold", threshold);
+    cJSON_AddStringToObject(root, "unit", unit ? unit : "");
+    cJSON_AddStringToObject(root, "summary", summary);
+    cJSON_AddNumberToObject(root, "ts_ms", (double)ts_ms);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return;
+    }
+    (void)mqtt_queue_publish(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, json);
+    (void)mqtt_queue_publish(ESPAGENT_MESH_TOPIC_ALERTS, json);
+    (void)sensor_mqtt_publish_timeline_event("sensor",
+                                             "sensor_threshold",
+                                             status,
+                                             summary,
+                                             "",
+                                             "sensor_agent",
+                                             espagent_node_id(),
+                                             metric);
+    ESP_LOGI(TAG, "Sensor threshold event: %s", json);
+    cJSON_free(json);
+}
+
+static void sensor_thresholds_check(const tool_environment_values_t *values,
+                                    double temp_avg,
+                                    double humidity_avg,
+                                    double light_avg)
+{
+    if (!values) {
+        return;
+    }
+
+    int temp_band = values->temperature_c_x10 >= ESPAGENT_SENSOR_TEMP_HIGH_C_X10 ? 1 : 0;
+    if (temp_band != s_last_temp_band) {
+        s_last_temp_band = temp_band;
+        publish_sensor_threshold_event("temperature_c",
+                                       temp_band ? "high" : "normal",
+                                       temp_avg,
+                                       (double)ESPAGENT_SENSOR_TEMP_HIGH_C_X10 / 10.0,
+                                       "C");
+    }
+
+    int humidity_band = 0;
+    if (values->humidity_percent_x10 < ESPAGENT_SENSOR_HUMIDITY_LOW_X10) {
+        humidity_band = -1;
+    } else if (values->humidity_percent_x10 > ESPAGENT_SENSOR_HUMIDITY_HIGH_X10) {
+        humidity_band = 1;
+    }
+    if (humidity_band != s_last_humidity_band) {
+        s_last_humidity_band = humidity_band;
+        publish_sensor_threshold_event("humidity_percent",
+                                       humidity_band < 0 ? "low" : (humidity_band > 0 ? "high" : "normal"),
+                                       humidity_avg,
+                                       humidity_band < 0
+                                           ? (double)ESPAGENT_SENSOR_HUMIDITY_LOW_X10 / 10.0
+                                           : (double)ESPAGENT_SENSOR_HUMIDITY_HIGH_X10 / 10.0,
+                                       "%");
+    }
+
+    if (values->light_lux_x10 >= 0) {
+        int light_band = values->light_lux_x10 < ESPAGENT_SENSOR_LIGHT_LOW_LUX_X10 ? -1 : 0;
+        if (light_band != s_last_light_band) {
+            s_last_light_band = light_band;
+            publish_sensor_threshold_event("light_lux",
+                                           light_band < 0 ? "low" : "normal",
+                                           light_avg,
+                                           (double)ESPAGENT_SENSOR_LIGHT_LOW_LUX_X10 / 10.0,
+                                           "lux");
+        }
+    }
+}
+
 static esp_err_t publish_sensor_data(int fd)
 {
     if (!espagent_node_should_publish_sensor_telemetry()) {
@@ -1617,22 +2262,33 @@ static esp_err_t publish_sensor_data(int fd)
         return publish_node_state(fd, "online");
     }
 
-    char json[384];
+    char json[640];
     int64_t ts_ms = esp_timer_get_time() / 1000;
     double temp = (double)values.temperature_c_x10 / 10.0;
     double humidity = (double)values.humidity_percent_x10 / 10.0;
+    double temp_avg = temp;
+    double humidity_avg = humidity;
+    double light_avg = (double)values.light_lux_x10 / 10.0;
+    uint32_t sample_count = 0;
+    sensor_cache_update(&values, &temp_avg, &humidity_avg, &light_avg, &sample_count);
+    sensor_thresholds_check(&values, temp_avg, humidity_avg, light_avg);
+
     snprintf(json, sizeof(json),
              "{\"node_id\":\"%s\",\"role\":\"%s\",\"location\":\"%s\","
              "\"capabilities\":\"%s\","
              "\"type\":\"telemetry\",\"temp\":%.1f,\"humidity\":%.1f,"
+             "\"temp_avg\":%.1f,\"humidity_avg\":%.1f,\"sample_count\":%u,"
              "\"co2\":%d,\"tvoc\":%d,\"light_lux\":%.1f,"
+             "\"light_lux_avg\":%.1f,"
              "\"sensor\":\"AHT20\",\"status\":\"%s\",\"ts_ms\":%lld}",
              espagent_node_id(), espagent_node_role(), espagent_node_location(),
              espagent_node_capabilities(),
              temp, humidity,
+             temp_avg, humidity_avg, (unsigned)sample_count,
              values.co2eq_ppm,
              values.tvoc_ppb,
              (double)values.light_lux_x10 / 10.0,
+             light_avg,
              env_status,
              (long long)ts_ms);
 
@@ -1649,6 +2305,7 @@ static void sensor_mqtt_task(void *arg)
     const bool publish_telemetry = espagent_role_runs_sensor_sampling();
 
     while (1) {
+        mqtt_set_connected(false);
         int fd = mqtt_connect_tcp();
         if (fd < 0 || mqtt_send_connect(fd) != 0 || mqtt_read_connack(fd) != 0) {
             ESP_LOGW(TAG, "MQTT connect failed");
@@ -1660,20 +2317,53 @@ static void sensor_mqtt_task(void *arg)
         }
 
         ESP_LOGI(TAG, "MQTT connected to %s:%d", ESPAGENT_SENSOR_MQTT_BROKER, ESPAGENT_SENSOR_MQTT_PORT);
-        publish_node_state(fd, "online");
-        publish_node_event(fd, "mqtt_connected", "sensor_mqtt connected");
         mqtt_subscribe(fd, ESPAGENT_SENSOR_MQTT_TOPIC_COMMAND, 1);
         mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ROLE_COMMAND, 2);
-        mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
-        mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
-        mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
-        mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_CHECK, 6);
-        mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 7);
+
+        if (espagent_role_is_coordinator()) {
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 6);
+        } else if (espagent_role_is_control()) {
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
+        } else if (espagent_role_is_guardian()) {
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_CHECK, 6);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 7);
+        } else if (espagent_role_is_edge()) {
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_CHECK, 6);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 7);
+        }
+        if (espagent_role_runs_guardian() || espagent_role_is_coordinator()) {
+            char nodes_state_filter[160] = {0};
+            char nodes_telemetry_filter[160] = {0};
+            snprintf(nodes_state_filter, sizeof(nodes_state_filter),
+                     "%s/nodes/+/state", ESPAGENT_MESH_TOPIC_PREFIX);
+            snprintf(nodes_telemetry_filter, sizeof(nodes_telemetry_filter),
+                     "%s/nodes/+/telemetry", ESPAGENT_MESH_TOPIC_PREFIX);
+            mqtt_subscribe(fd, nodes_state_filter, 8);
+            mqtt_subscribe(fd, nodes_telemetry_filter, 9);
+        }
+        mqtt_set_connected(true);
+        publish_node_state(fd, "online");
+        publish_node_event(fd, "mqtt_connected", "sensor_mqtt connected");
 
         int64_t last_periodic_publish_ms = 0;
         while (1) {
             mqtt_poll_inbound(fd);
-            mqtt_flush_queued_publishes(fd);
+            if (!mqtt_flush_queued_publishes(fd)) {
+                ESP_LOGW(TAG, "MQTT queued publish failed, reconnecting");
+                mqtt_set_connected(false);
+                close(fd);
+                break;
+            }
 
             int64_t now_ms = esp_timer_get_time() / 1000;
             if (last_periodic_publish_ms == 0 ||
@@ -1684,11 +2374,13 @@ static void sensor_mqtt_task(void *arg)
                     if (telemetry_err == ESP_FAIL) {
                         ESP_LOGW(TAG, "MQTT publish failed, reconnecting");
                         publish_node_event(fd, "mqtt_reconnect", "telemetry publish failed");
+                        mqtt_set_connected(false);
                         close(fd);
                         break;
                     }
                 } else if (publish_node_state(fd, "online") != ESP_OK) {
                     ESP_LOGW(TAG, "MQTT state publish failed, reconnecting");
+                    mqtt_set_connected(false);
                     close(fd);
                     break;
                 }
@@ -1709,6 +2401,12 @@ esp_err_t sensor_mqtt_start(void)
         s_pub_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(mqtt_pub_item_t));
         if (!s_pub_queue) {
             ESP_LOGE(TAG, "Failed to create MQTT publish queue");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (!s_mqtt_event_group) {
+        s_mqtt_event_group = xEventGroupCreate();
+        if (!s_mqtt_event_group) {
             return ESP_ERR_NO_MEM;
         }
     }

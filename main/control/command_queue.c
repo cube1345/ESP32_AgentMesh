@@ -16,6 +16,7 @@ static const char *TAG = "control_queue";
 
 #define CONTROL_RECENT_DEPTH 8
 #define CONTROL_STATE_DEPTH  8
+#define CONTROL_RECENT_TTL_MS (2 * 60 * 1000)
 
 typedef struct {
     bool used;
@@ -93,7 +94,12 @@ static bool seen_command_locked(const char *command_id)
     if (!command_id || !command_id[0]) {
         return false;
     }
+    int64_t now = now_ms();
     for (int i = 0; i < CONTROL_RECENT_DEPTH; i++) {
+        if (s_recent[i].used && now - s_recent[i].ts_ms > CONTROL_RECENT_TTL_MS) {
+            memset(&s_recent[i], 0, sizeof(s_recent[i]));
+            continue;
+        }
         if (s_recent[i].used && strcmp(s_recent[i].command_id, command_id) == 0) {
             return true;
         }
@@ -106,11 +112,17 @@ static void remember_command_locked(const char *command_id)
     if (!command_id || !command_id[0]) {
         return;
     }
+    int64_t now = now_ms();
+    for (int i = 0; i < CONTROL_RECENT_DEPTH; i++) {
+        if (s_recent[i].used && now - s_recent[i].ts_ms > CONTROL_RECENT_TTL_MS) {
+            memset(&s_recent[i], 0, sizeof(s_recent[i]));
+        }
+    }
     recent_command_t *slot = &s_recent[s_recent_next % CONTROL_RECENT_DEPTH];
     memset(slot, 0, sizeof(*slot));
     slot->used = true;
     snprintf(slot->command_id, sizeof(slot->command_id), "%s", command_id);
-    slot->ts_ms = now_ms();
+    slot->ts_ms = now;
     s_recent_next++;
 }
 
@@ -194,17 +206,14 @@ static esp_err_t admission_check_locked(const espagent_mesh_command_t *cmd,
         snprintf(output, output_size, "Error: duplicate control command_id=%s rejected", cmd->command_id);
         return ESP_ERR_INVALID_STATE;
     }
-    if (cmd->ts_ms > 0 && cmd->ttl_ms > 0) {
-        int64_t age_ms = now_ms() - cmd->ts_ms;
-        if (age_ms < -5000 || age_ms > cmd->ttl_ms) {
-            snprintf(output, output_size,
-                     "Error: control command expired or from the future command_id=%s age_ms=%lld ttl_ms=%d",
-                     cmd->command_id,
-                     (long long)age_ms,
-                     cmd->ttl_ms);
-            return ESP_ERR_TIMEOUT;
-        }
-    }
+    /*
+     * Mesh command ts_ms is generated from the coordinator node uptime, while
+     * this queue runs on the control node uptime. These monotonic clocks do not
+     * share an epoch, so comparing them here rejects valid cross-node commands
+     * as "from the future". TTL is enforced by the sender wait path and kept in
+     * the signed command envelope; the actuator side only validates schema,
+     * Guardian decision, duplicate IDs, emergency stop, and hardware interlock.
+     */
     return ESP_OK;
 }
 

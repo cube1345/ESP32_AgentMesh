@@ -1,7 +1,9 @@
 #include "mesh/mesh_auth.h"
 
 #include "espagent_config.h"
-#include "psa/crypto.h"
+#include "net/net_guard.h"
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+#include "mbedtls/md.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -81,37 +83,23 @@ static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
         return err;
     }
 
-    psa_status_t status = psa_crypto_init();
-    if (status != PSA_SUCCESS) {
-        return ESP_FAIL;
-    }
-
-    psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-    psa_key_id_t key_id = 0;
-    psa_set_key_type(&attrs, PSA_KEY_TYPE_HMAC);
-    psa_set_key_bits(&attrs, strlen(key) * 8);
-    psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_SIGN_MESSAGE);
-    psa_set_key_algorithm(&attrs, PSA_ALG_HMAC(PSA_ALG_SHA_256));
-    status = psa_import_key(&attrs,
-                            (const uint8_t *)key,
-                            strlen(key),
-                            &key_id);
-    psa_reset_key_attributes(&attrs);
-    if (status != PSA_SUCCESS) {
-        return ESP_FAIL;
-    }
-
     uint8_t mac[32] = {0};
-    size_t mac_len = 0;
-    status = psa_mac_compute(key_id,
-                             PSA_ALG_HMAC(PSA_ALG_SHA_256),
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!info) {
+        return ESP_FAIL;
+    }
+    err = espagent_net_guard_take(5000);
+    if (err != ESP_OK) {
+        return err;
+    }
+    int rc = mbedtls_md_hmac(info,
+                             (const uint8_t *)key,
+                             strlen(key),
                              (const uint8_t *)canonical,
                              strlen(canonical),
-                             mac,
-                             sizeof(mac),
-                             &mac_len);
-    psa_destroy_key(key_id);
-    if (status != PSA_SUCCESS || mac_len != sizeof(mac)) {
+                             mac);
+    espagent_net_guard_give();
+    if (rc != 0) {
         return ESP_FAIL;
     }
     bytes_to_hex(mac, sizeof(mac), signature, signature_size);

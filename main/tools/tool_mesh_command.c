@@ -6,6 +6,7 @@
 #include "bus/message_bus.h"
 #include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
+#include "net/net_guard.h"
 #include "sensors/sensor_mqtt.h"
 #include "tools/tool_sandbox.h"
 
@@ -31,6 +32,12 @@ typedef struct {
     uint32_t wait_ms;
 } mesh_wait_task_ctx_t;
 
+#define MESH_OUTPUT_JSON_SIZE 1024
+#define MESH_POLICY_JSON_SIZE 1024
+#define MESH_BACKGROUND_NET_DEFER_MS 15000
+#define MESH_ACK_RETRY_COUNT 4
+#define MESH_POLICY_RETRY_COUNT 3
+
 static const char *json_string(cJSON *root, const char *key)
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
@@ -52,6 +59,105 @@ static bool json_bool(cJSON *root, const char *key, bool default_value)
     return cJSON_IsTrue(item);
 }
 
+static void compact_text_copy(char *dst, size_t dst_size, const char *src)
+{
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    dst[0] = '\0';
+    if (!src) {
+        return;
+    }
+
+    size_t j = 0;
+    bool last_space = false;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_size; i++) {
+        char ch = src[i];
+        if (ch == '\r' || ch == '\n' || ch == '\t') {
+            ch = ' ';
+        }
+        if (ch == ' ') {
+            if (last_space) {
+                continue;
+            }
+            last_space = true;
+        } else {
+            last_space = false;
+        }
+        dst[j++] = ch;
+    }
+    dst[j] = '\0';
+}
+
+static void build_mesh_async_user_reply(const mesh_wait_task_ctx_t *ctx,
+                                        const char *output_json,
+                                        bool timed_out,
+                                        char *reply,
+                                        size_t reply_size)
+{
+    if (!reply || reply_size == 0) {
+        return;
+    }
+    reply[0] = '\0';
+
+    if (timed_out) {
+        snprintf(reply, reply_size,
+                 "远程%s未在 %u ms 内返回结果，请稍后重试。",
+                 ctx && ctx->target_role[0] ? ctx->target_role : "节点",
+                 (unsigned)(ctx ? ctx->wait_ms : 0));
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(output_json ? output_json : "");
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        snprintf(reply, reply_size,
+                 "远程%s已返回结果，但结果格式无法解析。",
+                 ctx && ctx->target_role[0] ? ctx->target_role : "节点");
+        return;
+    }
+
+    const char *status = json_string(root, "status");
+    const char *action = json_string(root, "action");
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    cJSON *error = cJSON_GetObjectItem(root, "error");
+    const char *result_text = NULL;
+    const char *error_text = NULL;
+    if (cJSON_IsObject(result)) {
+        result_text = json_string(result, "text");
+    }
+    if (cJSON_IsObject(error)) {
+        error_text = json_string(error, "message");
+    }
+
+    char compact[512] = {0};
+    compact_text_copy(compact, sizeof(compact),
+                      result_text && result_text[0] ? result_text : error_text);
+
+    const char *role = (ctx && ctx->target_role[0]) ? ctx->target_role : "节点";
+    const char *verb = "已返回";
+    if (action && action[0] &&
+        (strcmp(action, "set_status_light") == 0 ||
+         strcmp(action, "ws2812_set") == 0 ||
+         strcmp(action, "virtual_device_control") == 0 ||
+         strcmp(action, "servo_write") == 0 ||
+         strcmp(action, "gpio_write") == 0)) {
+        verb = "已执行";
+    }
+
+    if (status && strcmp(status, "ok") == 0) {
+        snprintf(reply, reply_size, "远程%s%s：%s",
+                 role,
+                 verb,
+                 compact[0] ? compact : "执行成功。");
+    } else {
+        snprintf(reply, reply_size, "远程%s执行失败：%s",
+                 role,
+                 compact[0] ? compact : "未返回详细错误。");
+    }
+    cJSON_Delete(root);
+}
+
 static bool is_control_action(const char *action)
 {
     return action &&
@@ -60,6 +166,7 @@ static bool is_control_action(const char *action)
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0);
 }
@@ -73,7 +180,52 @@ static bool is_sensor_action(const char *action)
 
 static bool is_allowed_mesh_action(const char *action)
 {
-    return is_sensor_action(action) || is_control_action(action);
+    return is_sensor_action(action) ||
+           is_control_action(action) ||
+           (action && strcmp(action, "agent_task") == 0);
+}
+
+static esp_err_t publish_mesh_command_payload(const char *topic,
+                                              const char *payload,
+                                              const char *target_role,
+                                              bool require_ack)
+{
+    esp_err_t err = sensor_mqtt_publish_text(topic, payload);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    if (!require_ack || !target_role || !target_role[0]) {
+        return ESP_OK;
+    }
+
+    /*
+     * Role topics are QoS0 in the tiny MQTT client. Retrying the same
+     * command_id is safe because receivers de-duplicate before execution,
+     * and it removes the last observed stress-test gap where Guardian had
+     * allowed a sensor command but the sensor board never saw the role topic.
+     */
+    static const uint16_t retry_delay_ms[MESH_ACK_RETRY_COUNT - 1] = {80, 180, 350};
+    for (size_t i = 0; i < MESH_ACK_RETRY_COUNT - 1; i++) {
+        vTaskDelay(pdMS_TO_TICKS(retry_delay_ms[i]));
+        esp_err_t retry_err = sensor_mqtt_publish_text(topic, payload);
+        if (retry_err != ESP_OK) {
+            ESP_LOGW("tool_mesh_command",
+                     "Mesh command retry publish failed: role=%s attempt=%u/%u err=%s",
+                     target_role,
+                     (unsigned)(i + 2),
+                     (unsigned)MESH_ACK_RETRY_COUNT,
+                     esp_err_to_name(retry_err));
+        } else {
+            ESP_LOGI("tool_mesh_command",
+                     "Mesh command retry queued: role=%s attempt=%u/%u topic=%s",
+                     target_role,
+                     (unsigned)(i + 2),
+                     (unsigned)MESH_ACK_RETRY_COUNT,
+                     topic);
+        }
+    }
+    return ESP_OK;
 }
 
 static esp_err_t request_policy_decision(const char *command_id,
@@ -114,28 +266,52 @@ static esp_err_t request_policy_decision(const char *command_id,
         return ESP_ERR_NO_MEM;
     }
 
+    uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
+    if (wait_ms > 15000U) {
+        wait_ms = 15000U;
+    }
+    if (wait_ms < 3000U) {
+        wait_ms = 3000U;
+    }
+
     ESP_LOGI("tool_mesh_command", "Policy check requested: %s", json);
-    esp_err_t err = sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_POLICY_CHECK, json);
+    esp_err_t err = ESP_ERR_TIMEOUT;
+    for (int attempt = 1; attempt <= MESH_POLICY_RETRY_COUNT; attempt++) {
+        err = sensor_mqtt_wait_connected(12000);
+        if (err != ESP_OK) {
+            cJSON_free(json);
+            snprintf(reason, reason_size, "MQTT is not connected for policy_check: %s", esp_err_to_name(err));
+            return err;
+        }
+        err = sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_POLICY_CHECK, json);
+        if (err != ESP_OK) {
+            cJSON_free(json);
+            snprintf(reason, reason_size, "failed to publish policy_check: %s", esp_err_to_name(err));
+            return err;
+        }
+        espagent_net_guard_defer_background(MESH_BACKGROUND_NET_DEFER_MS);
+
+        err = sensor_mqtt_wait_policy_decision(command_id,
+                                               decision_json,
+                                               decision_json_size,
+                                               wait_ms);
+        if (err == ESP_OK) {
+            break;
+        }
+        ESP_LOGW("tool_mesh_command",
+                 "policy_decision wait timed out: command_id=%s attempt=%d/%d wait_ms=%u",
+                 command_id,
+                 attempt,
+                 MESH_POLICY_RETRY_COUNT,
+                 (unsigned)wait_ms);
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
     cJSON_free(json);
     if (err != ESP_OK) {
-        snprintf(reason, reason_size, "failed to publish policy_check: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
-    if (wait_ms > 8000U) {
-        wait_ms = 8000U;
-    }
-    if (wait_ms < 1000U) {
-        wait_ms = 1000U;
-    }
-
-    err = sensor_mqtt_wait_policy_decision(command_id,
-                                           decision_json,
-                                           decision_json_size,
-                                           wait_ms);
-    if (err != ESP_OK) {
-        snprintf(reason, reason_size, "policy_decision wait timed out after %ums", (unsigned)wait_ms);
+        snprintf(reason, reason_size,
+                 "policy_decision wait timed out after %u attempts (%ums each)",
+                 (unsigned)MESH_POLICY_RETRY_COUNT,
+                 (unsigned)wait_ms);
         return err;
     }
 
@@ -194,7 +370,7 @@ static void mesh_wait_task(void *arg)
         return;
     }
 
-    char output_json[768] = {0};
+    char output_json[MESH_OUTPUT_JSON_SIZE] = {0};
     esp_err_t wait_err = sensor_mqtt_wait_output_message(ctx->command_id,
                                                          output_json,
                                                          sizeof(output_json),
@@ -216,34 +392,32 @@ static void mesh_wait_task(void *arg)
                                              ctx->action);
 
     if (ctx->reply_channel[0] && ctx->reply_chat_id[0]) {
-        espagent_msg_t msg = {0};
-        snprintf(msg.channel, sizeof(msg.channel), "%s", ctx->reply_channel);
-        snprintf(msg.chat_id, sizeof(msg.chat_id), "%s", ctx->reply_chat_id);
-        msg.flags = ESPAGENT_MSG_FLAG_INTERNAL_RESULT;
+        espagent_msg_t out = {0};
+        char reply[768] = {0};
+        build_mesh_async_user_reply(ctx, output_json, !ok, reply, sizeof(reply));
 
-        char content[1152] = {0};
-        if (ok) {
-            snprintf(content, sizeof(content),
-                     "Internal async Mesh result. task_id=%s command_id=%s action=%s output_message=%s\n"
-                     "Please summarize this execution result to the user in one concise Chinese sentence. "
-                     "Do not call mesh_send_command again for this result.",
-                     ctx->task_id,
-                     ctx->command_id,
-                     ctx->action,
-                     output_json);
-        } else {
-            snprintf(content, sizeof(content),
-                     "Internal async Mesh timeout. task_id=%s command_id=%s action=%s wait_ms=%u. "
-                     "Please tell the user that the remote node did not return a result in time.",
-                     ctx->task_id,
-                     ctx->command_id,
-                     ctx->action,
-                     (unsigned)ctx->wait_ms);
-        }
-        msg.content = strdup(content);
-        if (msg.content) {
-            if (message_bus_push_inbound(&msg) != ESP_OK) {
-                free(msg.content);
+        snprintf(out.channel, sizeof(out.channel), "%s", ctx->reply_channel);
+        snprintf(out.chat_id, sizeof(out.chat_id), "%s", ctx->reply_chat_id);
+        out.content = strdup(reply);
+        if (out.content) {
+            (void)sensor_mqtt_publish_timeline_event("final",
+                                                     "mesh_async_reply",
+                                                     ok ? "ok" : "timeout",
+                                                     out.content,
+                                                     ctx->command_id,
+                                                     ctx->target_role,
+                                                     ctx->target_node,
+                                                     ctx->action);
+            (void)sensor_mqtt_publish_output_message("final_reply",
+                                                     ctx->command_id,
+                                                     ctx->trace_id,
+                                                     ctx->action,
+                                                     ctx->reply_channel,
+                                                     ok ? ESP_OK : wait_err,
+                                                     out.content,
+                                                     out.content);
+            if (message_bus_push_outbound(&out) != ESP_OK) {
+                free(out.content);
             }
         }
     }
@@ -293,6 +467,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                          char *output,
                                          size_t output_size)
 {
+    espagent_net_guard_defer_background(MESH_BACKGROUND_NET_DEFER_MS);
+
     char sandbox_reason[192] = {0};
     esp_err_t sandbox_err = tool_sandbox_check("mesh_send_command",
                                                input_json,
@@ -353,6 +529,16 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
             snprintf(output, output_size,
                      "Error: action=%s must target control_agent, got %s",
                      action, target_role);
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (strcmp(action, "agent_task") == 0 &&
+            strcmp(target_role, "sensor_agent") != 0 &&
+            strcmp(target_role, "control_agent") != 0 &&
+            strcmp(target_role, "guardian_agent") != 0) {
+            cJSON_Delete(root);
+            snprintf(output, output_size,
+                     "Error: agent_task must target sensor_agent, control_agent, or guardian_agent, got %s",
+                     target_role);
             return ESP_ERR_INVALID_ARG;
         }
     }
@@ -482,7 +668,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         return ESP_ERR_NO_MEM;
     }
 
-    char policy_json[512] = {0};
+    char policy_json[MESH_POLICY_JSON_SIZE] = {0};
     char policy_reason[160] = {0};
     esp_err_t policy_err = request_policy_decision(command_id_copy,
                                                    trace_id_copy,
@@ -521,7 +707,28 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                              target_node_copy,
                                              action_copy);
 
-    esp_err_t err = sensor_mqtt_publish_text(topic, payload);
+    esp_err_t dispatch_err = sensor_mqtt_wait_connected(12000);
+    if (dispatch_err != ESP_OK) {
+        snprintf(output, output_size,
+                 "Error: MQTT is not connected for mesh dispatch action=%s command_id=%s (%s)",
+                 action_copy, command_id_copy, esp_err_to_name(dispatch_err));
+        (void)sensor_mqtt_publish_timeline_event("dispatch",
+                                                 "mesh_command_queued",
+                                                 "error",
+                                                 output,
+                                                 command_id_copy,
+                                                 target_role_copy,
+                                                 target_node_copy,
+                                                 action_copy);
+        cJSON_free(payload);
+        return dispatch_err;
+    }
+
+    espagent_net_guard_defer_background(MESH_BACKGROUND_NET_DEFER_MS);
+    esp_err_t err = publish_mesh_command_payload(topic,
+                                                 payload,
+                                                 target_role_copy,
+                                                 require_ack);
     if (err == ESP_OK) {
         snprintf(output, output_size,
                  "OK: queued MQTT mesh command action=%s topic=%s command_id=%s",
@@ -537,28 +744,34 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
         if (require_ack) {
             uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
             if (async_wait) {
-                char task_id[48] = {0};
-                esp_err_t task_err = start_mesh_wait_task(command_id_copy,
-                                                          trace_id_copy,
-                                                          target_role_copy,
-                                                          target_node_copy,
-                                                          action_copy,
-                                                          reply_channel_copy,
-                                                          reply_chat_id_copy,
-                                                          wait_ms,
-                                                          task_id,
-                                                          sizeof(task_id));
-                if (task_err == ESP_OK) {
-                    snprintf(output, output_size,
-                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s async_task_id=%s; result will be injected when OutputMessage arrives",
-                             action_copy, topic, command_id_copy, task_id);
+                if (reply_channel_copy[0] && reply_chat_id_copy[0]) {
+                    char task_id[48] = {0};
+                    esp_err_t task_err = start_mesh_wait_task(command_id_copy,
+                                                              trace_id_copy,
+                                                              target_role_copy,
+                                                              target_node_copy,
+                                                              action_copy,
+                                                              reply_channel_copy,
+                                                              reply_chat_id_copy,
+                                                              wait_ms,
+                                                              task_id,
+                                                              sizeof(task_id));
+                    if (task_err == ESP_OK) {
+                        snprintf(output, output_size,
+                                 "OK: queued MQTT mesh command action=%s topic=%s command_id=%s async_task_id=%s; result will be injected when OutputMessage arrives",
+                                 action_copy, topic, command_id_copy, task_id);
+                    } else {
+                        snprintf(output, output_size,
+                                 "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; async wait task failed: %s",
+                                 action_copy, topic, command_id_copy, esp_err_to_name(task_err));
+                    }
                 } else {
                     snprintf(output, output_size,
-                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; async wait task failed: %s",
-                             action_copy, topic, command_id_copy, esp_err_to_name(task_err));
+                             "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; OutputMessage will be published on MQTT timeline/events",
+                             action_copy, topic, command_id_copy);
                 }
             } else {
-                char output_json[768] = {0};
+                char output_json[MESH_OUTPUT_JSON_SIZE] = {0};
                 esp_err_t wait_err = sensor_mqtt_wait_output_message(command_id_copy,
                                                                      output_json,
                                                                      sizeof(output_json),

@@ -44,6 +44,9 @@ bool espagent_role_runs_llm(void)
 {
     return espagent_role_is_edge() ||
            espagent_role_is_coordinator() ||
+           espagent_role_is_sensor() ||
+           espagent_role_is_control() ||
+           espagent_role_is_guardian() ||
            espagent_node_has_capability("llm");
 }
 

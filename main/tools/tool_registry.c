@@ -5,6 +5,7 @@
 #include "tools/tool_cron.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
+#include "tools/tool_gateway.h"
 #include "tools/tool_lua.h"
 #include "tools/tool_mesh_command.h"
 #include "tools/tool_sandbox.h"
@@ -15,6 +16,7 @@
 #include "tools/tool_environment.h"
 #include "tools/tool_hc_sr05.h"
 #include "tools/tool_servo.h"
+#include "tools/tool_gree_ac.h"
 #include "tools/tool_max98357.h"
 #include "tools/tool_sgp30.h"
 #include "tools/tool_bh1750.h"
@@ -276,6 +278,14 @@ static esp_err_t tool_servo_write_routed_execute(const char *input_json,
                                         tool_servo_write_execute);
 }
 
+static esp_err_t tool_gree_ac_control_routed_execute(const char *input_json,
+                                                     char *output,
+                                                     size_t output_size)
+{
+    return coordinator_control_or_local("gree_ac_control", input_json, output, output_size,
+                                        tool_gree_ac_control_execute);
+}
+
 static void register_tool(const espagent_tool_t *tool)
 {
     if (s_tool_count >= MAX_TOOLS) {
@@ -503,13 +513,13 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "mesh_send_command",
-        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use this when the coordinator should route a user request to another ESP32. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote control/status-light requests, use target_role=control_agent with action=set_status_light or ws2812_set and color/RGB args. Do not claim a Mesh command was sent unless this tool returns OK.",
+        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic hardware work. Use action=agent_task with args.task when the coordinator should delegate a natural-language subtask to a remote role's own local AI loop. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote control/status-light, servo, GPIO, or Gree air-conditioner requests, use target_role=control_agent with the matching action and structured args. Do not claim a Mesh command was sent unless this tool returns OK.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
-            "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads and control_agent for actuators.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"control_state\",\"control_emergency_stop\"],\"description\":\"Whitelisted mesh command action\"},"
-            "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command\"},"
+            "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
             "\"trace_id\":{\"type\":\"string\",\"description\":\"Optional trace id shared across the user request and downstream OutputMessage\"},"
@@ -523,10 +533,12 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "virtual_device_read",
-        .description = "Read a simple read-only runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports bounded I2C, UART query, Modbus RTU function 3/4 register reads, SPI transfer-read, ADC one-shot, and GPIO input manifests. The manifest must use manifest_version=1, role=sensor_agent, permissions=[read], and risk=read_only. On a coordinator_agent, this routes to sensor_agent unless local=true is explicitly set. Use this when a developer added a protocol manifest for a new simple sensor or serial module and no dedicated C tool exists.",
+        .description = "Read or perform a bounded UART exchange with a simple runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports bounded I2C, UART query, Modbus RTU function 3/4 register reads, SPI transfer-read, ADC one-shot, and GPIO input manifests. For UART manifests, command_ascii or command_bytes may be overridden at call time, and expect_response=false enables send-only serial pushes such as HC-05 phone bridge text output. The manifest must use manifest_version=1, role=sensor_agent, permissions=[read], and risk=read_only. On a coordinator_agent, this routes to sensor_agent unless local=true is explicitly set. Use this when a developer added a protocol manifest for a new simple sensor or serial module and no dedicated C tool exists.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"device\":{\"type\":\"string\",\"description\":\"Device manifest name, loaded from /spiffs/devices/<device>.json\"},"
+            "\"command_ascii\":{\"type\":\"string\",\"description\":\"Optional runtime UART ASCII payload override for uart manifests such as HC-05 bridge text\"},"
+            "\"expect_response\":{\"type\":\"boolean\",\"description\":\"For uart manifests, set false for send-only writes that should not wait for reply\"},"
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly reading this board locally instead of routing to sensor_agent\"}},"
             "\"required\":[\"device\"],\"additionalProperties\":false}",
         .execute = tool_virtual_device_read_execute,
@@ -603,6 +615,54 @@ esp_err_t tool_registry_init(void)
             "\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Workflow or rule id returned by automation_list/create\"}},"
             "\"required\":[\"id\"]}",
         .execute = tool_automation_remove_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "gateway_status",
+        .description = "Return ESPAgent gateway status, including device registry, WiFi/IP state, BLE Mesh bridge availability, and OTA gateway boundary. Use this to inspect what external devices and gateway capabilities are currently known.",
+        .input_schema_json =
+            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
+        .execute = tool_gateway_status_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "gateway_register_ble_mesh_device",
+        .description = "Register an external BLE Mesh device in the ESPAgent device registry. This records device_id, address, name, and capabilities for future Gateway Agent use. It does not provision real BLE hardware unless BLE Mesh backend is linked.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"device_id\":{\"type\":\"string\",\"description\":\"Stable device id, e.g. blemesh_living_room_light\"},"
+            "\"address\":{\"type\":\"string\",\"description\":\"BLE Mesh unicast address or external address token\"},"
+            "\"name\":{\"type\":\"string\",\"description\":\"Human-readable device name\"},"
+            "\"capabilities\":{\"type\":\"string\",\"description\":\"Comma-separated capabilities such as light,onoff,rgb\"}},"
+            "\"required\":[\"device_id\",\"address\"],\"additionalProperties\":false}",
+        .execute = tool_gateway_register_ble_mesh_device_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "gateway_ble_mesh_send",
+        .description = "Send or stage a BLE Mesh gateway command using device_id/address, opcode, and hex data. In current firmware this records timeline intent and returns not_linked unless BLE Mesh backend is compiled in; do not claim real BLE execution unless the tool returns OK.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"device_id\":{\"type\":\"string\",\"description\":\"Known BLE Mesh device id from the registry\"},"
+            "\"address\":{\"type\":\"string\",\"description\":\"BLE Mesh unicast address when device_id is not enough\"},"
+            "\"opcode\":{\"type\":\"string\",\"description\":\"Vendor/model opcode as hex string\"},"
+            "\"data\":{\"type\":\"string\",\"description\":\"Payload as hex string, may be empty for reads\"}},"
+            "\"required\":[\"opcode\",\"data\"],\"additionalProperties\":false}",
+        .execute = tool_gateway_ble_mesh_send_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "ota_gateway_plan",
+        .description = "Create a structured OTA gateway plan for a target node or role and publish it to timeline. This does not directly flash firmware from the LLM path; execution remains via serial ota_update or a future Guardian-gated remote OTA command.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target ESPAgent node id\"},"
+            "\"target_role\":{\"type\":\"string\",\"description\":\"Optional target role when node id is not known\"},"
+            "\"url\":{\"type\":\"string\",\"description\":\"HTTPS URL to ESPAgent.bin\"},"
+            "\"version\":{\"type\":\"string\",\"description\":\"Optional expected firmware version\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only after explicit operator confirmation\"}},"
+            "\"required\":[\"url\"],\"additionalProperties\":false}",
+        .execute = tool_ota_gateway_plan_execute,
     });
 
     register_tool(&(espagent_tool_t){
@@ -778,6 +838,25 @@ esp_err_t tool_registry_init(void)
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
             "\"required\":[]}",
         .execute = tool_servo_write_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "gree_ac_control",
+        .description = "Control a Gree air-conditioner by IR transmit only. Supports common actions such as power on/off, cool/heat/dry/fan/auto mode, set or adjust temperature, common fan speed, and swing on/off. The tool keeps a bounded local cached AC state and resends a full Gree frame each time. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"power\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"],\"description\":\"Turn the Gree AC on or off\"},"
+            "\"mode\":{\"type\":\"string\",\"enum\":[\"auto\",\"cool\",\"dry\",\"fan\",\"heat\"],\"description\":\"Optional operating mode\"},"
+            "\"temp_c\":{\"type\":\"integer\",\"minimum\":16,\"maximum\":30,\"description\":\"Optional target temperature in Celsius\"},"
+            "\"temp_delta\":{\"type\":\"integer\",\"minimum\":-5,\"maximum\":5,\"description\":\"Optional relative temperature adjustment such as +1 or -1\"},"
+            "\"fan\":{\"type\":\"string\",\"enum\":[\"auto\",\"low\",\"medium\",\"high\"],\"description\":\"Optional fan speed\"},"
+            "\"swing\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"],\"description\":\"Vertical swing auto on/off\"},"
+            "\"tx_gpio\":{\"type\":\"integer\",\"description\":\"Optional IR TX GPIO override; defaults to configured Gree IR pin\"},"
+            "\"repeat_count\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":4,\"description\":\"Optional extra retransmit count for reliability\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[]}",
+        .execute = tool_gree_ac_control_routed_execute,
     });
 
     register_tool(&(espagent_tool_t){

@@ -14,6 +14,12 @@ esp_err_t feishu_bot_init(void);
 esp_err_t feishu_bot_start(void);
 
 /**
+ * Wait for Feishu WebSocket bootstrap to make initial progress.
+ * Returns ESP_OK once connected or once WS config/client state is available.
+ */
+esp_err_t feishu_bot_wait_ready(uint32_t timeout_ms);
+
+/**
  * Send a text message to a Feishu chat.
  * Automatically splits messages longer than ESPAGENT_FEISHU_MAX_MSG_LEN chars.
  * @param chat_id  Feishu chat ID (open_id or chat_id)

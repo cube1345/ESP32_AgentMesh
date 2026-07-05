@@ -73,12 +73,17 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"virtual_device_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"servo_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"gree_ac_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"max98357_play_tone", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL},
     {"mesh_send_command", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_MESH},
     {"automation_create_workflow", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_AUTOMATION | TOOL_CAP_MESH},
     {"automation_create_rule", ESPAGENT_TOOL_RISK_HIGH_CONTROL, TOOL_CAP_AUTOMATION | TOOL_CAP_MESH},
     {"automation_list", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
     {"automation_remove", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_AUTOMATION},
+    {"gateway_status", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ | TOOL_CAP_MESH},
+    {"gateway_register_ble_mesh_device", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_MESH},
+    {"gateway_ble_mesh_send", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_MESH},
+    {"ota_gateway_plan", ESPAGENT_TOOL_RISK_HIGH_CONTROL, TOOL_CAP_SYSTEM | TOOL_CAP_MESH},
     {"cron_add", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_SCHEDULE},
     {"cron_list", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
     {"cron_remove", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_SCHEDULE},
@@ -257,10 +262,12 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
         strcmp(action, "virtual_device_control") != 0 &&
+        strcmp(action, "gree_ac_control") != 0 &&
         strcmp(action, "control_state") != 0 &&
         strcmp(action, "control_emergency_stop") != 0 &&
         strcmp(action, "read_temperature_humidity") != 0 &&
-        strcmp(action, "virtual_device_read") != 0) {
+        strcmp(action, "virtual_device_read") != 0 &&
+        strcmp(action, "agent_task") != 0) {
         deny(reason, reason_size, "sandbox denied mesh_send_command: unsupported action=%s", action);
         return false;
     }

@@ -16,6 +16,7 @@ ESPAgent 是运行在 ESP32-S3 上的轻量 AI Agent 固件。它不是 Linux �
 当前固件能力可以概括为：
 
 - 通过 Feishu / WebSocket / Serial CLI 接收人类输入。
+- 支持一层轻量 `/命令` 前缀路由，用固定命令约束后续自然语言执行方向。
 - 使用 LLM tool calling 理解任务和选择工具。
 - 支持 `spawn_subagent`：主 Agent 可为独立的信息检索、文件读取/总结等子任务临时创建一个受限子 Agent。
 - 通过 `tool_registry` 执行真实硬件、文件、天气、搜索、定时任务等工具。
@@ -65,6 +66,7 @@ Feishu / WebSocket reply
 关键边界：
 
 - 通道只负责收发消息，不直接碰硬件。
+- slash 命令层先于 prompt 构建运行；它只做 direct reply 或 prompt rewrite，不是新的 shell/runtime。
 - `agent_loop` 决定是否调用工具。
 - 工具是 C 函数，LLM 只能通过注册过的 JSON schema 调用。
 - 硬件动作必须经过工具实现和 tool guard。
@@ -108,8 +110,20 @@ esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audi
 - 2026-06-15 联调确认：四个串口 `/dev/ttyUSB0-3` 均可读取，但当前工具环境读串口需要提权；非提权 `/dev` 扫描可能短暂看不到设备。
 - Coordinator 通过飞书自然语言测试已经能把 `读取温湿度` 路由到 `sensor_agent`，把 `点亮WS2812为蓝色` 路由到 `control_agent`。
 - Coordinator 现在对常见飞书 Mesh 指令有确定性路由：普通 `读取温湿度` 直接转 `sensor_agent/read_temperature_humidity`，远程/控制板 WS2812 状态灯颜色请求直接转 `control_agent/set_status_light`，不再完全依赖 LLM 自己选择工具。
+- Coordinator 新增一层显式 slash command：
+  - `/help`
+  - `/sensor <task>`
+  - `/control <task>`
+  - `/guardian <task>`
+  - `/subagent <task>`
+  - `/workflow <task>`
+  - `/rule <task>`
+  - `/local <task>`
+- 其中 `/help`、未知命令、缺少任务参数会直接返回文本；其它 slash 命令会把后续自然语言改写成更强的角色/执行约束，再进入原有 ReAct/tool 流程。
+- 2026-07-05 USB0 板端已验证 slash 闭环：`/help` 直接回复成功；`/control set status light blue` 已确认走 `mesh_send_command -> policy_check -> policy_decision -> control_agent -> OutputMessage -> final reply`。
 - Sensor 节点当前日志中可见 `DHT22=ESP_ERR_TIMEOUT` 和 `MH-Z19=ESP_FAIL`，表示节点在线但这些具体传感器在当前接线/配置下未读到数据。
 - 当前控制类远程执行已支持 WS2812/status-light/servo/GPIO/virtual_device_control 白名单验证；Coordinator 下发前会先经过 Guardian `policy_check/policy_decision`，执行结果会发布结构化 `espagent.output.v1` OutputMessage。Control Agent 已新增轻量 command queue，支持重复 command_id 拦截、TTL 检查、单执行器互锁、emergency stop latch 和 actuator state snapshot。Guardian 已具备人工确认队列，`approval_confirm` 后可通过一次性 `approval_id` 让同 action/role 的高风险控制重试获得 allow。固件也支持可选硬件 interlock GPIO 和 Mesh command HMAC 当前/previous key 验证；生产 broker ACL/TLS、真实互锁接线和密钥轮换流程仍需部署验证。
+- 2026-06-21 实机压测发现 Guardian 在高频 state/telemetry + StateBoard 更新下会拖慢 `policy_decision` 回流，导致 Coordinator 偶发等待超时但 Guardian 随后才 allow。已修复：Guardian 对普通 watchdog StateBoard 更新按 state/telemetry 分别 30s 节流，MQTT critical 队列只让 command / policy_check / policy_decision 插队，Coordinator 的 policy decision 等待调整为 3-15s 并增加同 `command_id` 的 3 次幂等 `policy_check` 重试。
 - 联调用 broker 暂为 `broker.emqx.io:1883`，topic prefix 暂为 `espagent/cube1345`；这是调试配置，不是生产配置。
 - `mesh_send_command` 已加入 LLM tool registry，Coordinator 可以把跨节点请求发布为 MQTT Mesh command。
 - Sensor 角色已补充 `read_temperature_humidity` command 白名单：收到命令后可调用 AHT10/AHT20 工具并发布结构化 `espagent.output.v1` OutputMessage 到 events/timeline。
@@ -119,6 +133,15 @@ esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audi
 - Automation 当前分两条执行路径：条件规则由一个常驻 `rule_task` 串行扫描 `s_rules[]`，多步/延迟任务由每个 workflow 自己启动一个临时 `workflow_task`。默认上限为 8 条规则、8 个 workflow 槽位、每个 workflow 8 步。
 - 2026-06-18 已完成湿度条件自动化验证：USB0 创建 `humidity_percent > 40` 规则，USB1 AHT20 返回湿度约 `46.0%`，USB0 经 Guardian policy 下发 `set_status_light`，USB2 `control_agent` 执行 WS2812 `rgb=(255,0,0)`；测试规则随后已通过 `automation_remove` 删除。
 - Guardian 角色已接入 policy 第二层：启动时声明 policy/privacy/audit/stateboard/watchdog 边界；订阅 `espagent/cube1345/security/policy_check` 后按白名单、安全等级和部分参数级规则返回 `espagent.policy_decision.v1` 到 `espagent/cube1345/security/decision`；对 `virtual_device_control` 会检查 `device`、`duration_ms` 和持久 relay `confirmed=true` 要求；订阅 timeline 后对 `tool_use`、`tool_result`、`mesh_command_queued`、`mesh_command_result`、`final_reply`、`error` 等关键事件生成 `espagent.guardian.audit.v1` 审计事件，错误事件会同步发布到 alerts。
+
+Gateway / 管理后台状态：
+
+- 2026-06-21 已参考 Ai-Thinker BLE Mesh Gateway 的思路，把“网关”作为 ESPAgent 的能力层接入，而不是把外部项目整套替换进来。
+- 新增 `device_registry`：本地维护已知 MQTT Mesh 节点和外部网关设备，持久化到 `/spiffs/device_registry.json`；本节点启动时自动注册自己，收到 `nodes/+/state` 或 `nodes/+/telemetry` 后会更新远端节点在线状态、角色、能力和最近出现时间。
+- 新增本地管理 API：`GET /status`、`GET /devices`、`POST /gateway/ble_mesh/register`、`POST /ota/plan`；`onboard_html` 已加入 Gateway Status、BLE Mesh Device、OTA Gateway Plan 三个管理区块。
+- 新增 LLM/CLI 可调用工具：`gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`，并接入 sandbox、capability family、role-visible profile 和 `context_builder` 提示词。
+- BLE Mesh 目前是 bridge boundary：可以注册设备、生成事件、把 BLE Mesh command 意图发布到 node events 和全局 timeline；但真实 BLE Mesh Provisioner / model send 后端尚未链接，工具会返回 `ESP_ERR_NOT_SUPPORTED` / `not_linked`，不能声称已经物理控制 BLE Mesh 设备。
+- OTA Gateway 当前是 plan-only：Coordinator/管理页/CLI 可以生成结构化升级计划并发布到 timeline，便于 P4/Android 展示；真实升级仍通过串口 `ota_update <https_url>`，远程 OTA 执行还需要 Guardian 审批、镜像来源校验、目标角色校验和进度回传后再开放。
 
 MQTT Mesh topic：
 
@@ -133,7 +156,7 @@ espagent/agent/timeline
 espagent/alerts
 ```
 
-当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并发布 `mesh_command_result`；Control 角色已支持 WS2812/status-light 这类低风险白名单命令并发布结果。其它 node/role command 仍以校验和 dry-run 日志为主，不直接执行硬件动作。Control 角色后续真正开放更多执行器前必须补 command queue、鉴权、审计、message_bus/tool_guard 转发和 safety interlock。
+当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并发布 `mesh_command_result`；Control 角色已支持 WS2812/status-light 这类低风险白名单命令并发布结果。Gateway 侧 BLE Mesh command 当前只登记/发布意图，不做真实 BLE 执行。其它 node/role command 仍以校验和 dry-run 日志为主，不直接执行硬件动作。
 
 Feishu/LLM 通信板的 MQTT 桥接已经进入可编译状态：
 
@@ -153,9 +176,28 @@ Subagent 状态：
 - 2026-06-15 已在 USB0 coordinator 板端完成真实验证：烧录当前固件后启动日志显示 `Registered tool: spawn_subagent`、`Tools JSON built (26 tools)`、`Subagent tools JSON built`；串口执行 `tool_exec spawn_subagent {"task":"Call_get_current_time_and_return_one_sentence"}` 后，子代理完成 LLM tool loop，调用 `get_current_time`，并以 `ESP_OK` 返回当前时间。
 - 2026-06-15 同一 USB0 板端也完成主 `agent_loop` ReAct 验证：串口 `inject_msg system react_test 请调用get_current_time并回复当前时间` 触发 `Tool use iteration 1`，模型调用 `get_current_time({})`，工具返回系统时间后第二轮 LLM 生成最终回复。
 
+Slash command 状态：
+
+- 实现文件：`main/agent/slash_command.c/.h`
+- 接入点：`main/agent/agent_loop.c`
+- 提示词认知：`main/agent/context_builder.c`
+- 当前设计不是给 MCU 做一个通用 shell，而是在 `agent_loop` 前增加一层固定命令语义入口。
+- 已支持的固定命令：
+  - `/help`
+  - `/sensor`
+  - `/control`
+  - `/guardian`
+  - `/subagent`
+  - `/workflow`
+  - `/rule`
+  - `/local`
+- 当前行为：
+  - `/help` 和错误命令直接回复
+  - 其它命令把后续自然语言重写成强约束提示，再复用现有 LLM ReAct/tool/runtime
+
 四角色资源占用快照：
 
-- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像，但会在烧录前写入不同 `node_id` / `role` / capabilities；2026-06-21 最新 Lua runtime 构建 app 二进制约 `0x1902c0` - `0x190310`，2MB app 分区剩余约 `0x6fd00`，约 22%。
+- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像，但会在烧录前写入不同 `node_id` / `role` / capabilities；2026-06-21 加入 Gateway/device_registry/管理 API 后构建 app 二进制约 `0x195920`，2MB app 分区剩余 `0x6a6e0`，约 21%。
 - Coordinator 是当前最重角色，承担 LLM、Feishu WebSocket、WebSocket server、MQTT、SNTP、cron/proactive、session/context 和临时 subagent。USB0 启动日志显示 PSRAM 约 8MB 可用；完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用。
 - Sensor 当前承担 sensor sampling、environment/presence monitor、MQTT telemetry 和串口 CLI，不运行 LLM/Feishu。
 - Control 当前承担控制边界、MQTT command 接收、本地执行器工具和 boot servo demo，不运行 LLM/Feishu。
@@ -241,6 +283,8 @@ Feishu WebSocket 稳定性状态：
 - 2026-06-15 基线测试 `--rounds 5 --interval 6 --settle 40 --quiet` 通过：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃。
 - 2026-06-15 突发测试 `--rounds 5 --interval 1.5 --settle 60 --quiet` 通过：USB0 入队 10/10，USB1 sensor 接收/执行 5/5，USB2 control 接收/执行 5/5，0 崩溃。
 - 2026-06-15 飞书入口压力测试 `tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet` 通过：飞书发送 4/4，USB1 sensor 接收/执行 2/2，USB2 control 接收/执行 2/2，`mesh_command_result_lines=8`，0 崩溃；日志在 `artifacts/feishu_stress/feishu_stress_205412_ttyUSB*.log`。
+- 2026-06-21 最新四板复测：按 `/dev/ttyUSB0-3` 顺序重刷 Coordinator/Sensor/Control/Guardian 后，`tools/verify_roles_usb0_3.py --echo` 四角色身份 PASS；`tools/stress_mesh_usb0_3.py --rounds 5 --interval 1.5 --settle 60 --quiet` 连续两轮 PASS。两轮均为 `sent=10`、`queued_ok=10`、Sensor 接收/执行 `5/5`、Control 接收/执行 `5/5`、Guardian `policy_checks=10`、`policy_decisions=10`、`guardian_audits=10`、`warnings=0`、`errors=0`、`crashes=0`。当前判断：在该压测强度下四角色 MQTT Mesh / Guardian policy / OutputMessage 链路正常。
+- 2026-07-05 USB0 一度因刷写链路异常掉入 bootloader 循环，现象为 `invalid segment length 0xffffffff`、`OTA app partition slot 0 is not bootable`、`No bootable app partitions in the partition table`。已确认不是 slash 功能代码本身造成编译失败，而是增量压缩刷写后的 app 镜像损坏。恢复方式为：跳过 `idf.py flash` 的增量压缩路径，改用原始 `esptool` 对 `/dev/ttyUSB0` 做整板擦除和全量无压缩写入；恢复后 USB0 已重新启动 app，并再次看到 Feishu WS 启动日志。
 - 压测中出现的 AHT10/DHT22/MH-Z19 错误来自当前物理传感器未接入或不可用，不代表 MQTT Mesh 链路失败。
 - Display role 当前可确认 profile 与 state 在线；完整 timeline 订阅、缓存和可视化仍未完成。
 
@@ -573,9 +617,11 @@ ESPAgent/
 |------|------|
 | `main/channels/feishu/feishu_bot.c/.h` | Feishu/Lark WebSocket 接入、事件解析、消息入队、回复发送。 |
 | `main/gateway/ws_server.c/.h` | 本地 WebSocket chat gateway，默认端口 `18789`。 |
+| `main/gateway/ble_mesh_bridge.c/.h` | BLE Mesh bridge boundary：注册外部 BLE Mesh 设备、发布 BLE command 意图到 events/timeline；真实 BLE 后端未链接时返回 `not_linked`。 |
+| `main/device/device_registry.c/.h` | 本地 device registry：持久化已知 MQTT Mesh 节点和外部网关设备，供管理页、Gateway tool、P4/Android 展示使用。 |
 | `main/cli/serial_cli.c/.h` | USB serial CLI，提供配置、诊断、工具直调、注入消息、搜索测试、proactive 测试等命令。 |
-| `main/onboard/wifi_onboard.c/.h` | Wi-Fi onboarding/admin AP。 |
-| `main/onboard/onboard_html.h` | 内嵌 onboarding HTML 页面。 |
+| `main/onboard/wifi_onboard.c/.h` | Wi-Fi onboarding/admin AP；当前也提供 `/status`、`/devices`、`/gateway/ble_mesh/register`、`/ota/plan` 管理 API。 |
+| `main/onboard/onboard_html.h` | 内嵌 onboarding/admin HTML 页面，包含 Wi-Fi/LLM/Feishu/Search/Gateway/BLE/OTA Plan 配置区。 |
 
 ### 存储、记忆、缓存、技能
 
@@ -601,6 +647,7 @@ ESPAgent/
 | `main/drivers/*.c/.h` | 底层驱动：SGP30、AHT10/AHT20、BH1750、MAX98357 等。 |
 | `main/tools/*.c/.h` | AI-callable 工具实现。每个工具做参数解析、边界检查和具体硬件/服务调用。 |
 | `main/tools/tool_registry.c/.h` | 工具注册表、JSON schema 构建、按名字分发执行。 |
+| `main/tools/tool_gateway.c/.h` | Gateway 相关 AI-callable 工具：`gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`。 |
 | `main/tools/tool_subagent.c/.h` | `spawn_subagent` 工具：创建受限 FreeRTOS 子代理，执行独立短 ReAct loop 后同步返回结果。 |
 | `main/tools/gpio_policy.c/.h` | GPIO allowlist 和安全策略。 |
 | `main/sensors/sensor_mqtt.c/.h` | MQTT state/event/telemetry 发布，订阅 node/role command、dispatch、timeline、alerts、policy_check/decision；缓存 OutputMessage 和 policy decision，供 Coordinator 异步回注与 Control 本地校验使用。 |
@@ -887,7 +934,7 @@ Coordinator 发布真正 Mesh command 前，会先发布 `espagent.policy_check.
 }
 ```
 
-Guardian 返回 `espagent.policy_decision.v1`，当前 Coordinator 只在 `decision=allow` 时继续下发真实 command。等待 policy decision 的超时被限制在 1-8 秒之间，避免 LLM 回合被长期阻塞。
+Guardian 返回 `espagent.policy_decision.v1`，当前 Coordinator 只在 `decision=allow` 时继续下发真实 command。等待 policy decision 的单次超时限制在 3-15 秒之间；若未收到 decision，Coordinator 会用同一 `command_id` 幂等重发 `policy_check`，最多 3 次，避免 MQTT/Guardian 瞬时拥塞导致真实允许的命令被误判为失败。
 
 当前安全边界：
 
@@ -1016,14 +1063,15 @@ Flash 配置为 16MB，自定义分区表：
 
 最近构建结果：
 
-- 2026-06-21 最新 Lua runtime 构建 `build/ESPAgent.bin` 约 `0x1902c0` - `0x190310`。
-- 最小 app 分区剩余约 `0x6fd00`，约 22%。
-- `0x16f020` / 约 28% 剩余是 runtime hardware manifest 阶段的历史构建结果，不代表 Lua runtime 合入后的当前体积。
+- 2026-06-21 加入 Gateway/device_registry/管理 API 后，`build/ESPAgent.bin` 约 `0x195920`。
+- 最小 app 分区剩余约 `0x6a6e0`，约 21%。
+- `0x1902c0` - `0x191d40` / 约 22% 剩余是 Lua runtime 和多节点必要性增强阶段的历史构建结果，不代表 Gateway 合入后的当前体积。
 
 OTA 状态：
 
 - 分区表已经是双 app slot：`ota_0` / `ota_1` 各 2MB，`otadata` 记录启动状态。
 - 2026-06-17 已把 `main/ota/ota_manager.c` 编入固件，并在串口 CLI 增加 `ota_info` 和 `ota_update <https_url_to_ESPAgent.bin>`。
+- 2026-06-21 已新增 `ota_gateway_plan` 工具和 `/ota/plan` 管理 API，用于创建结构化 OTA 运维计划并发布到 timeline，供 P4/Android 展示和 Guardian 后续审批链路使用。
 - `ota_update` 只接受 HTTPS URL，使用 ESP-IDF `esp_https_ota` 和系统证书包下载 app `.bin`，成功后自动重启到新分区。
 - OTA 当前不暴露为 LLM/Feishu tool。后续如果要远程触发，必须经过 Guardian policy、人工确认、镜像来源校验和版本/角色校验。
 - Agent 在 OTA 中的定位不是“写新固件代码”或“在 MCU 上编译固件”，而是升级运维编排：开发者或 CI 先准备好 `ESPAgent.bin`，Agent 后续可以负责发现版本、匹配角色、请求 Guardian 审批、询问用户确认、下发 OTA 任务、观察重启和汇总升级结果。
@@ -1100,6 +1148,8 @@ OTA 状态：
 - 2026-06-21 阶段性结论更新：软件侧不再只是工具堆叠，而是进入“每个 ESP32 角色都有 esp-claw-like 单板 Agent runtime，角色间再通过 MQTT Mesh 协作”的架构。当前没有直接把 esp-claw 全量硬件 Lua module 裸接入 ESPAgent；采用的是兼容 ESPAgent 现有 Mesh/Guardian/OutputMessage 的安全重写：Lua 通过 `espagent.call_capability(name, args_json)` 调用现有 capability，仍经过 sandbox、角色权限、Guardian/Mesh/硬件互锁边界；`gpio/i2c/adc/pwm/rmt/ble/display/camera/audio` 等 esp-claw 式直接硬件 module 当前在 `lua_list_modules` 中标记为 `not_linked`，开发者应通过 manifest primitive 或 ESPAgent capability 访问硬件。
 - 2026-06-21 实机部署验证：按 USB0-3 顺序烧录四个 ESP32-S3，USB0=`coordinator_agent`，USB1=`sensor_agent`，USB2=`control_agent`，USB3=`guardian_agent`；`tools/verify_roles_usb0_3.py --echo` 四角色身份检查 PASS。USB0 执行 `tools/test_lua_usb0.py --echo`，在 SNTP 同步后 Lua runtime 完整 smoke 7/7 PASS，覆盖 runtime info、module list、script list、同步脚本、inline source、async job、job list。`tools/test_lua_roles_usb0_3.py` 对四个角色执行 `lua_runtime_info` 与 `lua_run_source`，结果 8/8 PASS，证明 Lua runtime 不只部署在 coordinator。
 - 2026-06-21 esp-claw 优势吸收策略：后续值得迁移的是工程化能力，而不是替换 ESPAgent 架构。优先级包括：Board Descriptor/Board Profile，用结构化方式记录每块 S3/P4 的 pins、sensors、actuators、safe ranges、dangerous actions 和 validation status；Lua package/layout，把 `/spiffs/scripts/builtin/`、`/spiffs/scripts/user/`、`/spiffs/skills/<skill>/scripts/` 区分为内置可信、用户上传和 skill 绑定脚本；Lua module/docs/skill 生成思想，形成“Lua script + manifest primitive + capability schema + skill 文档 + benchmark case”的开发者工具链；Capability lifecycle，为每个 capability 增加 init/start/health_check/stop/benchmark 状态；P4/Android Script Console，用于显示 Lua job、capability list、Guardian decision、benchmark 和 trace。禁止方向：不允许 Lua 裸控 GPIO/I2C/ADC/PWM/RMT/BLE/display/camera/audio 绕过 tool_registry/capability_registry；不允许脚本跳过 sandbox、Guardian、Mesh policy 或 Control interlock；不把 ESPAgent 做成 esp-claw 复制版，项目特色仍是多 ESP32 Agent Mesh、Guardian 权限治理、OutputMessage/ReAct 闭环和可视化推理链路。
+- 2026-06-21 多节点必要性增强第一轮已落地并完成四板实机回归：Sensor 不再只是“读一下传感器”，MQTT telemetry 增加最近采样 ring cache 与 EWMA 滤波输出 `temp_avg`、`humidity_avg`、`light_lux_avg`、`sample_count`，并基于默认阈值 `temperature>35.0C`、`humidity<35%`、`humidity>70%`、`light<10lux` 在状态变化时发布 `espagent.sensor_event.v1` 到 node events、全局 alerts 和 timeline；Control 在远程 actuator 命令执行后发布 `espagent.control_state.v1`，包含 busy、emergency_stop、interlock 和最近动作状态，便于 Android/P4 展示执行器状态；Guardian 的 `policy_decision` 增加 `risk_score` 与 `privacy_mode=metadata_only`，同时订阅 `espagent.../nodes/+/state` 和 `espagent.../nodes/+/telemetry` 聚合 `watchdog_node_state` / `watchdog_node_telemetry` 到 StateBoard。针对实机压测中暴露的 policy 回流拥塞，已补 Guardian watchdog StateBoard 节流、MQTT critical 队列调整和 Coordinator `policy_check` 幂等重试。最新 app 约 `0x191d40`，2MB app 分区剩余约 22%；四角色身份检查 PASS，连续两轮 5 轮 Mesh 压测 PASS。
+- 2026-06-21 参考 Ai-Thinker BLE Mesh Gateway 的强项完成 ESPAgent Gateway 软件侧第一版：新增 `main/device/device_registry.*` 持久化 MQTT Mesh 节点和外部设备；新增 `main/gateway/ble_mesh_bridge.*` 作为 BLE Mesh bridge boundary；新增 `main/tools/tool_gateway.*` 并注册 `gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`；`wifi_onboard` 增加 `/status`、`/devices`、`/gateway/ble_mesh/register`、`/ota/plan` API，`onboard_html` 增加 Gateway/BLE/OTA 管理区。该轮 `idf.py build` PASS，`ESPAgent.bin=0x195920`，app 分区剩余 `0x6a6e0`，约 21%。当前 BLE Mesh 只完成设备登记和命令意图发布，未链接真实 BLE Provisioner 后端；OTA Gateway 只生成计划并发 timeline，未开放远程刷机执行。
 - Feishu 通信板时间同步已补齐：Wi-Fi 连接后启动 SNTP 校时，`get_current_time` 不再优先依赖 Google Date 头；天气工具仍使用高德 `get_weather`，默认南京市栖霞区。
 - 本地私有配置当前已设置为 Feishu/LLM 入口板：`esp32s3-coordinator-01` / `coordinator_agent` / `coordinator,communication,llm,dispatch,timeline,alerts`。
 - 已烧录 coordinator 固件到 `/dev/ttyUSB0`，目标 ESP32-S3 MAC 为 `14:c1:9f:2d:76:20`；串口日志确认 Feishu、LLM、agent_loop 和 coordinator role 均启动，本地 sensor monitor 与 boot servo demo 已按角色跳过。
@@ -1147,6 +1197,7 @@ OTA 状态：
 ### P0
 
 - 持续回归当前软件侧闭环：USB0 Coordinator、USB1 Sensor、USB2 Control、USB3 Guardian、ESP32-P4 Display Terminal。
+- 继续回归本轮多节点自治增强：USB1 telemetry 的 EWMA/threshold 事件、USB2 control_state 快照、USB3 watchdog StateBoard 聚合和 Mesh policy 链路已经通过四板压力测试；下一步重点转向 Android/P4 是否能订阅并稳定显示。
 - 继续实机验证 Control command queue、一次性 `approval_id`、可选 interlock GPIO、emergency stop 和 actuator state 在真实板端的串口/MQTT表现。
 - 验证 ESP32-P4/Android 是否能稳定展示 `policy_check`、`policy_decision`、`mesh_command_queued`、`OutputMessage`、final reply 和 sensor telemetry。
 - 完善 automation rule 管理：自然语言暂停/恢复/删除、状态查询、规则命名、冲突检测和默认任务可视化。

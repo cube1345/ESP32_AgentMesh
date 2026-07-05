@@ -1,0 +1,155 @@
+#include "agent/slash_command.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <string.h>
+
+typedef struct {
+    const char *name;
+    const char *usage;
+    const char *template_text;
+} slash_command_spec_t;
+
+static const slash_command_spec_t s_commands[] = {
+    {
+        .name = "sensor",
+        .usage = "/sensor <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /sensor 指令。请只从 sensor_agent 的职责出发处理这条请求，"
+            "优先使用传感器、环境读取、虚拟只读设备、温湿度、光照、空气质量、人体存在等能力。"
+            "除非用户明确要求，否则不要把任务转成 control_agent 执行器控制。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "control",
+        .usage = "/control <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /control 指令。请只从 control_agent 的职责出发处理这条请求，"
+            "优先使用状态灯、WS2812、GPIO、舵机、继电器、虚拟控制设备等执行能力。"
+            "如果需要远程执行，应优先走 control_agent，而不是本地 coordinator 直接声称已执行。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "guardian",
+        .usage = "/guardian <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /guardian 指令。请只从 guardian_agent 的安全、权限、隐私、审计、策略判断视角处理这条请求。"
+            "重点给出 policy、risk、privacy、approval、sandbox 相关结论。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "subagent",
+        .usage = "/subagent <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /subagent 指令。请优先调用 spawn_subagent 处理下面这个聚焦任务，"
+            "然后由主 Agent 用简短结果总结返回。用户原始请求：%s",
+    },
+    {
+        .name = "workflow",
+        .usage = "/workflow <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /workflow 指令。请优先把下面的请求实现为 deterministic 多步 workflow，"
+            "而不是只执行最后一步。优先考虑 automation_create_workflow。用户原始请求：%s",
+    },
+    {
+        .name = "rule",
+        .usage = "/rule <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /rule 指令。请优先把下面的请求实现为 persistent 条件规则，"
+            "而不是一次性动作。优先考虑 automation_create_rule；若属于持久后台规则，需要明确确认要求。"
+            "用户原始请求：%s",
+    },
+    {
+        .name = "local",
+        .usage = "/local <自然语言任务>",
+        .template_text =
+            "这是一个显式的 /local 指令。请只在当前节点本地处理下面这条请求，"
+            "不要默认路由到其它 AgentMesh 角色。若调用支持 local=true 的工具，应显式使用 local=true。"
+            "用户原始请求：%s",
+    },
+};
+
+static void build_help_text(espagent_slash_result_t *result)
+{
+    if (!result) {
+        return;
+    }
+
+    result->type = ESPAGENT_SLASH_HELP;
+    snprintf(result->command, sizeof(result->command), "help");
+
+    size_t off = 0;
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "Slash commands:\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/help - show slash command help\n");
+    for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]) && off < sizeof(result->text); i++) {
+        off += snprintf(result->text + off, sizeof(result->text) - off,
+                        "%s - %s\n", s_commands[i].usage, s_commands[i].name);
+    }
+    snprintf(result->text + off, sizeof(result->text) - off,
+             "Example: /control 把状态灯设为蓝色");
+}
+
+static const char *skip_spaces(const char *p)
+{
+    while (p && *p && isspace((unsigned char)*p)) {
+        p++;
+    }
+    return p;
+}
+
+bool espagent_slash_try_handle(const char *input, espagent_slash_result_t *result)
+{
+    if (!input || !result) {
+        return false;
+    }
+
+    memset(result, 0, sizeof(*result));
+    const char *p = skip_spaces(input);
+    if (!p || p[0] != '/') {
+        result->type = ESPAGENT_SLASH_NONE;
+        return false;
+    }
+
+    p++;
+    char command[32] = {0};
+    size_t ci = 0;
+    while (*p && !isspace((unsigned char)*p) && ci + 1 < sizeof(command)) {
+        command[ci++] = (char)tolower((unsigned char)*p++);
+    }
+    command[ci] = '\0';
+    p = skip_spaces(p);
+
+    if (command[0] == '\0' || strcmp(command, "help") == 0) {
+        build_help_text(result);
+        return true;
+    }
+
+    for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]); i++) {
+        if (strcmp(command, s_commands[i].name) != 0) {
+            continue;
+        }
+
+        snprintf(result->command, sizeof(result->command), "%s", command);
+        if (!p || p[0] == '\0') {
+            result->type = ESPAGENT_SLASH_ERROR;
+            snprintf(result->text, sizeof(result->text),
+                     "Missing task after /%s.\nUsage: %s",
+                     command, s_commands[i].usage);
+            return true;
+        }
+
+        result->type = ESPAGENT_SLASH_REWRITE;
+        snprintf(result->text, sizeof(result->text),
+                 s_commands[i].template_text, p);
+        return true;
+    }
+
+    result->type = ESPAGENT_SLASH_ERROR;
+    snprintf(result->text, sizeof(result->text),
+             "Unknown slash command: /%s\nUse /help to list supported commands.",
+             command);
+    snprintf(result->command, sizeof(result->command), "%s", command);
+    return true;
+}

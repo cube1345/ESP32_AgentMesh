@@ -39,6 +39,9 @@ static const char *legacy_family_for_tool(const char *name)
     if (streq(name, "mesh_send_command")) {
         return "mesh";
     }
+    if (starts_with(name, "gateway_") || streq(name, "ota_gateway_plan")) {
+        return "gateway";
+    }
     if (streq(name, "spawn_subagent")) {
         return "subagent";
     }
@@ -61,7 +64,8 @@ static const char *legacy_family_for_tool(const char *name)
     }
     if (streq(name, "gpio_write") || streq(name, "ws2812_set") ||
         streq(name, "set_status_light") || streq(name, "servo_write") ||
-        streq(name, "max98357_play_tone") || streq(name, "virtual_device_control")) {
+        streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
+        streq(name, "virtual_device_control")) {
         return "control";
     }
     return "utility";
@@ -84,7 +88,8 @@ static espagent_capability_risk_t legacy_risk_for_tool(const char *name)
     }
     if (streq(name, "gpio_write") || streq(name, "ws2812_set") ||
         streq(name, "set_status_light") || streq(name, "servo_write") ||
-        streq(name, "max98357_play_tone") || streq(name, "virtual_device_control") ||
+        streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
+        streq(name, "virtual_device_control") ||
         starts_with(name, "automation_")) {
         return ESPAGENT_CAP_RISK_CONTROL;
     }

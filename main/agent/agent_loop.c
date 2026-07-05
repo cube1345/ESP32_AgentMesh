@@ -1,9 +1,11 @@
 #include "agent_loop.h"
 #include "agent/context_builder.h"
+#include "agent/slash_command.h"
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
 #include "memory/session_mgr.h"
 #include "proactive/proactive_service.h"
+#include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
 #include "espagent_config.h"
 #include "tools/tool_registry.h"
@@ -1314,6 +1316,37 @@ static void agent_loop_task(void *arg) {
       proactive_service_note_contact(msg.channel, msg.chat_id);
     }
 
+    espagent_slash_result_t slash = {0};
+    if (!proactive_turn && !internal_result_turn &&
+        espagent_slash_try_handle(msg.content, &slash)) {
+      if (slash.type == ESPAGENT_SLASH_HELP || slash.type == ESPAGENT_SLASH_ERROR) {
+        espagent_msg_t out = {0};
+        strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
+        strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
+        out.content = strdup(slash.text);
+        if (out.content) {
+          ESP_LOGI(TAG, "Slash command /%s produced direct reply",
+                   slash.command[0] ? slash.command : "help");
+          (void)message_bus_push_outbound(&out);
+        }
+        free(msg.content);
+        ESP_LOGI(TAG, "Free PSRAM: %d bytes",
+                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        continue;
+      }
+
+      if (slash.type == ESPAGENT_SLASH_REWRITE) {
+        char *rewritten = strdup(slash.text);
+        if (rewritten) {
+          ESP_LOGI(TAG, "Slash command /%s rewrote request", slash.command);
+          free(msg.content);
+          msg.content = rewritten;
+          ESP_LOGI(TAG, "=== CONV === [%s/%s] >> SLASH-REWRITE: %s",
+                   msg.channel, msg.chat_id, msg.content);
+        }
+      }
+    }
+
     /* 1. Build system prompt */
     context_build_system_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE);
     append_turn_context_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, &msg);
@@ -1531,12 +1564,24 @@ esp_err_t agent_loop_init(void) {
 }
 
 esp_err_t agent_loop_start(void) {
-  const uint32_t stack_candidates[] = {
+  const uint32_t coordinator_stack_candidates[] = {
+      16 * 1024, 14 * 1024, 12 * 1024,
+  };
+  const uint32_t default_stack_candidates[] = {
       ESPAGENT_AGENT_STACK, 20 * 1024, 16 * 1024, 14 * 1024, 12 * 1024,
   };
 
-  for (size_t i = 0;
-       i < (sizeof(stack_candidates) / sizeof(stack_candidates[0])); i++) {
+  const uint32_t *stack_candidates = default_stack_candidates;
+  size_t stack_candidate_count =
+      sizeof(default_stack_candidates) / sizeof(default_stack_candidates[0]);
+
+  if (espagent_role_is_coordinator()) {
+    stack_candidates = coordinator_stack_candidates;
+    stack_candidate_count = sizeof(coordinator_stack_candidates) /
+                            sizeof(coordinator_stack_candidates[0]);
+  }
+
+  for (size_t i = 0; i < stack_candidate_count; i++) {
     uint32_t stack_size = stack_candidates[i];
     BaseType_t ret =
         xTaskCreatePinnedToCore(agent_loop_task, "agent_loop", stack_size, NULL,

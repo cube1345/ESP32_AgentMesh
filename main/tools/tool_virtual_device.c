@@ -1226,16 +1226,28 @@ static esp_err_t control_cooldown_check_and_mark(const char *device,
     return ESP_OK;
 }
 
-static esp_err_t parse_uart_command(cJSON *manifest, uint8_t *cmd, size_t *cmd_len)
+static esp_err_t parse_uart_command(cJSON *request,
+                                    cJSON *manifest,
+                                    uint8_t *cmd,
+                                    size_t *cmd_len)
 {
-    cJSON *bytes = cJSON_GetObjectItem(manifest, "command_bytes");
+    cJSON *bytes = cJSON_GetObjectItem(request, "command_bytes");
+    if (!bytes) {
+        bytes = cJSON_GetObjectItem(manifest, "command_bytes");
+    }
     if (bytes) {
         return parse_bytes_limited(bytes, cmd, cmd_len, UART_COMMAND_MAX);
     }
 
-    const char *ascii = json_string(manifest, "command_ascii");
+    const char *ascii = json_string(request, "command_ascii");
     if (!ascii) {
-        cJSON *command = cJSON_GetObjectItem(manifest, "command");
+        ascii = json_string(manifest, "command_ascii");
+    }
+    if (!ascii) {
+        cJSON *command = cJSON_GetObjectItem(request, "command");
+        if (!command) {
+            command = cJSON_GetObjectItem(manifest, "command");
+        }
         ascii = json_string(command, "ascii");
         bytes = cJSON_GetObjectItem(command, "bytes");
         if (bytes) {
@@ -1248,7 +1260,10 @@ static esp_err_t parse_uart_command(cJSON *manifest, uint8_t *cmd, size_t *cmd_l
     }
 
     size_t len = strlen(ascii);
-    const char *terminator = json_string(manifest, "terminator");
+    const char *terminator = json_string(request, "terminator");
+    if (!terminator) {
+        terminator = json_string(manifest, "terminator");
+    }
     size_t term_len = terminator ? strlen(terminator) : 0;
     if (len + term_len > UART_COMMAND_MAX) {
         return ESP_ERR_INVALID_SIZE;
@@ -1296,18 +1311,20 @@ static void format_hex_preview(const uint8_t *data, size_t len, char *out, size_
 }
 
 static esp_err_t execute_uart_manifest(cJSON *manifest,
+                                       cJSON *request,
                                        const virtual_uart_device_t *cfg,
                                        char *output,
                                        size_t output_size)
 {
     uint8_t command[UART_COMMAND_MAX] = {0};
     size_t command_len = 0;
-    esp_err_t err = parse_uart_command(manifest, command, &command_len);
+    esp_err_t err = parse_uart_command(request, manifest, command, &command_len);
     if (err != ESP_OK) {
         snprintf(output, output_size, "Error: invalid UART command for device=%s (%s)",
                  cfg->device, esp_err_to_name(err));
         return err;
     }
+    bool expect_response = json_bool(request, "expect_response", true);
 
     uart_config_t uart_cfg = {
         .baud_rate = cfg->baud,
@@ -1353,6 +1370,27 @@ static esp_err_t execute_uart_manifest(cJSON *manifest,
         if (cfg->post_write_delay_ms > 0) {
             vTaskDelay(pdMS_TO_TICKS(cfg->post_write_delay_ms));
         }
+    }
+
+    if (!expect_response) {
+        uart_wait_tx_done(uart_num, pdMS_TO_TICKS(cfg->timeout_ms));
+        uart_driver_delete(uart_num);
+        char ascii[96] = {0};
+        char hex[160] = {0};
+        format_ascii_preview(command, command_len, ascii, sizeof(ascii));
+        format_hex_preview(command, command_len, hex, sizeof(hex));
+        snprintf(output, output_size,
+                 "OK: virtual_device_read device=%s protocol=uart uart=%d baud=%d TX=%d RX=%d sent_bytes=%u ascii=\"%s\" hex=%s response=skipped",
+                 cfg->device,
+                 cfg->uart_port,
+                 cfg->baud,
+                 cfg->tx_gpio,
+                 cfg->rx_gpio,
+                 (unsigned)command_len,
+                 ascii,
+                 hex[0] ? hex : "(none)");
+        ESP_LOGI(TAG, "virtual_device_read UART send-only status=ESP_OK result=%s", output);
+        return ESP_OK;
     }
 
     uint8_t response[UART_BYTES_MAX] = {0};
@@ -1910,15 +1948,17 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
     }
 
     const char *device = json_string(root, "device");
+    char device_name[DEVICE_NAME_MAX] = {0};
     if (!valid_device_name(device)) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: device must be 1..47 chars using letters, numbers, '_' or '-'");
         return ESP_ERR_INVALID_ARG;
     }
+    snprintf(device_name, sizeof(device_name), "%s", device);
 
     char manifest_path[128] = {0};
     char manifest_buf[MANIFEST_MAX_SIZE] = {0};
-    esp_err_t err = read_manifest(device,
+    esp_err_t err = read_manifest(device_name,
                                   manifest_buf,
                                   sizeof(manifest_buf),
                                   manifest_path,
@@ -1926,17 +1966,17 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
     if (err != ESP_OK) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: cannot read manifest for device=%s at %s (%s)",
-                 device, manifest_path[0] ? manifest_path : ESPAGENT_SPIFFS_BASE "/devices/<device>.json",
+                 device_name, manifest_path[0] ? manifest_path : ESPAGENT_SPIFFS_BASE "/devices/<device>.json",
                  esp_err_to_name(err));
         return err;
     }
 
     char signature_reason[160] = {0};
-    err = verify_manifest_sha256(device, manifest_buf, false, signature_reason, sizeof(signature_reason));
+    err = verify_manifest_sha256(device_name, manifest_buf, false, signature_reason, sizeof(signature_reason));
     if (err != ESP_OK) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: manifest trust check failed for device=%s: %s",
-                 device, signature_reason);
+                 device_name, signature_reason);
         return err;
     }
 
@@ -1950,7 +1990,7 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
 
     const char *protocol = json_string(manifest, "protocol");
     char reason[128] = {0};
-    err = validate_manifest_header(manifest, device, "sensor_agent", "read", reason, sizeof(reason));
+    err = validate_manifest_header(manifest, device_name, "sensor_agent", "read", reason, sizeof(reason));
     if (err != ESP_OK) {
         snprintf(output, output_size, "Error: manifest rejected for device=%s: %s", device, reason);
         cJSON_Delete(manifest);
@@ -1959,37 +1999,37 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
     }
     if (protocol && strcmp(protocol, "i2c") == 0) {
         virtual_i2c_device_t cfg;
-        err = parse_i2c_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_i2c_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
             err = execute_i2c_manifest(manifest, &cfg, output, output_size);
         }
     } else if (protocol && strcmp(protocol, "uart") == 0) {
         virtual_uart_device_t cfg;
-        err = parse_uart_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_uart_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
-            err = execute_uart_manifest(manifest, &cfg, output, output_size);
+            err = execute_uart_manifest(manifest, root, &cfg, output, output_size);
         }
     } else if (protocol && strcmp(protocol, "modbus_rtu") == 0) {
         virtual_modbus_device_t cfg;
-        err = parse_modbus_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_modbus_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
             err = execute_modbus_manifest(&cfg, output, output_size);
         }
     } else if (protocol && strcmp(protocol, "spi") == 0) {
         virtual_spi_device_t cfg;
-        err = parse_spi_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_spi_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
             err = execute_spi_manifest(manifest, &cfg, output, output_size);
         }
     } else if (protocol && strcmp(protocol, "adc") == 0) {
         virtual_adc_device_t cfg;
-        err = parse_adc_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_adc_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
             err = execute_adc_manifest(&cfg, output, output_size);
         }
     } else if (protocol && strcmp(protocol, "gpio_input") == 0) {
         virtual_gpio_input_t cfg;
-        err = parse_gpio_input_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_gpio_input_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
         if (err == ESP_OK) {
             err = execute_gpio_input_manifest(&cfg, output, output_size);
         }
@@ -2001,7 +2041,7 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
     }
     if (err != ESP_OK && output[0] == '\0') {
         snprintf(output, output_size, "Error: manifest rejected for device=%s: %s",
-                 device, reason[0] ? reason : esp_err_to_name(err));
+                 device_name, reason[0] ? reason : esp_err_to_name(err));
     }
 
     cJSON_Delete(manifest);
@@ -2028,15 +2068,17 @@ esp_err_t tool_virtual_device_control_execute(const char *input_json,
     }
 
     const char *device = json_string(root, "device");
+    char device_name[DEVICE_NAME_MAX] = {0};
     if (!valid_device_name(device)) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: device must be 1..47 chars using letters, numbers, '_' or '-'");
         return ESP_ERR_INVALID_ARG;
     }
+    snprintf(device_name, sizeof(device_name), "%s", device);
 
     char manifest_path[128] = {0};
     char manifest_buf[MANIFEST_MAX_SIZE] = {0};
-    esp_err_t err = read_manifest(device,
+    esp_err_t err = read_manifest(device_name,
                                   manifest_buf,
                                   sizeof(manifest_buf),
                                   manifest_path,
@@ -2044,17 +2086,17 @@ esp_err_t tool_virtual_device_control_execute(const char *input_json,
     if (err != ESP_OK) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: cannot read control manifest for device=%s at %s (%s)",
-                 device, manifest_path[0] ? manifest_path : ESPAGENT_SPIFFS_BASE "/devices/<device>.json",
+                 device_name, manifest_path[0] ? manifest_path : ESPAGENT_SPIFFS_BASE "/devices/<device>.json",
                  esp_err_to_name(err));
         return err;
     }
 
     char signature_reason[160] = {0};
-    err = verify_manifest_sha256(device, manifest_buf, true, signature_reason, sizeof(signature_reason));
+    err = verify_manifest_sha256(device_name, manifest_buf, true, signature_reason, sizeof(signature_reason));
     if (err != ESP_OK) {
         cJSON_Delete(root);
         snprintf(output, output_size, "Error: control manifest trust check failed for device=%s: %s",
-                 device, signature_reason);
+                 device_name, signature_reason);
         return err;
     }
 
@@ -2068,16 +2110,16 @@ esp_err_t tool_virtual_device_control_execute(const char *input_json,
 
     char reason[160] = {0};
     virtual_control_device_t cfg;
-    err = validate_manifest_header(manifest, device, "control_agent", "control", reason, sizeof(reason));
+    err = validate_manifest_header(manifest, device_name, "control_agent", "control", reason, sizeof(reason));
     if (err == ESP_OK) {
-        err = parse_control_manifest(manifest, device, &cfg, reason, sizeof(reason));
+        err = parse_control_manifest(manifest, device_name, &cfg, reason, sizeof(reason));
     }
     if (err == ESP_OK) {
         err = execute_control_manifest(&cfg, root, output, output_size);
     }
     if (err != ESP_OK && output[0] == '\0') {
         snprintf(output, output_size, "Error: control manifest rejected for device=%s: %s",
-                 device, reason[0] ? reason : esp_err_to_name(err));
+                 device_name, reason[0] ? reason : esp_err_to_name(err));
     }
 
     cJSON_Delete(manifest);

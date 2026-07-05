@@ -58,18 +58,28 @@ static void event_handler(void *arg, esp_event_base_t event_base,
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         s_connected = false;
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         wifi_event_sta_disconnected_t *disc = (wifi_event_sta_disconnected_t *)event_data;
         if (disc) {
             ESP_LOGW(TAG, "Disconnected (reason=%d:%s)", disc->reason, wifi_reason_to_str(disc->reason));
         }
-        if (s_reconnect_enabled && s_retry_count < ESPAGENT_WIFI_MAX_RETRY) {
+        if (s_reconnect_enabled &&
+            (s_retry_count < ESPAGENT_WIFI_MAX_RETRY || ESPAGENT_WIFI_RETRY_FOREVER)) {
             /* Exponential backoff: 1s, 2s, 4s, 8s, ... capped at 30s */
-            uint32_t delay_ms = ESPAGENT_WIFI_RETRY_BASE_MS << s_retry_count;
+            uint32_t retry_slot = s_retry_count;
+            if (retry_slot >= ESPAGENT_WIFI_MAX_RETRY) {
+                retry_slot = ESPAGENT_WIFI_MAX_RETRY - 1;
+            }
+            uint32_t delay_ms = ESPAGENT_WIFI_RETRY_BASE_MS << retry_slot;
             if (delay_ms > ESPAGENT_WIFI_RETRY_MAX_MS) {
                 delay_ms = ESPAGENT_WIFI_RETRY_MAX_MS;
             }
-            ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
-                     s_retry_count + 1, ESPAGENT_WIFI_MAX_RETRY, delay_ms);
+            if (s_retry_count < ESPAGENT_WIFI_MAX_RETRY) {
+                ESP_LOGW(TAG, "Disconnected, retry %d/%d in %" PRIu32 "ms",
+                         s_retry_count + 1, ESPAGENT_WIFI_MAX_RETRY, delay_ms);
+            } else {
+                ESP_LOGW(TAG, "Disconnected, background retry in %" PRIu32 "ms", delay_ms);
+            }
             s_retry_count++;
             if (!s_reconnect_task) {
                 if (xTaskCreate(reconnect_task, "wifi_reconn", 3072,

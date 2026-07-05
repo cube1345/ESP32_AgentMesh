@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "esp_check.h"
 #include "esp_event.h"
@@ -25,8 +26,10 @@
 #include "channels/feishu/feishu_bot.h"
 #include "cli/serial_cli.h"
 #include "cron/cron_service.h"
+#include "device/device_registry.h"
 #include "dynamic/dynamic_extension.h"
 #include "events/espagent_event.h"
+#include "gateway/ble_mesh_bridge.h"
 #include "gateway/ws_server.h"
 #include "heartbeat/heartbeat.h"
 #include "llm/llm_proxy.h"
@@ -71,9 +74,39 @@ static esp_err_t create_pinned_task(TaskFunction_t task_func,
                                     const char *task_name,
                                     uint32_t stack_bytes,
                                     UBaseType_t priority,
-                                    BaseType_t core_id)
+                                    BaseType_t core_id,
+                                    bool prefer_spiram)
 {
-    BaseType_t ok = xTaskCreatePinnedToCore(
+    BaseType_t ok = pdFAIL;
+
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    if (prefer_spiram) {
+        ok = xTaskCreatePinnedToCoreWithCaps(
+            task_func,
+            task_name,
+            stack_bytes,
+            NULL,
+            priority,
+            NULL,
+            core_id,
+            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (ok == pdPASS) {
+            ESP_LOGI(TAG, "Task %s created with PSRAM stack=%u", task_name, (unsigned)stack_bytes);
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG,
+                 "Task %s PSRAM stack create failed (stack=%u, free_internal=%u, largest_internal=%u), retrying internal RAM",
+                 task_name,
+                 (unsigned)stack_bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+#else
+    (void)prefer_spiram;
+#endif
+
+    ok = xTaskCreatePinnedToCore(
         task_func,
         task_name,
         stack_bytes,
@@ -314,6 +347,8 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(cache_store_init(), TAG, "cache_store_init failed");
     ESP_RETURN_ON_ERROR(skill_loader_init(), TAG, "skill_loader_init failed");
     ESP_RETURN_ON_ERROR(dynamic_extension_init(), TAG, "dynamic_extension_init failed");
+    ESP_RETURN_ON_ERROR(espagent_device_registry_init(), TAG, "device_registry_init failed");
+    ESP_RETURN_ON_ERROR(espagent_ble_mesh_bridge_init(), TAG, "ble_mesh_bridge_init failed");
     ESP_RETURN_ON_ERROR(session_mgr_init(), TAG, "session_mgr_init failed");
     ESP_RETURN_ON_ERROR(wifi_manager_init(), TAG, "wifi_manager_init failed");
     ESP_RETURN_ON_ERROR(http_proxy_init(), TAG, "http_proxy_init failed");
@@ -364,7 +399,8 @@ esp_err_t espagent_app_start_local_services(void)
         ESP_RETURN_ON_ERROR(create_pinned_task(boot_servo_task, "boot_servo",
                                               ESPAGENT_BOOT_SERVO_STACK,
                                               ESPAGENT_BOOT_SERVO_PRIO,
-                                              ESPAGENT_BOOT_SERVO_CORE),
+                                              ESPAGENT_BOOT_SERVO_CORE,
+                                              false),
                             TAG, "boot_servo task failed");
     } else {
         ESP_LOGI(TAG, "Boot servo demo skipped for role=%s", ESPAGENT_NODE_ROLE);
@@ -374,12 +410,14 @@ esp_err_t espagent_app_start_local_services(void)
         ESP_RETURN_ON_ERROR(create_pinned_task(environment_monitor_task, "env_mon",
                                               ESPAGENT_ENVIRONMENT_MONITOR_STACK,
                                               ESPAGENT_ENVIRONMENT_MONITOR_PRIO,
-                                              ESPAGENT_ENVIRONMENT_MONITOR_CORE),
+                                              ESPAGENT_ENVIRONMENT_MONITOR_CORE,
+                                              true),
                             TAG, "env_mon task failed");
         ESP_RETURN_ON_ERROR(create_pinned_task(presence_monitor_task, "presence_mon",
                                               ESPAGENT_PRESENCE_MONITOR_STACK,
                                               ESPAGENT_PRESENCE_MONITOR_PRIO,
-                                              ESPAGENT_PRESENCE_MONITOR_CORE),
+                                              ESPAGENT_PRESENCE_MONITOR_CORE,
+                                              false),
                             TAG, "presence_mon task failed");
 
         if (tool_sgp30_monitor_start() != ESP_OK) {
@@ -415,8 +453,12 @@ esp_err_t espagent_app_connect_wifi_or_onboard(void)
     }
 
 #if ESPAGENT_ONBOARD_ADMIN_AFTER_WIFI
-    if (wifi_onboard_start(WIFI_ONBOARD_MODE_ADMIN) != ESP_OK) {
-        ESP_LOGW(TAG, "Local admin portal unavailable; continuing without config hotspot");
+    if (espagent_role_is_coordinator()) {
+        if (wifi_onboard_start(WIFI_ONBOARD_MODE_ADMIN) != ESP_OK) {
+            ESP_LOGW(TAG, "Local admin portal unavailable; continuing without config hotspot");
+        }
+    } else {
+        ESP_LOGI(TAG, "Local admin portal skipped for role=%s", ESPAGENT_NODE_ROLE);
     }
 #else
     ESP_LOGI(TAG, "Local admin portal disabled after WiFi connect; keeping STA-only mode");
@@ -440,8 +482,23 @@ esp_err_t espagent_app_start_network_services(void)
     ESP_RETURN_ON_ERROR(create_pinned_task(outbound_dispatch_task, "outbound",
                                           ESPAGENT_OUTBOUND_STACK,
                                           ESPAGENT_OUTBOUND_PRIO,
-                                          ESPAGENT_OUTBOUND_CORE),
+                                          ESPAGENT_OUTBOUND_CORE,
+                                          true),
                         TAG, "outbound task failed");
+
+    if (espagent_role_runs_chat_channels()) {
+        ESP_RETURN_ON_ERROR(feishu_bot_start(), TAG, "feishu_bot_start failed");
+        if (espagent_role_is_coordinator()) {
+            esp_err_t feishu_ready_err = feishu_bot_wait_ready(6000);
+            if (feishu_ready_err != ESP_OK) {
+                ESP_LOGW(TAG, "Feishu bootstrap not ready yet: %s", esp_err_to_name(feishu_ready_err));
+            } else {
+                ESP_LOGI(TAG, "Feishu bootstrap made progress before heavier services");
+            }
+        }
+    } else {
+        ESP_LOGI(TAG, "Feishu channel start skipped for role=%s", ESPAGENT_NODE_ROLE);
+    }
 
     ESP_RETURN_ON_ERROR(coordinator_node_start(), TAG, "coordinator_node_start failed");
     ESP_RETURN_ON_ERROR(sensor_node_start(), TAG, "sensor_node_start failed");
@@ -449,46 +506,48 @@ esp_err_t espagent_app_start_network_services(void)
     ESP_RETURN_ON_ERROR(display_node_start(), TAG, "display_node_start failed");
     ESP_RETURN_ON_ERROR(guardian_node_start(), TAG, "guardian_node_start failed");
 
+    ESP_RETURN_ON_ERROR(sensor_mqtt_start(), TAG, "sensor_mqtt_start failed");
+
     if (espagent_role_runs_llm()) {
         ESP_RETURN_ON_ERROR(agent_loop_start(), TAG, "agent_loop_start failed");
     } else {
         ESP_LOGI(TAG, "Agent loop start skipped for role=%s", ESPAGENT_NODE_ROLE);
     }
 
-    if (espagent_role_runs_chat_channels()) {
-        ESP_RETURN_ON_ERROR(feishu_bot_start(), TAG, "feishu_bot_start failed");
-    } else {
-        ESP_LOGI(TAG, "Feishu channel start skipped for role=%s", ESPAGENT_NODE_ROLE);
-    }
-
-    ESP_RETURN_ON_ERROR(sensor_mqtt_start(), TAG, "sensor_mqtt_start failed");
-
     if (espagent_role_runs_scheduler()) {
-        esp_err_t automation_err = automation_engine_start();
-        if (automation_err != ESP_OK) {
-            ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
-        }
+        if (espagent_role_is_coordinator()) {
+            ESP_LOGI(TAG, "Coordinator background scheduler tasks deferred to preserve Feishu/LLM memory headroom");
+        } else {
+            esp_err_t automation_err = automation_engine_start();
+            if (automation_err != ESP_OK) {
+                ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
+            }
 
-        esp_err_t cron_err = cron_service_start();
-        if (cron_err != ESP_OK) {
-            ESP_LOGW(TAG, "Cron service start failed: %s", esp_err_to_name(cron_err));
-        }
+            esp_err_t cron_err = cron_service_start();
+            if (cron_err != ESP_OK) {
+                ESP_LOGW(TAG, "Cron service start failed: %s", esp_err_to_name(cron_err));
+            }
 
-        esp_err_t heartbeat_err = heartbeat_start();
-        if (heartbeat_err != ESP_OK) {
-            ESP_LOGW(TAG, "Heartbeat start failed: %s", esp_err_to_name(heartbeat_err));
-        }
+            esp_err_t heartbeat_err = heartbeat_start();
+            if (heartbeat_err != ESP_OK) {
+                ESP_LOGW(TAG, "Heartbeat start failed: %s", esp_err_to_name(heartbeat_err));
+            }
 
-        esp_err_t proactive_err = proactive_service_start();
-        if (proactive_err != ESP_OK) {
-            ESP_LOGW(TAG, "Proactive service start failed: %s", esp_err_to_name(proactive_err));
+            esp_err_t proactive_err = proactive_service_start();
+            if (proactive_err != ESP_OK) {
+                ESP_LOGW(TAG, "Proactive service start failed: %s", esp_err_to_name(proactive_err));
+            }
         }
     } else {
         ESP_LOGI(TAG, "Scheduler/proactive start skipped for role=%s", ESPAGENT_NODE_ROLE);
     }
 
     if (espagent_role_runs_chat_channels()) {
-        ESP_RETURN_ON_ERROR(ws_server_start(), TAG, "ws_server_start failed");
+        if (espagent_role_is_coordinator()) {
+            ESP_LOGI(TAG, "WebSocket chat gateway deferred on coordinator to preserve Feishu/LLM memory headroom");
+        } else {
+            ESP_RETURN_ON_ERROR(ws_server_start(), TAG, "ws_server_start failed");
+        }
     } else {
         ESP_LOGI(TAG, "WebSocket chat gateway skipped for role=%s", ESPAGENT_NODE_ROLE);
     }

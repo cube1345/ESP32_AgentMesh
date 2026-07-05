@@ -1,15 +1,19 @@
 #include "feishu_bot.h"
 #include "espagent_config.h"
 #include "bus/message_bus.h"
+#include "net/net_guard.h"
 #include "proxy/http_proxy.h"
 #include "sensors/sensor_mqtt.h"
+#include "wifi/wifi_manager.h"
 
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
@@ -29,6 +33,9 @@ static const char *TAG = "feishu";
 #define FEISHU_WS_CONNECT_GRACE_MS 15000
 #define FEISHU_WS_RECONNECT_MIN_MS 3000
 #define FEISHU_WS_RECONNECT_MAX_MS 10000
+#define FEISHU_WS_CONFIG_MIN_INTERNAL_FREE (24 * 1024)
+#define FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL (8 * 1024)
+#define FEISHU_WS_LOW_MEM_BACKOFF_MS 30000
 
 /* ── Credentials & token state ─────────────────────────────── */
 static char s_app_id[64] = ESPAGENT_SECRET_FEISHU_APP_ID;
@@ -43,59 +50,6 @@ static char s_ws_url[512] = {0};
 static int s_ws_ping_interval_ms = 120000;
 static int s_ws_reconnect_interval_ms = 30000;
 
-static void publish_feishu_event(const char *event_type,
-                                 const char *message_id,
-                                 const char *chat_id,
-                                 const char *sender_id,
-                                 const char *text)
-{
-    cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        return;
-    }
-
-    char preview[192] = {0};
-    if (text && text[0]) {
-        size_t text_len = strlen(text);
-        size_t copy_len = text_len > 128 ? 128 : text_len;
-        snprintf(preview, sizeof(preview), "%.*s%s", (int)copy_len, text,
-                 text_len > copy_len ? "..." : "");
-    }
-
-    int64_t ts_ms = esp_timer_get_time() / 1000;
-    cJSON_AddStringToObject(root, "node_id", ESPAGENT_NODE_ID);
-    cJSON_AddStringToObject(root, "role", ESPAGENT_NODE_ROLE);
-    cJSON_AddStringToObject(root, "channel", ESPAGENT_CHAN_FEISHU);
-    cJSON_AddStringToObject(root, "type", "event");
-    cJSON_AddStringToObject(root, "event", event_type ? event_type : "");
-    if (message_id && message_id[0]) {
-        cJSON_AddStringToObject(root, "message_id", message_id);
-    }
-    if (chat_id && chat_id[0]) {
-        cJSON_AddStringToObject(root, "chat_id", chat_id);
-    }
-    if (sender_id && sender_id[0]) {
-        cJSON_AddStringToObject(root, "sender_id", sender_id);
-    }
-    if (preview[0]) {
-        cJSON_AddStringToObject(root, "text_preview", preview);
-        cJSON_AddNumberToObject(root, "text_len", (double)strlen(text));
-    }
-    cJSON_AddNumberToObject(root, "ts_ms", (double)ts_ms);
-
-    char *json = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!json) {
-        return;
-    }
-
-    (void)sensor_mqtt_publish_text(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, json);
-    if (event_type && strcmp(event_type, "feishu_inbound") == 0) {
-        (void)sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_DISPATCH, json);
-        (void)sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_TIMELINE, json);
-    }
-    cJSON_free(json);
-}
 static int s_ws_reconnect_nonce_ms = 30000;
 static int s_ws_service_id = 0;
 
@@ -112,6 +66,18 @@ static int clamp_ws_reconnect_ms(int value_ms)
 static bool s_ws_connected = false;
 
 static void handle_message_event(cJSON *event);
+
+static bool feishu_wait_wifi_stable(uint32_t wait_ms, uint32_t stable_ms)
+{
+    if (!wifi_manager_is_connected()) {
+        ESP_LOGI(TAG, "WiFi not connected, delaying Feishu WS config pull");
+        if (wifi_manager_wait_connected(wait_ms) != ESP_OK) {
+            return false;
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(stable_ms));
+    return wifi_manager_is_connected();
+}
 
 /* ── Message deduplication ─────────────────────────────────── */
 #define FEISHU_DEDUP_CACHE_SIZE 64
@@ -375,7 +341,7 @@ static void feishu_ws_ack_task(void *arg)
 {
     feishu_ws_ack_t *ack_item = (feishu_ws_ack_t *)arg;
     if (!ack_item) {
-        vTaskDelete(NULL);
+        vTaskDeleteWithCaps(NULL);
         return;
     }
 
@@ -389,7 +355,7 @@ static void feishu_ws_ack_task(void *arg)
     }
 
     free(ack_item);
-    vTaskDelete(NULL);
+    vTaskDeleteWithCaps(NULL);
 }
 
 static void feishu_send_ack_async(const ws_frame_t *frame, int code)
@@ -404,12 +370,13 @@ static void feishu_send_ack_async(const ws_frame_t *frame, int code)
     ack_item->frame.payload_len = 0;
     ack_item->code = code;
 
-    BaseType_t ok = xTaskCreate(feishu_ws_ack_task,
-                                "feishu_ack",
-                                ESPAGENT_FEISHU_ACK_STACK,
-                                ack_item,
-                                4,
-                                NULL);
+    BaseType_t ok = xTaskCreateWithCaps(feishu_ws_ack_task,
+                                        "feishu_ack",
+                                        ESPAGENT_FEISHU_ACK_STACK,
+                                        ack_item,
+                                        4,
+                                        NULL,
+                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok != pdPASS) {
         ESP_LOGW(TAG, "Feishu WS ACK task create failed");
         free(ack_item);
@@ -456,7 +423,15 @@ static esp_err_t feishu_get_tenant_token(void)
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_post_field(client, json_str, strlen(json_str));
 
-    esp_err_t err = esp_http_client_perform(client);
+    esp_err_t err = espagent_net_guard_take(20000);
+    if (err == ESP_OK) {
+        if (!wifi_manager_is_connected()) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            err = esp_http_client_perform(client);
+        }
+        espagent_net_guard_give();
+    }
     esp_http_client_cleanup(client);
     free(json_str);
 
@@ -524,7 +499,15 @@ static char *feishu_api_call(const char *url, const char *method, const char *po
         }
     }
 
-    esp_err_t err = esp_http_client_perform(client);
+    esp_err_t err = espagent_net_guard_take(20000);
+    if (err == ESP_OK) {
+        if (!wifi_manager_is_connected()) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            err = esp_http_client_perform(client);
+        }
+        espagent_net_guard_give();
+    }
     esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
@@ -563,6 +546,15 @@ static bool parse_query_param(const char *url, const char *key, char *out, size_
 
 static esp_err_t feishu_pull_ws_config(void)
 {
+    if (!espagent_net_guard_background_allowed(FEISHU_WS_CONFIG_MIN_INTERNAL_FREE,
+                                               FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL)) {
+        ESP_LOGI(TAG,
+                 "WS config postponed: internal_free=%u largest_internal=%u",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+
     cJSON *body = cJSON_CreateObject();
     cJSON_AddStringToObject(body, "AppID", s_app_id);
     cJSON_AddStringToObject(body, "AppSecret", s_app_secret);
@@ -596,15 +588,32 @@ static esp_err_t feishu_pull_ws_config(void)
     esp_http_client_set_header(client, "Content-Type", "application/json");
     esp_http_client_set_header(client, "locale", "zh");
     esp_http_client_set_post_field(client, json_str, strlen(json_str));
-    esp_err_t err = esp_http_client_perform(client);
-    int status = esp_http_client_get_status_code(client);
+    esp_err_t err = espagent_net_guard_take_background(20000,
+                                                       FEISHU_WS_CONFIG_MIN_INTERNAL_FREE,
+                                                       FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL);
+    if (err == ESP_OK) {
+        if (!wifi_manager_is_connected()) {
+            err = ESP_ERR_INVALID_STATE;
+        } else {
+            err = esp_http_client_perform(client);
+        }
+        espagent_net_guard_give();
+    }
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : 0;
     esp_http_client_cleanup(client);
     free(json_str);
 
     if (err != ESP_OK || status != 200) {
-        ESP_LOGE(TAG, "WS config request failed: err=%s http=%d", esp_err_to_name(err), status);
+        if (err == ESP_ERR_NO_MEM) {
+            ESP_LOGI(TAG,
+                     "WS config postponed after guard: internal_free=%u largest_internal=%u",
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        } else {
+            ESP_LOGE(TAG, "WS config request failed: err=%s http=%d", esp_err_to_name(err), status);
+        }
         free(resp.buf);
-        return ESP_FAIL;
+        return err != ESP_OK ? err : ESP_FAIL;
     }
 
     cJSON *root = cJSON_Parse(resp.buf);
@@ -771,15 +780,34 @@ static void feishu_ws_task(void *arg)
 {
     (void)arg;
     while (1) {
-        if (feishu_pull_ws_config() != ESP_OK) {
-            vTaskDelay(pdMS_TO_TICKS(5000));
+        if (!feishu_wait_wifi_stable(10000, 3000)) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        esp_err_t config_err = feishu_pull_ws_config();
+        if (config_err != ESP_OK) {
+            uint32_t delay_ms = config_err == ESP_ERR_NO_MEM
+                                    ? FEISHU_WS_LOW_MEM_BACKOFF_MS
+                                    : 5000U;
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+            continue;
+        }
+
+        size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+        if (largest_internal < ESPAGENT_FEISHU_WS_CLIENT_STACK + 1024) {
+            ESP_LOGW(TAG,
+                     "Feishu WS start postponed: largest_internal=%u required=%u",
+                     (unsigned)largest_internal,
+                     (unsigned)(ESPAGENT_FEISHU_WS_CLIENT_STACK + 1024));
+            vTaskDelay(pdMS_TO_TICKS(s_ws_reconnect_interval_ms));
             continue;
         }
 
         esp_websocket_client_config_t ws_cfg = {
             .uri = s_ws_url,
             .buffer_size = 2048,
-            .task_stack = ESPAGENT_FEISHU_POLL_STACK,
+            .task_stack = ESPAGENT_FEISHU_WS_CLIENT_STACK,
             .reconnect_timeout_ms = s_ws_reconnect_interval_ms,
             .network_timeout_ms = 10000,
             .disable_auto_reconnect = true,
@@ -794,7 +822,11 @@ static void feishu_ws_task(void *arg)
         esp_websocket_register_events(s_ws_client, WEBSOCKET_EVENT_ANY, feishu_ws_event_handler, NULL);
         esp_err_t start_err = esp_websocket_client_start(s_ws_client);
         if (start_err != ESP_OK) {
-            ESP_LOGW(TAG, "Feishu WS start failed: %s", esp_err_to_name(start_err));
+            ESP_LOGW(TAG,
+                     "Feishu WS start failed: %s internal_free=%u largest_internal=%u",
+                     esp_err_to_name(start_err),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
             esp_websocket_client_destroy(s_ws_client);
             s_ws_client = NULL;
             vTaskDelay(pdMS_TO_TICKS(s_ws_reconnect_interval_ms));
@@ -952,10 +984,12 @@ static void handle_message_event(cJSON *event)
     msg.content = strdup(cleaned);
 
     if (msg.content) {
-        publish_feishu_event("feishu_inbound", message_id, route_id, sender_id, cleaned);
         if (message_bus_push_inbound(&msg) != ESP_OK) {
             ESP_LOGW(TAG, "Inbound queue full, dropping feishu message");
             free(msg.content);
+        } else {
+            /* Keep the WS callback lean. Timeline/event publication belongs on the
+             * downstream processing path, not on the constrained websocket task. */
         }
     }
 
@@ -1003,20 +1037,67 @@ esp_err_t feishu_bot_start(void)
         ESP_LOGW(TAG, "Feishu WebSocket task already running");
         return ESP_OK;
     }
-    BaseType_t ok = xTaskCreatePinnedToCore(
+    BaseType_t ok = pdFAIL;
+
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    ok = xTaskCreatePinnedToCoreWithCaps(
         feishu_ws_task,
         "feishu_ws",
-        ESPAGENT_FEISHU_POLL_STACK,
+        ESPAGENT_FEISHU_TASK_STACK,
         NULL,
         ESPAGENT_FEISHU_POLL_PRIO,
         &s_ws_task,
-        ESPAGENT_FEISHU_POLL_CORE);
+        ESPAGENT_FEISHU_POLL_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok == pdPASS) {
+        ESP_LOGI(TAG, "Feishu WS task created with PSRAM stack=%u", (unsigned)ESPAGENT_FEISHU_TASK_STACK);
+    } else {
+        ESP_LOGW(TAG,
+                 "Feishu WS task PSRAM create failed (free_internal=%u largest_internal=%u), retrying internal RAM",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+#endif
+
+    if (ok != pdPASS) {
+        ok = xTaskCreatePinnedToCore(
+            feishu_ws_task,
+            "feishu_ws",
+            ESPAGENT_FEISHU_TASK_STACK,
+            NULL,
+            ESPAGENT_FEISHU_POLL_PRIO,
+            &s_ws_task,
+            ESPAGENT_FEISHU_POLL_CORE);
+    }
     if (ok != pdPASS) {
         s_ws_task = NULL;
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Feishu WebSocket mode enabled");
     return ESP_OK;
+}
+
+esp_err_t feishu_bot_wait_ready(uint32_t timeout_ms)
+{
+    if (s_app_id[0] == '\0' || s_app_secret[0] == '\0') {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    const int64_t deadline_ms = (esp_timer_get_time() / 1000) + (int64_t)timeout_ms;
+    bool bootstrap_seen = false;
+
+    while ((esp_timer_get_time() / 1000) < deadline_ms) {
+        if (s_ws_connected) {
+            return ESP_OK;
+        }
+        if (s_ws_client != NULL || s_ws_url[0] != '\0') {
+            bootstrap_seen = true;
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+
+    return bootstrap_seen ? ESP_ERR_TIMEOUT : ESP_ERR_NOT_FOUND;
 }
 
 esp_err_t feishu_send_message(const char *chat_id, const char *text)

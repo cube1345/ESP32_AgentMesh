@@ -51,7 +51,7 @@ Feishu App (User)
 │                     sendMessage  send              │
 │                                                   │
 │   ┌──────────────────────────────────────────┐    │
-│   │  SPIFFS (12 MB)                          │    │
+│   │  SPIFFS (4 MB)                           │    │
 │   │  /spiffs/config/  SOUL.md, USER.md       │    │
 │   │  /spiffs/memory/  MEMORY.md, YYYY-MM-DD  │    │
 │   │  /spiffs/sessions/ session_<hash>.jsonl  │    │
@@ -76,6 +76,11 @@ Feishu App (User)
 2. Channel client receives message, wraps in espagent_msg_t
 3. Message pushed to Inbound Queue (FreeRTOS xQueue)
 4. Agent Loop (Core 1) pops message:
+   a0. If the message starts with a supported slash command, run slash parsing:
+       - `/help` or invalid slash -> immediate direct reply
+       - `/sensor ...`, `/control ...`, `/guardian ...`, `/subagent ...`,
+         `/workflow ...`, `/rule ...`, `/local ...` -> rewrite to a stronger
+         constrained prompt, then continue
    a. Build system prompt (SOUL.md + USER.md + MEMORY.md + recent notes + tool guidance)
    b. Add current turn context (source channel + chat target)
    c. Load session history from SPIFFS (JSONL)
@@ -122,6 +127,32 @@ firmware checks before Guardian policy and local driver execution.
 
 ---
 
+## Slash Command Layer
+
+ESPAgent now has a small pre-LLM routing layer in `main/agent/slash_command.c`.
+
+Supported commands:
+
+- `/help`
+- `/sensor <task>`
+- `/control <task>`
+- `/guardian <task>`
+- `/subagent <task>`
+- `/workflow <task>`
+- `/rule <task>`
+- `/local <task>`
+
+Behavior:
+
+- `/help`, unknown slash commands, and missing-task cases do not enter the LLM.
+- Routing slash commands rewrite the trailing natural language into a stronger
+  role- or execution-scoped instruction, then pass the rewritten text into the
+  ordinary `agent_loop`.
+- This is not a separate shell. It is a deterministic prompt-routing shim
+  before the existing ReAct/tool path.
+
+---
+
 ## LingShu Agent Mesh Phase 1.6
 
 Current ESPAgent firmware models the ESP32-S3 as one Edge Agent Node in the planned LingShu Agent Mesh. This phase keeps the existing single `agent_loop` runtime, adds node identity, role-gated startup, mesh-style MQTT observability, and a first narrow cross-node command path.
@@ -161,6 +192,12 @@ ESPAgent adopts the useful engineering ideas from esp-claw without replacing the
 Lua scripts run as system-level extensions, but they do not get raw unrestricted hardware authority. Scripts use `require("espagent")` or the global `espagent` table and call `espagent.call_capability(name, args_json)`. That call enters the same ESPAgent capability/tool path used by Serial CLI, LLM tools, Mesh, and automation, so sandbox checks, role policy, Guardian policy, Mesh validation, and Control local interlocks remain authoritative. Direct esp-claw-style hardware modules such as raw GPIO, I2C, ADC, PWM, RMT, BLE, display, camera, or audio are intentionally not linked unless they can be wrapped behind ESPAgent capability/manifest policy.
 
 Current verification status: the latest Lua runtime build fits the 2 MB app slot with about 22% free space, `/dev/ttyUSB0-3` verify as Coordinator/Sensor/Control/Guardian, USB0 Lua smoke passes 7/7 after SNTP sync, and the same Lua runtime info/source smoke passes 8/8 across all four S3 roles. This verifies the managed runtime layer on every role, but it does not imply all physical sensors, actuators, manifest primitives, or display UI bindings have been hardware-tested.
+
+2026-07-05 update: USB0 Coordinator also completed board-side slash command
+verification. `/help` produced a direct reply from the slash layer, and
+`/control set status light blue` rewrote into a constrained control request,
+called `mesh_send_command`, passed Guardian policy, triggered Control execution,
+and returned a structured final reply through OutputMessage reinjection.
 
 The next safe esp-claw-inspired improvements are:
 
@@ -378,8 +415,12 @@ Offset      Size      Name        Purpose
 0x011000     4 KB     phy_init    WiFi PHY calibration
 0x020000     2 MB     ota_0       Firmware slot A
 0x220000     2 MB     ota_1       Firmware slot B
-0x420000    12 MB     spiffs      Markdown memory, sessions, config
-0xFF0000    64 KB     coredump    Crash dump storage
+0x420000     4 MB     spiffs      Markdown memory, sessions, config
+0x820000    64 KB     coredump    Crash dump storage
+
+The remaining flash space is intentionally left unallocated for future data
+partitions or growth, while keeping the default role firmware burn path much
+faster than a 12 MB SPIFFS image.
 ```
 
 Total: 16 MB flash.

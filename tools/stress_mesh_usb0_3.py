@@ -208,18 +208,18 @@ def request_config(states: dict[int, PortState]) -> None:
         state.node_id = node_match.group(1) if node_match else None
 
 
-def build_commands(rounds: int) -> list[str]:
+def build_commands(rounds: int, run_id: str) -> list[str]:
     colors = ["blue", "green", "red", "cyan", "purple", "white"]
     commands: list[str] = []
     for i in range(1, rounds + 1):
         sensor_cmd = {
             "action": "read_temperature_humidity",
-            "command_id": f"stress-sensor-{i}",
+            "command_id": f"{run_id}-sensor-{i}",
             "args": {},
         }
         control_cmd = {
             "action": "set_status_light",
-            "command_id": f"stress-control-{i}",
+            "command_id": f"{run_id}-control-{i}",
             "args": {"color": colors[(i - 1) % len(colors)]},
             "safety_level": 1,
         }
@@ -228,45 +228,108 @@ def build_commands(rounds: int) -> list[str]:
     return commands
 
 
-def count_ids_near_marker(text: str, prefix: str, rounds: int, marker: str, window: int = 768) -> int:
+def count_ids_in_lines(lines: list[str], prefix: str, rounds: int, marker: str) -> int:
     count = 0
     for i in range(1, rounds + 1):
         command_id = f"{prefix}-{i}"
-        id_positions = [m.start() for m in re.finditer(re.escape(command_id), text)]
-        marker_positions = [m.start() for m in re.finditer(re.escape(marker), text)]
-        if not id_positions or not marker_positions:
-            continue
-        if not any(abs(id_pos - marker_pos) <= window for id_pos in id_positions for marker_pos in marker_positions):
-            continue
-        count += 1
+        if any(marker in line and command_id in line for line in lines):
+            count += 1
     return count
 
 
-def final_metrics(states: dict[int, PortState], rounds: int, live: Metrics) -> Metrics:
+def count_command_ids_in_lines(lines: list[str], command_ids: list[str], marker: str) -> int:
+    return sum(1 for command_id in command_ids
+               if any(marker in line and command_id in line for line in lines))
+
+
+def missing_ids_in_lines(lines: list[str], command_ids: list[str], marker: str) -> list[str]:
+    return [command_id for command_id in command_ids
+            if not any(marker in line and command_id in line for line in lines)]
+
+
+def id_near_marker(text: str, command_id: str, marker: str, window: int = 4096) -> bool:
+    id_positions = [m.start() for m in re.finditer(re.escape(command_id), text)]
+    marker_positions = [m.start() for m in re.finditer(re.escape(marker), text)]
+    return bool(id_positions and marker_positions and
+                any(abs(id_pos - marker_pos) <= window
+                    for id_pos in id_positions
+                    for marker_pos in marker_positions))
+
+
+def command_id_from_tool_command(command: str) -> str:
+    try:
+        payload = command.split(" ", 2)[2]
+        data = json.loads(payload)
+        value = data.get("command_id", "")
+        return value if isinstance(value, str) else ""
+    except (IndexError, json.JSONDecodeError, TypeError):
+        return ""
+
+
+def coordinator_ack_seen(coordinator: PortState, command_id: str) -> bool:
+    if not command_id:
+        return True
+    markers = (
+        "OK: queued MQTT mesh command",
+        "Error: Guardian policy blocked mesh command",
+        "Error: MQTT is not connected for mesh dispatch",
+        "Error: failed to queue MQTT mesh command",
+        "tool_exec status:",
+    )
+    return any(id_near_marker(coordinator.text, command_id, marker) for marker in markers)
+
+
+def drain_until_command_ack(states: dict[int, PortState],
+                            coordinator: PortState,
+                            command_id: str,
+                            timeout_s: float,
+                            echo: bool,
+                            metrics: Metrics) -> None:
+    end = time.time() + timeout_s
+    while time.time() < end:
+        drain(states, 0.2, echo=echo, metrics=metrics)
+        if coordinator_ack_seen(coordinator, command_id):
+            return
+
+
+def final_metrics(states: dict[int, PortState], rounds: int, live: Metrics, run_id: str) -> Metrics:
     result = Metrics(
         sent=live.sent,
         warnings=live.warnings,
         errors=live.errors,
         crashes=live.crashes,
     )
-    usb0 = next(s for s in states.values() if s.port == "/dev/ttyUSB0").text
-    usb1 = next(s for s in states.values() if s.port == "/dev/ttyUSB1").text
-    usb2 = next(s for s in states.values() if s.port == "/dev/ttyUSB2").text
+    usb0_state = next(s for s in states.values() if s.port == "/dev/ttyUSB0")
+    usb1_state = next(s for s in states.values() if s.port == "/dev/ttyUSB1")
+    usb2_state = next(s for s in states.values() if s.port == "/dev/ttyUSB2")
+    usb0 = usb0_state.text
+    usb1 = usb1_state.text
+    usb2 = usb2_state.text
     all_text = "\n".join(s.text for s in states.values())
+    command_ids = (
+        [f"{run_id}-sensor-{i}" for i in range(1, rounds + 1)]
+        + [f"{run_id}-control-{i}" for i in range(1, rounds + 1)]
+    )
 
-    result.queued_ok = (
-        count_ids_near_marker(usb0, "stress-sensor", rounds, "OK: queued MQTT mesh command")
-        + count_ids_near_marker(usb0, "stress-control", rounds, "OK: queued MQTT mesh command")
+    queued_markers = (
+        "OK: queued MQTT mesh command",
+        "OK: mesh command completed",
+    )
+    result.queued_ok = sum(
+        1 for command_id in command_ids
+        if any(marker in line and command_id in line
+               for line in usb0_state.lines
+               for marker in queued_markers)
     )
     result.queued_error = usb0.count("Error: failed to queue MQTT mesh command")
-    result.sensor_received = count_ids_near_marker(usb1, "stress-sensor", rounds, "Mesh role command received for sensor_agent")
-    result.sensor_executed = count_ids_near_marker(usb1, "stress-sensor", rounds, "Mesh sensor command executed")
-    result.control_received = count_ids_near_marker(usb2, "stress-control", rounds, "Mesh role command received for control_agent")
-    result.control_executed = count_ids_near_marker(usb2, "stress-control", rounds, "Mesh control command executed")
-    usb3 = next(s for s in states.values() if s.port == "/dev/ttyUSB3").text
-    result.policy_checks = usb3.count("Policy check received")
-    result.policy_decisions = usb3.count("Guardian policy decision:")
-    result.guardian_audits = usb3.count("Guardian audited timeline event:")
+    result.sensor_received = count_ids_in_lines(usb1_state.lines, f"{run_id}-sensor", rounds, "Mesh role command received for sensor_agent")
+    result.sensor_executed = count_ids_in_lines(usb1_state.lines, f"{run_id}-sensor", rounds, "Mesh sensor command executed")
+    result.control_received = count_ids_in_lines(usb2_state.lines, f"{run_id}-control", rounds, "Mesh role command received for control_agent")
+    result.control_executed = count_ids_in_lines(usb2_state.lines, f"{run_id}-control", rounds, "Mesh control command executed")
+    usb3_state = next(s for s in states.values() if s.port == "/dev/ttyUSB3")
+    result.policy_checks = count_command_ids_in_lines(usb3_state.lines, command_ids, "Policy check received")
+    result.policy_decisions = count_command_ids_in_lines(usb3_state.lines, command_ids, "Guardian policy decision:")
+    result.guardian_audits = count_command_ids_in_lines(usb3_state.lines, command_ids, "Guardian audited timeline event:")
     result.command_results = all_text.count("mesh_command_result")
     result.mqtt_state = all_text.count('"state":"online"')
     result.mqtt_inbound = all_text.count("MQTT inbound") + all_text.count("Mesh dispatch received") + all_text.count("Mesh alert received")
@@ -295,6 +358,7 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=1.5, help="seconds between commands")
     parser.add_argument("--settle", type=float, default=25.0, help="extra seconds after last command")
     parser.add_argument("--quiet", action="store_true", help="do not print live interesting lines")
+    parser.add_argument("--run-id", default="", help="short unique command-id prefix; generated when omitted")
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -312,21 +376,33 @@ def main() -> int:
         roles_ok = print_config_summary(states)
 
         coordinator = next(s for s in states.values() if s.port == "/dev/ttyUSB0")
-        commands = build_commands(args.rounds)
+        run_id = args.run_id.strip() or f"st{int(time.time() * 1000) & 0xffffffff:08x}"
+        commands = build_commands(args.rounds, run_id)
+        command_ids = (
+            [f"{run_id}-sensor-{i}" for i in range(1, args.rounds + 1)]
+            + [f"{run_id}-control-{i}" for i in range(1, args.rounds + 1)]
+        )
         print("===== command phase =====")
+        print(f"run_id={run_id}")
         print(f"Sending {len(commands)} mesh commands from USB0: {args.rounds} sensor + {args.rounds} control")
 
         for index, command in enumerate(commands, start=1):
             metrics.sent += 1
             print(f"SEND {index}/{len(commands)}: {command.strip()}")
             write_line(coordinator, command)
-            drain(states, args.interval, echo=not args.quiet, metrics=metrics)
+            command_id = command_id_from_tool_command(command)
+            drain_until_command_ack(states,
+                                    coordinator,
+                                    command_id,
+                                    max(args.interval, 8.0),
+                                    echo=not args.quiet,
+                                    metrics=metrics)
 
         print(f"===== settle {args.settle:.1f}s =====")
         drain(states, args.settle, echo=not args.quiet, metrics=metrics)
 
         expected_each = args.rounds
-        metrics = final_metrics(states, args.rounds, metrics)
+        metrics = final_metrics(states, args.rounds, metrics, run_id)
         print("===== metrics =====")
         print(f"sent={metrics.sent}")
         print(f"queued_ok={metrics.queued_ok} queued_error={metrics.queued_error}")
@@ -336,6 +412,58 @@ def main() -> int:
         print(f"mesh_command_result_lines={metrics.command_results}")
         print(f"mqtt_state_lines={metrics.mqtt_state} mqtt_inbound_lines={metrics.mqtt_inbound}")
         print(f"warnings={metrics.warnings} errors={metrics.errors} crashes={metrics.crashes}")
+
+        missing_queued = [
+            command_id for command_id in command_ids
+            if not any(marker in line and command_id in line
+                       for line in coordinator.lines
+                       for marker in ("OK: queued MQTT mesh command", "OK: mesh command completed"))
+        ]
+        missing_sensor_received = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB1").lines,
+            [f"{run_id}-sensor-{i}" for i in range(1, args.rounds + 1)],
+            "Mesh role command received for sensor_agent")
+        missing_sensor_executed = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB1").lines,
+            [f"{run_id}-sensor-{i}" for i in range(1, args.rounds + 1)],
+            "Mesh sensor command executed")
+        missing_control_received = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB2").lines,
+            [f"{run_id}-control-{i}" for i in range(1, args.rounds + 1)],
+            "Mesh role command received for control_agent")
+        missing_control_executed = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB2").lines,
+            [f"{run_id}-control-{i}" for i in range(1, args.rounds + 1)],
+            "Mesh control command executed")
+        missing_policy_checks = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB3").lines,
+            command_ids,
+            "Policy check received")
+        missing_policy_decisions = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB3").lines,
+            command_ids,
+            "Guardian policy decision:")
+        missing_guardian_audits = missing_ids_in_lines(
+            next(s for s in states.values() if s.port == "/dev/ttyUSB3").lines,
+            command_ids,
+            "Guardian audited timeline event:")
+        if any((missing_queued,
+                missing_sensor_received,
+                missing_sensor_executed,
+                missing_control_received,
+                missing_control_executed,
+                missing_policy_checks,
+                missing_policy_decisions,
+                missing_guardian_audits)):
+            print("===== missing ids =====")
+            print(f"queued={missing_queued}")
+            print(f"sensor_received={missing_sensor_received}")
+            print(f"sensor_executed={missing_sensor_executed}")
+            print(f"control_received={missing_control_received}")
+            print(f"control_executed={missing_control_executed}")
+            print(f"policy_checks={missing_policy_checks}")
+            print(f"policy_decisions={missing_policy_decisions}")
+            print(f"guardian_audits={missing_guardian_audits}")
 
         pass_basic = (
             roles_ok
@@ -348,6 +476,7 @@ def main() -> int:
             and metrics.policy_checks >= len(commands)
             and metrics.policy_decisions >= len(commands)
             and metrics.guardian_audits >= len(commands)
+            and metrics.errors == 0
             and metrics.crashes == 0
         )
         print("RESULT:", "PASS" if pass_basic else "FAIL")

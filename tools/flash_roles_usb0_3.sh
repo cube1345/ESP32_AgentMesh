@@ -9,6 +9,7 @@ IDF_PATH="${IDF_PATH:-/home/cube/WorkSpace/ESP/esp-idf}"
 IDF_PYTHON_ENV_PATH="${IDF_PYTHON_ENV_PATH:-/home/cube/.espressif/python_env/idf6.1_py3.13_env}"
 IDF_PYTHON="${IDF_PYTHON:-${IDF_PYTHON_ENV_PATH}/bin/python}"
 ESPAGENT_FLASH_BAUD="${ESPAGENT_FLASH_BAUD:-}"
+ESPAGENT_FLASH_MODE="${ESPAGENT_FLASH_MODE:-app}"
 ESPAGENT_ERASE_BEFORE_FLASH="${ESPAGENT_ERASE_BEFORE_FLASH:-0}"
 export ESP_IDF_VERSION="${ESP_IDF_VERSION:-6.1.0}"
 export IDF_PATH
@@ -77,6 +78,39 @@ require_fixed_usb_port() {
   require_file "$port"
 }
 
+flash_target_for_mode() {
+  case "$ESPAGENT_FLASH_MODE" in
+    app)
+      printf '%s' "app-flash"
+      ;;
+    full)
+      printf '%s' "flash"
+      ;;
+    spiffs)
+      printf '%s' "__spiffs_manual__"
+      ;;
+    *)
+      echo "ERROR: unsupported ESPAGENT_FLASH_MODE=${ESPAGENT_FLASH_MODE}; use app, full, or spiffs" >&2
+      exit 1
+      ;;
+  esac
+}
+
+spiffs_offset_hex() {
+  awk -F',' '
+    $1 !~ /^[[:space:]]*#/ {
+      name=$1
+      gsub(/[[:space:]]/, "", name)
+      if (name == "spiffs") {
+        offset=$4
+        gsub(/[[:space:]]/, "", offset)
+        print offset
+        exit
+      }
+    }
+  ' "$ROOT_DIR/partitions.csv"
+}
+
 set_profile() {
   local node_id="$1"
   local node_role="$2"
@@ -116,10 +150,17 @@ flash_one() {
   local node_role="${NODE_ROLES[$index]}"
   local capabilities="${NODE_CAPABILITIES[$index]}"
   local responsibilities="${NODE_RESPONSIBILITIES[$index]}"
+  local flash_target
+  local flash_label
+  flash_target="$(flash_target_for_mode)"
+  flash_label="$flash_target"
+  if [[ "$flash_target" == "__spiffs_manual__" ]]; then
+    flash_label="spiffs"
+  fi
 
   require_file "$port"
   echo
-  echo "==> Flashing USB${index}: ${port} -> ${node_id} / ${node_role}"
+  echo "==> Flashing USB${index}: ${port} -> ${node_id} / ${node_role} (mode=${ESPAGENT_FLASH_MODE}, target=${flash_label})"
   set_profile "$node_id" "$node_role" "$capabilities" "$responsibilities"
 
   if [[ "${ESPAGENT_FLASH_FULLCLEAN:-0}" == "1" ]]; then
@@ -127,6 +168,10 @@ flash_one() {
   fi
 
   if [[ "$ESPAGENT_ERASE_BEFORE_FLASH" == "1" ]]; then
+    if [[ "$ESPAGENT_FLASH_MODE" != "full" ]]; then
+      echo "ERROR: ESPAGENT_ERASE_BEFORE_FLASH=1 requires ESPAGENT_FLASH_MODE=full" >&2
+      exit 1
+    fi
     echo "==> Erasing flash on ${port} before flashing"
     if [[ -n "$ESPAGENT_FLASH_BAUD" ]]; then
       (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" -p "$port" -b "$ESPAGENT_FLASH_BAUD" erase-flash)
@@ -135,10 +180,25 @@ flash_one() {
     fi
   fi
 
-  if [[ -n "$ESPAGENT_FLASH_BAUD" ]]; then
-    (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" -p "$port" -b "$ESPAGENT_FLASH_BAUD" flash)
+  if [[ "$flash_target" == "__spiffs_manual__" ]]; then
+    local spiffs_offset
+    spiffs_offset="$(spiffs_offset_hex)"
+    if [[ -z "$spiffs_offset" ]]; then
+      echo "ERROR: failed to resolve spiffs offset from partitions.csv" >&2
+      exit 1
+    fi
+
+    (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" build)
+
+    if [[ -n "$ESPAGENT_FLASH_BAUD" ]]; then
+      (cd "$ROOT_DIR" && "$IDF_PYTHON" -m esptool --chip esp32s3 -p "$port" -b "$ESPAGENT_FLASH_BAUD" --before default-reset --after hard-reset write-flash "$spiffs_offset" build/spiffs.bin)
+    else
+      (cd "$ROOT_DIR" && "$IDF_PYTHON" -m esptool --chip esp32s3 -p "$port" --before default-reset --after hard-reset write-flash "$spiffs_offset" build/spiffs.bin)
+    fi
+  elif [[ -n "$ESPAGENT_FLASH_BAUD" ]]; then
+    (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" -p "$port" -b "$ESPAGENT_FLASH_BAUD" "$flash_target")
   else
-    (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" -p "$port" flash)
+    (cd "$ROOT_DIR" && "$IDF_PYTHON" "$IDF_PATH/tools/idf.py" -p "$port" "$flash_target")
   fi
 }
 
@@ -177,4 +237,4 @@ rm -f "$BACKUP_FILE"
 trap - ERR INT TERM
 
 echo
-echo "OK: flashed role index(es): ${SELECTED_INDICES[*]}. main/espagent_secrets.h restored to coordinator_agent profile."
+echo "OK: flashed role index(es): ${SELECTED_INDICES[*]} with mode=${ESPAGENT_FLASH_MODE}. main/espagent_secrets.h restored to coordinator_agent profile."

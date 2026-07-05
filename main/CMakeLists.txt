@@ -5,11 +5,14 @@ set(ESPAGENT_CORE_SRCS
     "bus/message_bus.c"
     "time_sync/time_sync.c"
     "wifi/wifi_manager.c"
+    "net/net_guard.c"
+    "device/device_registry.c"
 )
 
 set(ESPAGENT_AGENT_SRCS
     "agent/agent_loop.c"
     "agent/context_builder.c"
+    "agent/slash_command.c"
     "capability/capability_registry.c"
     "capability/role_capability_profile.c"
     "events/espagent_event.c"
@@ -42,6 +45,7 @@ set(ESPAGENT_MESH_ROLE_SRCS
 set(ESPAGENT_CHANNEL_SRCS
     "channels/feishu/feishu_bot.c"
     "gateway/ws_server.c"
+    "gateway/ble_mesh_bridge.c"
     "cli/serial_cli.c"
     "proxy/http_proxy.c"
     "onboard/wifi_onboard.c"
@@ -64,6 +68,7 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_web_search.c"
     "tools/tool_get_time.c"
     "tools/tool_lua.c"
+    "tools/tool_gateway.c"
     "tools/tool_files.c"
     "tools/tool_mesh_command.c"
     "tools/tool_virtual_device.c"
@@ -77,6 +82,7 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_hc_sr05.c"
     "tools/tool_sgp30.c"
     "tools/tool_bh1750.c"
+    "tools/tool_gree_ac.c"
 )
 
 set(ESPAGENT_DRIVER_SRCS
@@ -84,6 +90,7 @@ set(ESPAGENT_DRIVER_SRCS
     "drivers/max98357.c"
     "drivers/sgp30.c"
     "drivers/bh1750.c"
+    "drivers/gree_ir.c"
 )
 
 idf_component_register(

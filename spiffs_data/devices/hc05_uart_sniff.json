@@ -1,0 +1,27 @@
+{
+  "manifest_version": 1,
+  "name": "hc05_uart_sniff",
+  "protocol": "uart",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "tx": 17,
+    "rx": 16
+  },
+  "uart_port": 2,
+  "baud": 9600,
+  "data_bits": 8,
+  "stop_bits": 1,
+  "parity": "none",
+  "read_length": 64,
+  "timeout_ms": 3000,
+  "post_write_delay_ms": 0,
+  "notes": "Passive HC-05 UART data-mode sniff. No command is sent. Trigger a bounded read window and collect bytes arriving from the paired phone app."
+}
