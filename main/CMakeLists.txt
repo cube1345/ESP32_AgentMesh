@@ -5,6 +5,7 @@ set(ESPAGENT_CORE_SRCS
     "bus/message_bus.c"
     "time_sync/time_sync.c"
     "voice/voice_bridge.c"
+    "voice/local_tts.c"
     "wifi/wifi_manager.c"
     "net/net_guard.c"
     "device/device_registry.c"

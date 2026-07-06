@@ -39,6 +39,7 @@
 #include "onboard/wifi_onboard.h"
 #include "proactive/proactive_service.h"
 #include "voice/voice_bridge.h"
+#include "voice/local_tts.h"
 #include "proxy/http_proxy.h"
 #include "roles/control_node.h"
 #include "roles/coordinator_node.h"
@@ -319,6 +320,13 @@ static void outbound_dispatch_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "Feishu send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                 publish_feishu_outbound_event(msg.chat_id, msg.content, "send_ok");
+                if (espagent_voice_local_tts_enabled()) {
+                    char diag[192];
+                    esp_err_t tts_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
+                    ESP_LOGI(TAG, "Local S3 TTS after Feishu reply -> %s (%s)",
+                             esp_err_to_name(tts_err),
+                             diag[0] ? diag : "no detail");
+                }
             }
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_WEBSOCKET) == 0) {
             esp_err_t ws_err = ws_server_send(msg.chat_id, msg.content);
@@ -328,6 +336,13 @@ static void outbound_dispatch_task(void *arg)
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
             ESP_LOGI(TAG, "Voice outbound handled via MQTT TTS bridge [%s]: %.96s",
                      msg.chat_id, msg.content);
+            if (espagent_voice_local_tts_enabled()) {
+                char diag[192];
+                esp_err_t tts_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
+                ESP_LOGI(TAG, "Local S3 TTS on voice channel -> %s (%s)",
+                         esp_err_to_name(tts_err),
+                         diag[0] ? diag : "no detail");
+            }
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);
         } else {
