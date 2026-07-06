@@ -180,7 +180,7 @@ replacements = {
 
 for key, value in replacements.items():
     if re.fullmatch(r"-?\d+", value):
-        pattern = rf'(#define\s+{re.escape(key)}\s+)\(?-?\d+\)?\b'
+        pattern = rf'(#define\s+{re.escape(key)}\s+)\(?-?\d+\)?'
         text, count = re.subn(pattern, rf'\g<1>{value}', text, count=1)
     else:
         pattern = rf'(#define\s+{re.escape(key)}\s+)".*?"'

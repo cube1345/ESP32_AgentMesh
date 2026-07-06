@@ -8,6 +8,11 @@ esp_err_t espagent_voice_publish_tts_request(const char *text,
                                              const char *source_channel,
                                              const char *chat_id,
                                              const char *trace_id);
+esp_err_t espagent_voice_publish_tts_request_to_device(const char *text,
+                                                       const char *device_id,
+                                                       const char *source_channel,
+                                                       const char *chat_id,
+                                                       const char *trace_id);
 
 esp_err_t espagent_voice_publish_stt_request(const char *session_id,
                                              const char *reply_channel,

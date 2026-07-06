@@ -10,7 +10,30 @@ typedef struct {
     const char *template_text;
 } slash_command_spec_t;
 
+static bool is_action_command(const char *command)
+{
+    return command &&
+           (strcmp(command, "clear") == 0 ||
+            strcmp(command, "clear_all_memory") == 0 ||
+            strcmp(command, "context_status") == 0);
+}
+
 static const slash_command_spec_t s_commands[] = {
+    {
+        .name = "clear",
+        .usage = "/clear",
+        .template_text = NULL,
+    },
+    {
+        .name = "clear_all_memory",
+        .usage = "/clear_all_memory",
+        .template_text = NULL,
+    },
+    {
+        .name = "context_status",
+        .usage = "/context_status",
+        .template_text = NULL,
+    },
     {
         .name = "sensor",
         .usage = "/sensor <自然语言任务>",
@@ -171,6 +194,12 @@ static void build_help_text(espagent_slash_result_t *result)
                     "Slash commands:\n");
     off += snprintf(result->text + off, sizeof(result->text) - off,
                     "/help - show slash command help\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/clear - clear current chat_id session/history/brief/trace\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/clear_all_memory - clear session + MEMORY/profile/skills/trace\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/context_status - show current chat_id history/brief/trace usage\n");
     for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]) && off < sizeof(result->text); i++) {
         off += snprintf(result->text + off, sizeof(result->text) - off,
                         "%s - %s\n", s_commands[i].usage, s_commands[i].name);
@@ -220,6 +249,12 @@ bool espagent_slash_try_handle(const char *input, espagent_slash_result_t *resul
         }
 
         snprintf(result->command, sizeof(result->command), "%s", command);
+        if (is_action_command(command)) {
+            result->type = ESPAGENT_SLASH_ACTION;
+            snprintf(result->text, sizeof(result->text), "%s", command);
+            return true;
+        }
+
         if (!p || p[0] == '\0') {
             result->type = ESPAGENT_SLASH_ERROR;
             snprintf(result->text, sizeof(result->text),

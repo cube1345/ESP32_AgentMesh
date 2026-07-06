@@ -165,6 +165,91 @@ static size_t append_brief_line(char *buf, size_t size, size_t off, const char *
     return off + (size_t)n;
 }
 
+static int count_lines_in_file(const char *path)
+{
+    if (!path || path[0] == '\0') {
+        return -1;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return -1;
+    }
+
+    int count = 0;
+    int c = 0;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') {
+            count++;
+        }
+    }
+    fclose(f);
+    return count;
+}
+
+static long file_size_bytes(const char *path)
+{
+    if (!path || path[0] == '\0') {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return -1;
+    }
+    return (long)st.st_size;
+}
+
+static esp_err_t remove_if_exists(const char *path, bool *removed)
+{
+    if (!path || path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (remove(path) == 0) {
+        if (removed) {
+            *removed = true;
+        }
+        return ESP_OK;
+    }
+    return ESP_ERR_NOT_FOUND;
+}
+
+static esp_err_t clear_matching_session_store_files(void)
+{
+    DIR *dir = opendir(ESPAGENT_SPIFFS_SESSION_DIR);
+    if (!dir) {
+        dir = opendir(ESPAGENT_SPIFFS_BASE);
+        if (!dir) {
+            return ESP_ERR_NOT_FOUND;
+        }
+    }
+
+    bool removed = false;
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        bool match = (strncmp(entry->d_name, "session_", 8) == 0 &&
+                      strstr(entry->d_name, ".jsonl") != NULL) ||
+                     (strncmp(entry->d_name, "trace_", 6) == 0 &&
+                      strstr(entry->d_name, ".jsonl") != NULL) ||
+                     (strncmp(entry->d_name, "brief_", 6) == 0 &&
+                      strstr(entry->d_name, ".md") != NULL);
+        if (!match) {
+            continue;
+        }
+
+        char path[320];
+        int n = snprintf(path, sizeof(path), "%s/%s", ESPAGENT_SPIFFS_BASE, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            continue;
+        }
+        if (remove(path) == 0) {
+            removed = true;
+        }
+    }
+    closedir(dir);
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
 esp_err_t session_mgr_init(void)
 {
     ESP_LOGI(TAG, "Session manager initialized at %s", ESPAGENT_SPIFFS_SESSION_DIR);
@@ -944,6 +1029,84 @@ esp_err_t session_clear(const char *chat_id)
         return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t session_clear_trace(const char *chat_id)
+{
+    char path[128];
+    session_trace_path(chat_id, path, sizeof(path));
+
+    bool removed = false;
+    (void)remove_if_exists(path, &removed);
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t session_clear_brief(const char *chat_id)
+{
+    char path[128];
+    session_brief_path(chat_id, path, sizeof(path));
+
+    bool removed = false;
+    (void)remove_if_exists(path, &removed);
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t session_clear_all_context(const char *chat_id)
+{
+    bool removed = false;
+    if (session_clear(chat_id) == ESP_OK) {
+        removed = true;
+    }
+    if (session_clear_trace(chat_id) == ESP_OK) {
+        removed = true;
+    }
+    if (session_clear_brief(chat_id) == ESP_OK) {
+        removed = true;
+    }
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t session_clear_all_sessions_and_traces(void)
+{
+    return clear_matching_session_store_files();
+}
+
+esp_err_t session_context_status_text(const char *chat_id, char *buf, size_t size)
+{
+    if (!chat_id || !buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char session_file[128];
+    char trace_file[128];
+    char brief_file[128];
+    session_path(chat_id, session_file, sizeof(session_file));
+    session_trace_path(chat_id, trace_file, sizeof(trace_file));
+    session_brief_path(chat_id, brief_file, sizeof(brief_file));
+
+    int history_messages = count_lines_in_file(session_file);
+    if (history_messages < 0) {
+        char legacy_file[128];
+        session_legacy_path(chat_id, legacy_file, sizeof(legacy_file));
+        history_messages = count_lines_in_file(legacy_file);
+    }
+    int trace_events = count_lines_in_file(trace_file);
+    long brief_bytes = file_size_bytes(brief_file);
+
+    snprintf(buf, size,
+             "Context status for chat_id=%s\n"
+             "- history_messages: %d (%s)\n"
+             "- trace_events: %d (%s)\n"
+             "- brief_bytes: %ld (%s)\n",
+             chat_id,
+             history_messages > 0 ? history_messages : 0,
+             history_messages >= 0 ? "present" : "missing",
+             trace_events > 0 ? trace_events : 0,
+             trace_events >= 0 ? "present" : "missing",
+             brief_bytes > 0 ? brief_bytes : 0,
+             brief_bytes >= 0 ? "present" : "missing");
+
+    return ESP_OK;
 }
 
 void session_list(void)

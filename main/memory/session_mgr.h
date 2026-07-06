@@ -69,6 +69,11 @@ esp_err_t session_build_relevant_task_brief(const char *chat_id,
  * Clear a session (delete the file).
  */
 esp_err_t session_clear(const char *chat_id);
+esp_err_t session_clear_trace(const char *chat_id);
+esp_err_t session_clear_brief(const char *chat_id);
+esp_err_t session_clear_all_context(const char *chat_id);
+esp_err_t session_clear_all_sessions_and_traces(void);
+esp_err_t session_context_status_text(const char *chat_id, char *buf, size_t size);
 
 /**
  * List all session files (prints to log).

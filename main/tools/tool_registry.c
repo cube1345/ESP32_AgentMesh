@@ -40,6 +40,8 @@ static const char *TAG = "tools";
 static espagent_tool_t s_tools[MAX_TOOLS];
 static int s_tool_count = 0;
 static char *s_tools_json = NULL;
+static char *s_tools_json_compact_coordinator = NULL;
+static char *s_tools_json_mesh_only = NULL;
 
 static bool json_has_key(cJSON *root, const char *key)
 {
@@ -324,20 +326,74 @@ static void register_tool(const espagent_tool_t *tool)
     ESP_LOGI(TAG, "Registered tool: %s", tool->name);
 }
 
-static void build_tools_json(void)
+static bool coordinator_compact_tool_allowed(const char *name)
 {
-    char *cap_json = espagent_capability_build_llm_tools_json();
-    if (cap_json) {
-        free(s_tools_json);
-        s_tools_json = cap_json;
-        ESP_LOGI(TAG, "Tools JSON built from capability registry (%d tools)", s_tool_count);
-        return;
+    static const char *const allowed[] = {
+        "web_search",
+        "get_weather",
+        "get_current_time",
+        "voice_status",
+        "voice_request_tts",
+        "voice_request_stt",
+        "spawn_subagent",
+        "mesh_send_command",
+        "automation_create_workflow",
+        "automation_create_rule",
+        "automation_list",
+        "automation_remove",
+        "gateway_status",
+        "gateway_register_ble_mesh_device",
+        "gateway_ble_mesh_send",
+        "ota_gateway_plan",
+        "read_file",
+        "list_dir",
+        "cron_add",
+        "cron_list",
+        "cron_remove",
+        "memory_profile_set",
+        "skill_observation_add",
+        "lua_runtime_info",
+        "lua_list_scripts",
+        "lua_list_jobs",
+        "lua_get_job",
+        "lua_stop_job",
+    };
+
+    if (!name) {
+        return false;
     }
 
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        if (strcmp(name, allowed[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool mesh_only_tool_allowed(const char *name)
+{
+    return name && strcmp(name, "mesh_send_command") == 0;
+}
+
+static char *build_tools_json_from_registry(bool (*filter_fn)(const char *name),
+                                            const char *label)
+{
     cJSON *arr = cJSON_CreateArray();
+    if (!arr) {
+        return NULL;
+    }
+
+    int visible = 0;
 
     for (int i = 0; i < s_tool_count; i++) {
+        if (filter_fn && !filter_fn(s_tools[i].name)) {
+            continue;
+        }
         cJSON *tool = cJSON_CreateObject();
+        if (!tool) {
+            continue;
+        }
         cJSON_AddStringToObject(tool, "name", s_tools[i].name);
         cJSON_AddStringToObject(tool, "description", s_tools[i].description);
 
@@ -347,13 +403,37 @@ static void build_tools_json(void)
         }
 
         cJSON_AddItemToArray(arr, tool);
+        visible++;
     }
 
-    free(s_tools_json);
-    s_tools_json = cJSON_PrintUnformatted(arr);
+    char *json = cJSON_PrintUnformatted(arr);
     cJSON_Delete(arr);
+    ESP_LOGI(TAG, "Tools JSON built (%s visible=%d total=%d)",
+             label ? label : "default",
+             visible,
+             s_tool_count);
+    return json;
+}
 
-    ESP_LOGI(TAG, "Tools JSON built (%d tools)", s_tool_count);
+static void build_tools_json(void)
+{
+    char *cap_json = espagent_capability_build_llm_tools_json();
+    if (cap_json) {
+        free(s_tools_json);
+        s_tools_json = cap_json;
+    } else {
+        free(s_tools_json);
+        s_tools_json = build_tools_json_from_registry(NULL, "fallback-default");
+    }
+
+    free(s_tools_json_compact_coordinator);
+    s_tools_json_compact_coordinator =
+        build_tools_json_from_registry(coordinator_compact_tool_allowed,
+                                       "coordinator-compact");
+
+    free(s_tools_json_mesh_only);
+    s_tools_json_mesh_only =
+        build_tools_json_from_registry(mesh_only_tool_allowed, "mesh-only");
 }
 
 esp_err_t tool_registry_init(void)
@@ -572,7 +652,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"tts_speak\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -1017,6 +1097,16 @@ esp_err_t tool_registry_init(void)
 const char *tool_registry_get_tools_json(void)
 {
     return s_tools_json;
+}
+
+const char *tool_registry_get_tools_json_compact_coordinator(void)
+{
+    return s_tools_json_compact_coordinator;
+}
+
+const char *tool_registry_get_tools_json_mesh_only(void)
+{
+    return s_tools_json_mesh_only;
 }
 
 void tool_registry_get_tools(const espagent_tool_t **tools, int *count)

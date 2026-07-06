@@ -38,6 +38,9 @@ main/espagent_secrets.h
 
 # Cache / Compiled
 .cache
+.vite/
+node_modules/
+*.tsbuildinfo
 __pycache__/
 **/__pycache__/
 *.pyc

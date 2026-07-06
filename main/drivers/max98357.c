@@ -9,6 +9,7 @@
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -132,6 +133,214 @@ static esp_err_t init_i2s_tx(const max98357_config_t *cfg, i2s_chan_handle_t *tx
         return err;
     }
 
+    return ESP_OK;
+}
+
+static esp_err_t stream_shutdown(max98357_stream_t *stream)
+{
+    if (!stream) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (stream->tx_chan) {
+        int16_t silence[MAX98357_CHUNK_FRAMES * 2] = {0};
+        size_t silence_written = 0;
+        (void)i2s_channel_write(stream->tx_chan, silence, sizeof(silence), &silence_written, 1000);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        (void)i2s_channel_disable(stream->tx_chan);
+        i2s_del_channel(stream->tx_chan);
+        stream->tx_chan = NULL;
+    }
+
+    (void)configure_shutdown_pin(stream->cfg.sd_gpio, false);
+    stream->active = false;
+    stream->has_pending_byte = false;
+    stream->pending_byte = 0;
+    return ESP_OK;
+}
+
+esp_err_t max98357_stream_open(max98357_stream_t *stream,
+                               const max98357_config_t *cfg,
+                               char *diag,
+                               size_t diag_size)
+{
+    if (!diag || diag_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    diag[0] = '\0';
+
+    if (!stream || !cfg) {
+        snprintf(diag, diag_size, "Error: missing MAX98357 stream config");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memset(stream, 0, sizeof(*stream));
+    stream->cfg = *cfg;
+
+    esp_err_t err = validate_config(&stream->cfg, diag, diag_size);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    err = configure_shutdown_pin(stream->cfg.sd_gpio, true);
+    if (err != ESP_OK) {
+        snprintf(diag, diag_size, "Error: MAX98357 SD GPIO init failed (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = init_i2s_tx(&stream->cfg, &stream->tx_chan);
+    if (err != ESP_OK) {
+        (void)configure_shutdown_pin(stream->cfg.sd_gpio, false);
+        snprintf(diag, diag_size, "Error: MAX98357 I2S init failed (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    err = i2s_channel_enable(stream->tx_chan);
+    if (err != ESP_OK) {
+        i2s_del_channel(stream->tx_chan);
+        stream->tx_chan = NULL;
+        (void)configure_shutdown_pin(stream->cfg.sd_gpio, false);
+        snprintf(diag, diag_size, "Error: MAX98357 I2S enable failed (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    stream->active = true;
+    snprintf(diag, diag_size,
+             "OK: MAX98357 stream ready sample_rate=%luHz BCLK=GPIO%d WS=GPIO%d DIN=GPIO%d",
+             (unsigned long)stream->cfg.sample_rate_hz,
+             (int)stream->cfg.bclk_gpio,
+             (int)stream->cfg.ws_gpio,
+             (int)stream->cfg.din_gpio);
+    ESP_LOGI(TAG, "%s", diag);
+    return ESP_OK;
+}
+
+esp_err_t max98357_stream_write_pcm_mono16le(max98357_stream_t *stream,
+                                             const uint8_t *data,
+                                             size_t len,
+                                             char *diag,
+                                             size_t diag_size)
+{
+    if (!diag || diag_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    diag[0] = '\0';
+
+    if (!stream || !stream->active || !stream->tx_chan) {
+        snprintf(diag, diag_size, "Error: MAX98357 stream is not open");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!data || len == 0) {
+        snprintf(diag, diag_size, "OK: no pcm data");
+        return ESP_OK;
+    }
+
+    size_t merged_len = len;
+    uint8_t *merged = NULL;
+    if (stream->has_pending_byte) {
+        merged = heap_caps_malloc(len + 1, MALLOC_CAP_8BIT);
+        if (!merged) {
+            snprintf(diag, diag_size, "Error: no memory for MAX98357 PCM merge");
+            return ESP_ERR_NO_MEM;
+        }
+        merged[0] = stream->pending_byte;
+        memcpy(merged + 1, data, len);
+        merged_len = len + 1;
+        stream->has_pending_byte = false;
+        stream->pending_byte = 0;
+    } else {
+        merged = heap_caps_malloc(len, MALLOC_CAP_8BIT);
+        if (!merged) {
+            snprintf(diag, diag_size, "Error: no memory for MAX98357 PCM copy");
+            return ESP_ERR_NO_MEM;
+        }
+        memcpy(merged, data, len);
+    }
+
+    if ((merged_len % sizeof(int16_t)) != 0) {
+        stream->pending_byte = merged[merged_len - 1];
+        stream->has_pending_byte = true;
+        merged_len -= 1;
+    }
+
+    if (merged_len == 0) {
+        heap_caps_free(merged);
+        snprintf(diag, diag_size, "OK: cached pending byte");
+        return ESP_OK;
+    }
+
+    size_t sample_count = merged_len / sizeof(int16_t);
+    size_t stereo_bytes = sample_count * 2 * sizeof(int16_t);
+    int16_t *stereo = heap_caps_malloc(stereo_bytes, MALLOC_CAP_8BIT);
+    if (!stereo) {
+        heap_caps_free(merged);
+        snprintf(diag, diag_size, "Error: no memory for MAX98357 stereo buffer");
+        return ESP_ERR_NO_MEM;
+    }
+
+    const int16_t *mono = (const int16_t *)merged;
+    for (size_t i = 0; i < sample_count; ++i) {
+        stereo[i * 2] = mono[i];
+        stereo[i * 2 + 1] = mono[i];
+    }
+
+    size_t bytes_written = 0;
+    esp_err_t err = i2s_channel_write(stream->tx_chan, stereo, stereo_bytes, &bytes_written, 2000);
+    heap_caps_free(stereo);
+    heap_caps_free(merged);
+
+    if (err != ESP_OK) {
+        snprintf(diag, diag_size, "Error: MAX98357 stream write failed (%s)", esp_err_to_name(err));
+        return err;
+    }
+
+    stream->pcm_bytes_in += merged_len;
+    stream->i2s_bytes_out += bytes_written;
+    snprintf(diag, diag_size,
+             "OK: wrote %u mono bytes (%u i2s bytes total=%u)",
+             (unsigned)merged_len,
+             (unsigned)bytes_written,
+             (unsigned)stream->i2s_bytes_out);
+    return ESP_OK;
+}
+
+esp_err_t max98357_stream_close(max98357_stream_t *stream,
+                                char *diag,
+                                size_t diag_size)
+{
+    if (!diag || diag_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    diag[0] = '\0';
+
+    if (!stream) {
+        snprintf(diag, diag_size, "Error: missing MAX98357 stream");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!stream->active) {
+        snprintf(diag, diag_size, "OK: MAX98357 stream already closed");
+        return ESP_OK;
+    }
+
+    if (stream->has_pending_byte) {
+        uint8_t tail[2] = {stream->pending_byte, 0};
+        char write_diag[96];
+        esp_err_t tail_err = max98357_stream_write_pcm_mono16le(stream, tail, sizeof(tail),
+                                                                write_diag, sizeof(write_diag));
+        if (tail_err != ESP_OK) {
+            snprintf(diag, diag_size, "Error: failed to flush pending PCM byte (%s)", write_diag);
+            (void)stream_shutdown(stream);
+            return tail_err;
+        }
+    }
+
+    (void)stream_shutdown(stream);
+    snprintf(diag, diag_size,
+             "OK: MAX98357 stream closed pcm_bytes=%u i2s_bytes=%u sample_rate=%luHz",
+             (unsigned)stream->pcm_bytes_in,
+             (unsigned)stream->i2s_bytes_out,
+             (unsigned long)stream->cfg.sample_rate_hz);
+    ESP_LOGI(TAG, "%s", diag);
     return ESP_OK;
 }
 

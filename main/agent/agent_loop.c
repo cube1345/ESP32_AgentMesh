@@ -3,6 +3,7 @@
 #include "agent/slash_command.h"
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
+#include "memory/memory_store.h"
 #include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "proactive/proactive_service.h"
@@ -27,6 +28,10 @@
 static const char *TAG = "agent";
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
+
+static bool agent_should_persist_trace(void) {
+  return !espagent_role_is_coordinator();
+}
 
 static size_t utf8_expected_len(unsigned char c) {
   if (c < 0x80) {
@@ -393,7 +398,12 @@ static bool text_claims_mesh_dispatched(const char *text) {
 
 static bool message_should_have_used_mesh(const char *message) {
   return tool_guard_match_temperature_humidity_request(message) ||
+         tool_guard_match_environment_request(message) ||
+         tool_guard_match_light_sensor_request(message) ||
          tool_guard_match_light_request(message) ||
+         tool_guard_match_air_quality_request(message) ||
+         tool_guard_match_presence_request(message) ||
+         tool_guard_match_gpio_read_request(message) ||
          tool_guard_match_gpio_write_request(message) ||
          tool_guard_match_servo_request(message);
 }
@@ -1036,6 +1046,54 @@ static void append_pending_clarification_prompt(char *prompt, size_t size,
       question);
 }
 
+static bool message_prefers_direct_reply_no_tools(const char *message) {
+  static const char *const direct_markers[] = {
+      "请用一句话回复", "用一句话回复", "一句话回复", "用一句话回答", "简短回复",
+      "直接回复", "直接回答", "只需要回复", "只回复", "不要调用工具",
+      "不用调用工具", "不要使用工具", "just reply", "reply only",
+      "answer only", "no tools",
+  };
+
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  return message_has_any_keyword(
+      message, direct_markers,
+      sizeof(direct_markers) / sizeof(direct_markers[0]));
+}
+
+static bool message_is_simple_greeting_or_smalltalk(const char *message) {
+  static const char *const markers[] = {
+      "你好", "您好", "hello", "hi", "hey", "早上好", "中午好", "晚上好",
+      "在吗", "在不在", "收到吗", "谢谢", "感谢", "bye", "再见",
+  };
+
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  if (strlen(message) > 48) {
+    return false;
+  }
+
+  return message_has_any_keyword(message, markers,
+                                 sizeof(markers) / sizeof(markers[0]));
+}
+
+static int history_limit_for_turn(bool smalltalk_turn, bool prefer_direct_reply) {
+  if (espagent_role_is_coordinator()) {
+    if (smalltalk_turn) {
+      return 2;
+    }
+    if (prefer_direct_reply) {
+      return 4;
+    }
+    return 6;
+  }
+  return ESPAGENT_AGENT_MAX_HISTORY;
+}
+
 static char *patch_tool_input_with_context(const llm_tool_call_t *call,
                                            const espagent_msg_t *msg) {
   if (!call || !msg ||
@@ -1215,7 +1273,9 @@ static void append_tool_trace(const espagent_msg_t *msg,
 
   char summary[128] = {0};
   snprintf(summary, sizeof(summary), "%s %s", event_type, call->name);
-  (void)session_append_trace(msg->chat_id, event_type, summary, json);
+  if (agent_should_persist_trace()) {
+    (void)session_append_trace(msg->chat_id, event_type, summary, json);
+  }
   cJSON_free(json);
 }
 
@@ -1308,6 +1368,78 @@ static cJSON *build_tool_results(const llm_response_t *resp,
   return content;
 }
 
+static bool send_direct_text_reply(const espagent_msg_t *msg, const char *text) {
+  if (!msg || !text) {
+    return false;
+  }
+
+  espagent_msg_t out = {0};
+  strncpy(out.channel, msg->channel, sizeof(out.channel) - 1);
+  strncpy(out.chat_id, msg->chat_id, sizeof(out.chat_id) - 1);
+  out.content = strdup(text);
+  if (!out.content) {
+    return false;
+  }
+  if (message_bus_push_outbound(&out) != ESP_OK) {
+    free(out.content);
+    return false;
+  }
+  return true;
+}
+
+static bool handle_slash_action(const espagent_msg_t *msg,
+                                const espagent_slash_result_t *slash) {
+  if (!msg || !slash || slash->type != ESPAGENT_SLASH_ACTION) {
+    return false;
+  }
+
+  char reply[512] = {0};
+  bool any_removed = false;
+
+  if (strcmp(slash->command, "clear") == 0) {
+    if (session_clear_all_context(msg->chat_id) == ESP_OK) {
+      snprintf(reply, sizeof(reply),
+               "已清除当前 chat_id 的 session/history/brief/trace。");
+    } else {
+      snprintf(reply, sizeof(reply),
+               "当前 chat_id 没有可清除的 session/history/brief/trace。");
+    }
+    return send_direct_text_reply(msg, reply);
+  }
+
+  if (strcmp(slash->command, "clear_all_memory") == 0) {
+    if (session_clear_all_context(msg->chat_id) == ESP_OK) {
+      any_removed = true;
+    }
+    if (session_clear_all_sessions_and_traces() == ESP_OK) {
+      any_removed = true;
+    }
+    if (memory_clear_all() == ESP_OK) {
+      any_removed = true;
+    }
+    if (memory_v2_clear_all() == ESP_OK) {
+      any_removed = true;
+    }
+
+    snprintf(reply, sizeof(reply),
+             any_removed
+                 ? "已清除当前上下文，并删除 MEMORY/profile/skills/trace/session/brief 持久数据。"
+                 : "没有发现可清除的 MEMORY/profile/skills/trace/session 数据。");
+    return send_direct_text_reply(msg, reply);
+  }
+
+  if (strcmp(slash->command, "context_status") == 0) {
+    if (session_context_status_text(msg->chat_id, reply, sizeof(reply)) != ESP_OK) {
+      snprintf(reply, sizeof(reply), "无法读取当前 chat_id 的 context 状态。");
+    }
+    return send_direct_text_reply(msg, reply);
+  }
+
+  snprintf(reply, sizeof(reply), "Unsupported slash action: /%s",
+           slash->command);
+  return send_direct_text_reply(msg, reply);
+}
+
 static void agent_loop_task(void *arg) {
   ESP_LOGI(TAG, "Agent loop started on core %d", xPortGetCoreID());
 
@@ -1319,14 +1451,21 @@ static void agent_loop_task(void *arg) {
   char *tool_output = heap_caps_calloc(1, TOOL_OUTPUT_SIZE, MALLOC_CAP_SPIRAM);
   char *tool_fallback =
       heap_caps_calloc(1, TOOL_OUTPUT_SIZE + 512, MALLOC_CAP_SPIRAM);
+  char *relevance_query = heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM);
+  char *turn_buf = heap_caps_calloc(1, 2048, MALLOC_CAP_SPIRAM);
 
-  if (!system_prompt || !history_json || !tool_output || !tool_fallback) {
+  if (!system_prompt || !history_json || !tool_output || !tool_fallback ||
+      !relevance_query || !turn_buf) {
     ESP_LOGE(TAG, "Failed to allocate PSRAM buffers");
     vTaskDelete(NULL);
     return;
   }
 
   const char *tools_json = tool_registry_get_tools_json();
+  const char *tools_json_compact_coordinator =
+      tool_registry_get_tools_json_compact_coordinator();
+  const char *tools_json_mesh_only =
+      tool_registry_get_tools_json_mesh_only();
 
   while (1) {
     espagent_msg_t msg;
@@ -1352,15 +1491,19 @@ static void agent_loop_task(void *arg) {
     if (!proactive_turn && !internal_result_turn &&
         espagent_slash_try_handle(msg.content, &slash)) {
       if (slash.type == ESPAGENT_SLASH_HELP || slash.type == ESPAGENT_SLASH_ERROR) {
-        espagent_msg_t out = {0};
-        strncpy(out.channel, msg.channel, sizeof(out.channel) - 1);
-        strncpy(out.chat_id, msg.chat_id, sizeof(out.chat_id) - 1);
-        out.content = strdup(slash.text);
-        if (out.content) {
-          ESP_LOGI(TAG, "Slash command /%s produced direct reply",
-                   slash.command[0] ? slash.command : "help");
-          (void)message_bus_push_outbound(&out);
-        }
+        ESP_LOGI(TAG, "Slash command /%s produced direct reply",
+                 slash.command[0] ? slash.command : "help");
+        (void)send_direct_text_reply(&msg, slash.text);
+        (void)tool_status_indicator_thinking_stop();
+        free(msg.content);
+        ESP_LOGI(TAG, "Free PSRAM: %d bytes",
+                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        continue;
+      }
+
+      if (slash.type == ESPAGENT_SLASH_ACTION) {
+        ESP_LOGI(TAG, "Slash command /%s executing action", slash.command);
+        (void)handle_slash_action(&msg, &slash);
         (void)tool_status_indicator_thinking_stop();
         free(msg.content);
         ESP_LOGI(TAG, "Free PSRAM: %d bytes",
@@ -1380,6 +1523,12 @@ static void agent_loop_task(void *arg) {
       }
     }
 
+    bool smalltalk_turn = message_is_simple_greeting_or_smalltalk(msg.content);
+    bool prefer_direct_reply =
+        message_prefers_direct_reply_no_tools(msg.content) || smalltalk_turn;
+    int history_limit =
+        history_limit_for_turn(smalltalk_turn, prefer_direct_reply);
+
     /* 1. Build system prompt */
     context_build_system_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE);
     append_turn_context_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, &msg);
@@ -1388,68 +1537,45 @@ static void agent_loop_task(void *arg) {
 
     /* 2. Load session history into cJSON array */
     session_get_history_json(msg.chat_id, history_json,
-                             ESPAGENT_LLM_STREAM_BUF_SIZE, ESPAGENT_AGENT_MAX_HISTORY);
-    char relevance_query[1024] = {0};
-    build_relevance_query(msg.content, relevance_query, sizeof(relevance_query));
-    {
-      char session_brief[2048] = {0};
-      if (session_build_context_brief(msg.chat_id,
-                                      session_brief,
-                                      sizeof(session_brief)) == ESP_OK &&
-          session_brief[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n%s\n",
-                             session_brief);
-      }
-    }
-    {
-      char relevant_profile[1024] = {0};
+                             ESPAGENT_LLM_STREAM_BUF_SIZE, history_limit);
+    ESP_LOGI(TAG,
+             "History loaded: limit=%d bytes=%u direct_reply=%d smalltalk=%d",
+             history_limit,
+             (unsigned)strlen(history_json),
+             prefer_direct_reply ? 1 : 0,
+             smalltalk_turn ? 1 : 0);
+    memset(relevance_query, 0, 1024);
+    build_relevance_query(msg.content, relevance_query, 1024);
+    if (!espagent_role_is_coordinator()) {
+      memset(turn_buf, 0, 2048);
       if (memory_v2_build_relevant_profile_summary(relevance_query,
-                                                   relevant_profile,
-                                                   sizeof(relevant_profile)) == ESP_OK &&
-          relevant_profile[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n## Relevant User Profile For This Turn\n\n%s\n",
-                             relevant_profile);
+                                                   turn_buf,
+                                                   2048) == ESP_OK &&
+          turn_buf[0]) {
+          append_prompt_format(system_prompt,
+                               ESPAGENT_CONTEXT_BUF_SIZE,
+                               "\n## Relevant User Profile For This Turn\n\n%s\n",
+                               turn_buf);
       }
-    }
-    {
-      char relevant_conflicts[768] = {0};
+      memset(turn_buf, 0, 2048);
       if (memory_v2_build_relevant_profile_conflict_summary(relevance_query,
-                                                            relevant_conflicts,
-                                                            sizeof(relevant_conflicts)) == ESP_OK &&
-          relevant_conflicts[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n## Relevant Profile Changes For This Turn\n\n%s\n",
-                             relevant_conflicts);
+                                                            turn_buf,
+                                                            2048) == ESP_OK &&
+          turn_buf[0]) {
+          append_prompt_format(system_prompt,
+                               ESPAGENT_CONTEXT_BUF_SIZE,
+                               "\n## Relevant Profile Changes For This Turn\n\n%s\n",
+                               turn_buf);
       }
-    }
-    {
-      char relevant_skills[1024] = {0};
+      memset(turn_buf, 0, 2048);
       if (memory_v2_build_relevant_skill_summary(relevance_query,
-                                                 relevant_skills,
-                                                 sizeof(relevant_skills)) == ESP_OK &&
-          relevant_skills[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n## Relevant Skill Notes For This Turn\n\n%s\n",
-                             relevant_skills);
-      }
-    }
-    {
-      char relevant_tasks[1024] = {0};
-      if (session_build_relevant_task_brief(msg.chat_id,
-                                            relevance_query,
-                                            relevant_tasks,
-                                            sizeof(relevant_tasks)) == ESP_OK &&
-          relevant_tasks[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n%s\n",
-                             relevant_tasks);
+                                                 turn_buf,
+                                                 2048) == ESP_OK &&
+          turn_buf[0]) {
+          append_prompt_format(system_prompt,
+                               ESPAGENT_CONTEXT_BUF_SIZE,
+                               "\n## Relevant Skill Notes For This Turn\n\n%s\n",
+                               turn_buf);
       }
     }
     append_pending_clarification_prompt(system_prompt,
@@ -1471,6 +1597,7 @@ static void agent_loop_task(void *arg) {
     int iteration = 0;
     bool sent_working_status = false;
     bool mesh_related_tool_seen = false;
+    esp_err_t last_llm_err = ESP_OK;
     tool_fallback[0] = '\0';
 
     if (!try_execute_deterministic_light_workflow(&msg, tool_output,
@@ -1483,8 +1610,9 @@ static void agent_loop_task(void *arg) {
     while (!final_text && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
       /* Send "working" indicator before each API call */
 #if ESPAGENT_AGENT_SEND_WORKING_STATUS
-      if (!proactive_turn && !sent_working_status &&
-          strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) != 0) {
+      if (!proactive_turn && !sent_working_status && !prefer_direct_reply &&
+          strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) != 0 &&
+          strcmp(msg.channel, ESPAGENT_CHAN_FEISHU) != 0) {
         espagent_msg_t status = {0};
         strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
         strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
@@ -1501,11 +1629,56 @@ static void agent_loop_task(void *arg) {
 #endif
 
       llm_response_t resp;
-      err = llm_chat_tools(system_prompt, messages, tools_json, &resp);
+      const char *selected_tools_json = tools_json;
+      if (espagent_role_is_coordinator()) {
+        if (message_should_have_used_mesh(msg.content) && tools_json_mesh_only) {
+          selected_tools_json = tools_json_mesh_only;
+        } else if (tools_json_compact_coordinator) {
+          selected_tools_json = tools_json_compact_coordinator;
+        }
+      }
+      const char *active_tools_json = prefer_direct_reply ? NULL : selected_tools_json;
+      if (prefer_direct_reply && iteration == 0) {
+        ESP_LOGI(TAG, "Direct-reply heuristic enabled for this turn; first LLM call runs without tools");
+      }
+      err = llm_chat_tools(system_prompt, messages, active_tools_json, &resp);
 
       if (err != ESP_OK) {
+        last_llm_err = err;
         ESP_LOGE(TAG, "LLM call failed: %s", esp_err_to_name(err));
-        break;
+        if (iteration == 0 && active_tools_json && !prefer_direct_reply) {
+          ESP_LOGW(TAG,
+                   "Retrying first LLM turn without tools after tool-enabled failure");
+          err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+          if (err == ESP_OK) {
+            prefer_direct_reply = true;
+            last_llm_err = ESP_OK;
+          } else {
+            last_llm_err = err;
+            ESP_LOGE(TAG, "Fallback no-tools LLM retry failed: %s",
+                     esp_err_to_name(err));
+          }
+        }
+        if (err != ESP_OK) {
+          break;
+        }
+      }
+
+      if (!resp.tool_use && (!resp.text || resp.text_len == 0) &&
+          iteration == 0 && active_tools_json && !prefer_direct_reply) {
+        ESP_LOGW(TAG,
+                 "First LLM turn returned empty non-tool response with tools; retrying without tools");
+        llm_response_free(&resp);
+        err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+        if (err == ESP_OK) {
+          prefer_direct_reply = true;
+          last_llm_err = ESP_OK;
+        } else {
+          last_llm_err = err;
+          ESP_LOGE(TAG, "No-tools retry after empty response failed: %s",
+                   esp_err_to_name(err));
+          break;
+        }
       }
 
       if (!resp.tool_use) {
@@ -1560,6 +1733,26 @@ static void agent_loop_task(void *arg) {
 
     cJSON_Delete(messages);
 
+    if (!final_text) {
+      if (tool_fallback[0]) {
+        final_text = strdup(tool_fallback);
+      } else if (tool_output[0]) {
+        char fallback_text[TOOL_OUTPUT_SIZE + 128];
+        snprintf(fallback_text, sizeof(fallback_text),
+                 "我已经执行了相关步骤，但整理最终回复时出了问题。先把当前结果直接发给你：\n\n%s",
+                 tool_output);
+        final_text = strdup(fallback_text);
+      } else if (iteration >= ESPAGENT_AGENT_MAX_TOOL_ITER) {
+        final_text = strdup("我已经开始处理这个问题，但工具调用轮次达到上限，没能整理出最终答复。请把问题再缩小一点，或者分步问我。");
+      } else if (last_llm_err != ESP_OK) {
+        char err_text[160];
+        snprintf(err_text, sizeof(err_text),
+                 "模型服务这次调用失败了：%s。请稍后重试。",
+                 esp_err_to_name(last_llm_err));
+        final_text = strdup(err_text);
+      }
+    }
+
     /* 5. Send response */
     if (final_text && final_text[0]) {
       if (proactive_turn && text_is_proactive_no_message(final_text)) {
@@ -1577,7 +1770,7 @@ static void agent_loop_task(void *arg) {
       esp_err_t save_user =
           (proactive_turn || internal_result_turn) ? ESP_OK : session_append(msg.chat_id, "user", msg.content);
       esp_err_t save_asst = session_append(msg.chat_id, "assistant", final_text);
-      if (internal_result_turn) {
+      if (internal_result_turn && agent_should_persist_trace()) {
         (void)session_append_trace(msg.chat_id, "async_result_input",
                                    "Async Mesh result injected", msg.content);
       }
@@ -1587,7 +1780,6 @@ static void agent_loop_task(void *arg) {
                  esp_err_to_name(save_asst));
       } else {
         ESP_LOGI(TAG, "Session saved for chat %s", msg.chat_id);
-        (void)session_refresh_context_brief(msg.chat_id);
       }
 
       /* Push response to outbound */
@@ -1610,16 +1802,10 @@ static void agent_loop_task(void *arg) {
                                                ESP_OK,
                                                out.content,
                                                out.content);
-      if (ESPAGENT_VOICE_AUTO_TTS &&
-          strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
-        (void)espagent_voice_publish_tts_request(out.content,
-                                                 msg.channel,
-                                                 msg.chat_id,
-                                                 NULL);
+      if (agent_should_persist_trace()) {
+        (void)session_append_trace(msg.chat_id, "final_reply",
+                                   "Assistant final reply", out.content);
       }
-      (void)session_append_trace(msg.chat_id, "final_reply",
-                                 "Assistant final reply", out.content);
-      (void)session_refresh_context_brief(msg.chat_id);
       if (message_bus_push_outbound(&out) != ESP_OK) {
         ESP_LOGW(TAG, "Outbound queue full, drop final response");
         free(final_text);
@@ -1646,16 +1832,10 @@ static void agent_loop_task(void *arg) {
                                                  ESP_FAIL,
                                                  out.content,
                                                  out.content);
-        if (ESPAGENT_VOICE_AUTO_TTS &&
-            strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
-          (void)espagent_voice_publish_tts_request(out.content,
-                                                   msg.channel,
-                                                   msg.chat_id,
-                                                   NULL);
+        if (agent_should_persist_trace()) {
+          (void)session_append_trace(msg.chat_id, "final_error",
+                                     "Assistant error reply", out.content);
         }
-        (void)session_append_trace(msg.chat_id, "final_error",
-                                   "Assistant error reply", out.content);
-        (void)session_refresh_context_brief(msg.chat_id);
         if (message_bus_push_outbound(&out) != ESP_OK) {
           ESP_LOGW(TAG, "Outbound queue full, drop error response");
           free(out.content);
@@ -1680,7 +1860,7 @@ esp_err_t agent_loop_init(void) {
 
 esp_err_t agent_loop_start(void) {
   const uint32_t coordinator_stack_candidates[] = {
-      16 * 1024, 14 * 1024, 12 * 1024,
+      24 * 1024, 20 * 1024, 18 * 1024, 16 * 1024,
   };
   const uint32_t default_stack_candidates[] = {
       ESPAGENT_AGENT_STACK, 20 * 1024, 16 * 1024, 14 * 1024, 12 * 1024,
@@ -1700,7 +1880,8 @@ esp_err_t agent_loop_start(void) {
     uint32_t stack_size = stack_candidates[i];
     BaseType_t ret =
         xTaskCreatePinnedToCore(agent_loop_task, "agent_loop", stack_size, NULL,
-                                ESPAGENT_AGENT_PRIO, NULL, ESPAGENT_AGENT_CORE);
+                                ESPAGENT_AGENT_PRIO, NULL,
+                                ESPAGENT_AGENT_CORE);
 
     if (ret == pdPASS) {
       ESP_LOGI(TAG, "agent_loop task created with stack=%u bytes",

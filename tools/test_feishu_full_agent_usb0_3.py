@@ -312,8 +312,8 @@ def build_cases() -> list[Case]:
             "Feishu basic dialogue and final reply",
             "请用一句话回复：收到综合测试。",
             45,
-            expect_any=["Queue final response to feishu:", "Feishu send success"],
-            expect_all=["Processing message from feishu"],
+            expect_any=["Queue final response to feishu:"],
+            expect_all=["Processing message from feishu", "Feishu send success"],
         ),
         Case(
             "FULL-TIME-WEATHER",

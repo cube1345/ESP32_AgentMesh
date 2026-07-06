@@ -912,3 +912,20 @@ esp_err_t memory_v2_build_relevant_skill_summary(const char *query,
     }
     return limit > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
+
+esp_err_t memory_v2_clear_all(void)
+{
+    bool removed = false;
+
+    if (remove(profile_path()) == 0) {
+        removed = true;
+    }
+    if (remove(skill_index_path()) == 0) {
+        removed = true;
+    }
+    if (remove(profile_conflict_path()) == 0) {
+        removed = true;
+    }
+
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+}

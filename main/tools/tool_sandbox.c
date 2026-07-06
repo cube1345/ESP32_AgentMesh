@@ -261,6 +261,7 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "servo_write") != 0 &&
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
+        strcmp(action, "tts_speak") != 0 &&
         strcmp(action, "virtual_device_control") != 0 &&
         strcmp(action, "gree_ac_control") != 0 &&
         strcmp(action, "control_state") != 0 &&

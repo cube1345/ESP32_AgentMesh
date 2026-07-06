@@ -12,6 +12,7 @@
 #include "tools/tool_web_search.h"
 #include "tools/tool_amap_weather.h"
 #include "drivers/max98357.h"
+#include "voice/local_tts.h"
 #include "cron/cron_service.h"
 #include "heartbeat/heartbeat.h"
 #include "proactive/proactive_service.h"
@@ -37,6 +38,88 @@
 #include "freertos/semphr.h"
 
 static const char *TAG = "cli";
+
+static int cli_base64_value(char ch)
+{
+    if (ch >= 'A' && ch <= 'Z') return ch - 'A';
+    if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
+    if (ch >= '0' && ch <= '9') return ch - '0' + 52;
+    if (ch == '+') return 62;
+    if (ch == '/') return 63;
+    return -1;
+}
+
+static esp_err_t cli_decode_base64_text(const char *input,
+                                        char *output,
+                                        size_t output_size,
+                                        size_t *output_len)
+{
+    if (!input || !output || output_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    size_t out_off = 0;
+    int quad[4];
+    int quad_len = 0;
+
+    for (size_t i = 0; input[i] != '\0'; ++i) {
+        char ch = input[i];
+        if (ch == '\r' || ch == '\n' || ch == ' ' || ch == '\t') {
+            continue;
+        }
+
+        if (ch == '=') {
+            quad[quad_len++] = -2;
+        } else {
+            int v = cli_base64_value(ch);
+            if (v < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            quad[quad_len++] = v;
+        }
+
+        if (quad_len == 4) {
+            if (quad[0] < 0 || quad[1] < 0) {
+                return ESP_ERR_INVALID_ARG;
+            }
+            if (out_off + 1 >= output_size) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            output[out_off++] = (char)((quad[0] << 2) | (quad[1] >> 4));
+
+            if (quad[2] != -2) {
+                if (quad[2] < 0) {
+                    return ESP_ERR_INVALID_ARG;
+                }
+                if (out_off + 1 >= output_size) {
+                    return ESP_ERR_INVALID_SIZE;
+                }
+                output[out_off++] = (char)(((quad[1] & 0x0F) << 4) | (quad[2] >> 2));
+
+                if (quad[3] != -2) {
+                    if (quad[3] < 0) {
+                        return ESP_ERR_INVALID_ARG;
+                    }
+                    if (out_off + 1 >= output_size) {
+                        return ESP_ERR_INVALID_SIZE;
+                    }
+                    output[out_off++] = (char)(((quad[2] & 0x03) << 6) | quad[3]);
+                }
+            }
+            quad_len = 0;
+        }
+    }
+
+    if (quad_len != 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    output[out_off] = '\0';
+    if (output_len) {
+        *output_len = out_off;
+    }
+    return ESP_OK;
+}
 
 /* --- wifi_set command --- */
 static int cmd_wifi_set(int argc, char **argv)
@@ -291,6 +374,78 @@ static int cmd_max98357_test(int argc, char **argv)
     esp_err_t err = max98357_play_tone(&cfg, frequency_hz, duration_ms, volume_pct,
                                        result, sizeof(result));
     printf("max98357_test status: %s\n", esp_err_to_name(err));
+    printf("%s\n", result[0] ? result : "(empty)");
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_local_tts_speak(int argc, char **argv)
+{
+    if (argc < 2) {
+        printf("Usage:\n");
+        printf("  local_tts_speak <text>\n");
+        return 1;
+    }
+
+    char text[512] = {0};
+    size_t used = 0;
+    for (int i = 1; i < argc; ++i) {
+        if (used > 0 && used + 1 < sizeof(text)) {
+            text[used++] = ' ';
+        }
+        size_t remain = sizeof(text) - used - 1;
+        size_t copy_len = strnlen(argv[i], remain);
+        memcpy(text + used, argv[i], copy_len);
+        used += copy_len;
+        if (used >= sizeof(text) - 1) {
+            break;
+        }
+    }
+    text[used] = '\0';
+
+    char result[256];
+    esp_err_t err = espagent_voice_local_tts_speak(text, result, sizeof(result));
+    printf("local_tts_speak status: %s\n", esp_err_to_name(err));
+    printf("%s\n", result[0] ? result : "(empty)");
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_local_tts_demo_zh(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char *demo_text =
+        "你好，我是ESPAgent，现在正在测试中文语音播报。";
+
+    char result[256];
+    esp_err_t err = espagent_voice_local_tts_speak(demo_text, result, sizeof(result));
+    printf("local_tts_demo_zh status: %s\n", esp_err_to_name(err));
+    printf("text: %s\n", demo_text);
+    printf("%s\n", result[0] ? result : "(empty)");
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_local_tts_b64(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage:\n");
+        printf("  local_tts_b64 <base64_utf8_text>\n");
+        return 1;
+    }
+
+    char text[512] = {0};
+    size_t text_len = 0;
+    esp_err_t decode_err = cli_decode_base64_text(argv[1], text, sizeof(text), &text_len);
+    if (decode_err != ESP_OK || text_len == 0) {
+        printf("local_tts_b64 decode status: %s\n", esp_err_to_name(decode_err));
+        printf("Error: invalid or empty base64 utf8 text\n");
+        return 1;
+    }
+
+    char result[256];
+    esp_err_t err = espagent_voice_local_tts_speak(text, result, sizeof(result));
+    printf("local_tts_b64 status: %s\n", esp_err_to_name(err));
+    printf("decoded_text: %s\n", text);
     printf("%s\n", result[0] ? result : "(empty)");
     return (err == ESP_OK) ? 0 : 1;
 }
@@ -873,6 +1028,46 @@ static int cmd_inject_msg(int argc, char **argv)
     return 0;
 }
 
+static int cmd_inject_outbound(int argc, char **argv)
+{
+    if (argc < 4) {
+        printf("Usage: inject_outbound <channel> <chat_id> <text>\n");
+        return 1;
+    }
+
+    espagent_msg_t msg = {0};
+    strncpy(msg.channel, argv[1], sizeof(msg.channel) - 1);
+    strncpy(msg.chat_id, argv[2], sizeof(msg.chat_id) - 1);
+
+    size_t text_len = 0;
+    for (int i = 3; i < argc; i++) {
+        text_len += strlen(argv[i]) + 1;
+    }
+
+    msg.content = calloc(1, text_len + 1);
+    if (!msg.content) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+
+    for (int i = 3; i < argc; i++) {
+        if (i > 3) {
+            strncat(msg.content, " ", text_len - strlen(msg.content));
+        }
+        strncat(msg.content, argv[i], text_len - strlen(msg.content));
+    }
+
+    esp_err_t err = message_bus_push_outbound(&msg);
+    if (err != ESP_OK) {
+        free(msg.content);
+        printf("inject_outbound status: %s\n", esp_err_to_name(err));
+        return 1;
+    }
+
+    printf("inject_outbound status: ESP_OK (%s:%s)\n", msg.channel, msg.chat_id);
+    return 0;
+}
+
 static int cmd_inject_search_zh(int argc, char **argv)
 {
     (void)argc;
@@ -1372,6 +1567,28 @@ esp_err_t serial_cli_init(void)
     };
     esp_console_cmd_register(&max98357_cmd);
 
+    /* local_tts_speak */
+    esp_console_cmd_t local_tts_cmd = {
+        .command = "local_tts_speak",
+        .help = "Synthesize speech with Volc TTS and play it through MAX98357 on this ESP32-S3",
+        .func = &cmd_local_tts_speak,
+    };
+    esp_console_cmd_register(&local_tts_cmd);
+
+    esp_console_cmd_t local_tts_demo_zh_cmd = {
+        .command = "local_tts_demo_zh",
+        .help = "Speak built-in Chinese demo text through local Volc TTS",
+        .func = &cmd_local_tts_demo_zh,
+    };
+    esp_console_cmd_register(&local_tts_demo_zh_cmd);
+
+    esp_console_cmd_t local_tts_b64_cmd = {
+        .command = "local_tts_b64",
+        .help = "Decode base64 UTF-8 text and speak it through local Volc TTS",
+        .func = &cmd_local_tts_b64,
+    };
+    esp_console_cmd_register(&local_tts_b64_cmd);
+
     /* cache_stats */
     esp_console_cmd_t cache_stats_cmd = {
         .command = "cache_stats",
@@ -1533,6 +1750,13 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_inject_msg,
     };
     esp_console_cmd_register(&inject_msg_cmd);
+
+    esp_console_cmd_t inject_outbound_cmd = {
+        .command = "inject_outbound",
+        .help = "Inject an outbound reply directly: inject_outbound <channel> <chat_id> <text>",
+        .func = &cmd_inject_outbound,
+    };
+    esp_console_cmd_register(&inject_outbound_cmd);
 
     /* inject_search_zh */
     esp_console_cmd_t inject_search_zh_cmd = {

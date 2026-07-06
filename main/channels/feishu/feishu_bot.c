@@ -341,7 +341,7 @@ static void feishu_ws_ack_task(void *arg)
 {
     feishu_ws_ack_t *ack_item = (feishu_ws_ack_t *)arg;
     if (!ack_item) {
-        vTaskDeleteWithCaps(NULL);
+        vTaskDelete(NULL);
         return;
     }
 
@@ -355,7 +355,7 @@ static void feishu_ws_ack_task(void *arg)
     }
 
     free(ack_item);
-    vTaskDeleteWithCaps(NULL);
+    vTaskDelete(NULL);
 }
 
 static void feishu_send_ack_async(const ws_frame_t *frame, int code)
@@ -370,13 +370,12 @@ static void feishu_send_ack_async(const ws_frame_t *frame, int code)
     ack_item->frame.payload_len = 0;
     ack_item->code = code;
 
-    BaseType_t ok = xTaskCreateWithCaps(feishu_ws_ack_task,
-                                        "feishu_ack",
-                                        ESPAGENT_FEISHU_ACK_STACK,
-                                        ack_item,
-                                        4,
-                                        NULL,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    BaseType_t ok = xTaskCreate(feishu_ws_ack_task,
+                                "feishu_ack",
+                                ESPAGENT_FEISHU_ACK_STACK,
+                                ack_item,
+                                4,
+                                NULL);
     if (ok != pdPASS) {
         ESP_LOGW(TAG, "Feishu WS ACK task create failed");
         free(ack_item);
@@ -1037,38 +1036,14 @@ esp_err_t feishu_bot_start(void)
         ESP_LOGW(TAG, "Feishu WebSocket task already running");
         return ESP_OK;
     }
-    BaseType_t ok = pdFAIL;
-
-#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
-    ok = xTaskCreatePinnedToCoreWithCaps(
+    BaseType_t ok = xTaskCreatePinnedToCore(
         feishu_ws_task,
         "feishu_ws",
         ESPAGENT_FEISHU_TASK_STACK,
         NULL,
         ESPAGENT_FEISHU_POLL_PRIO,
         &s_ws_task,
-        ESPAGENT_FEISHU_POLL_CORE,
-        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (ok == pdPASS) {
-        ESP_LOGI(TAG, "Feishu WS task created with PSRAM stack=%u", (unsigned)ESPAGENT_FEISHU_TASK_STACK);
-    } else {
-        ESP_LOGW(TAG,
-                 "Feishu WS task PSRAM create failed (free_internal=%u largest_internal=%u), retrying internal RAM",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    }
-#endif
-
-    if (ok != pdPASS) {
-        ok = xTaskCreatePinnedToCore(
-            feishu_ws_task,
-            "feishu_ws",
-            ESPAGENT_FEISHU_TASK_STACK,
-            NULL,
-            ESPAGENT_FEISHU_POLL_PRIO,
-            &s_ws_task,
-            ESPAGENT_FEISHU_POLL_CORE);
-    }
+        ESPAGENT_FEISHU_POLL_CORE);
     if (ok != pdPASS) {
         s_ws_task = NULL;
         return ESP_FAIL;

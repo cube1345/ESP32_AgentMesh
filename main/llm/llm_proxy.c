@@ -1,6 +1,7 @@
 #include "llm_proxy.h"
 #include "espagent_config.h"
 #include "proxy/http_proxy.h"
+#include "roles/role_config.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -10,6 +11,8 @@
 #include "esp_heap_caps.h"
 #include "nvs.h"
 #include "cJSON.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "llm";
 
@@ -17,6 +20,10 @@ static const char *TAG = "llm";
 #define LLM_MODEL_MAX_LEN   64
 #define LLM_DUMP_MAX_BYTES   (16 * 1024)
 #define LLM_DUMP_CHUNK_BYTES 320
+#define LLM_HTTP_BUFFER_SIZE 2048
+#define LLM_RETRY_DELAY_MS   600
+#define LLM_MIN_INTERNAL_FREE_FOR_TLS   (96 * 1024)
+#define LLM_MIN_INTERNAL_LARGEST_BLOCK  (32 * 1024)
 
 static char s_api_key[LLM_API_KEY_MAX_LEN] = {0};
 static char s_model[LLM_MODEL_MAX_LEN] = ESPAGENT_LLM_DEFAULT_MODEL;
@@ -79,6 +86,27 @@ static void safe_copy(char *dst, size_t dst_size, const char *src)
     size_t n = strnlen(src, dst_size - 1);
     memcpy(dst, src, n);
     dst[n] = '\0';
+}
+
+static void llm_log_heap_state(const char *label)
+{
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    size_t free_psram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG,
+             "%s heap: internal_free=%u largest_internal=%u psram_free=%u",
+             label,
+             (unsigned)free_internal,
+             (unsigned)largest_internal,
+             (unsigned)free_psram);
+}
+
+static bool llm_internal_heap_is_tight(void)
+{
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    return free_internal < LLM_MIN_INTERNAL_FREE_FOR_TLS ||
+           largest_internal < LLM_MIN_INTERNAL_LARGEST_BLOCK;
 }
 
 /* ── Response buffer ──────────────────────────────────────────── */
@@ -255,8 +283,8 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
         .event_handler = http_event_handler,
         .user_data = rb,
         .timeout_ms = 120 * 1000,
-        .buffer_size = 4096,
-        .buffer_size_tx = 4096,
+        .buffer_size = LLM_HTTP_BUFFER_SIZE,
+        .buffer_size_tx = LLM_HTTP_BUFFER_SIZE,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
@@ -620,12 +648,29 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     }
 
     int status = 0;
+    llm_log_heap_state("Before LLM HTTP");
     esp_err_t err = llm_http_call(post_data, &rb, &status);
+
+    if (err != ESP_OK && !http_proxy_is_enabled() && espagent_role_is_coordinator()) {
+        ESP_LOGW(TAG, "LLM HTTP failed once on coordinator, retrying after %dms", LLM_RETRY_DELAY_MS);
+        llm_log_heap_state("Retrying LLM HTTP");
+        vTaskDelay(pdMS_TO_TICKS(LLM_RETRY_DELAY_MS));
+        rb.len = 0;
+        if (rb.data && rb.cap > 0) {
+            rb.data[0] = '\0';
+        }
+        err = llm_http_call(post_data, &rb, &status);
+    }
+
     free(post_data);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "HTTP request failed: %s", esp_err_to_name(err));
         llm_log_payload("LLM tools partial response", rb.data);
+        if (err == ESP_FAIL && llm_internal_heap_is_tight()) {
+            llm_log_heap_state("LLM HTTP failed with tight heap");
+            err = ESP_ERR_NO_MEM;
+        }
         resp_buf_free(&rb);
         return err;
     }
@@ -635,6 +680,9 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     if (status != 200) {
         ESP_LOGE(TAG, "API error %d: %.500s", status, rb.data ? rb.data : "");
         resp_buf_free(&rb);
+        if (status == 429) {
+            return ESP_ERR_INVALID_STATE;
+        }
         return ESP_FAIL;
     }
 

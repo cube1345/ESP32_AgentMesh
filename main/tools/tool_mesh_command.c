@@ -89,6 +89,56 @@ static void compact_text_copy(char *dst, size_t dst_size, const char *src)
     dst[j] = '\0';
 }
 
+static void build_compact_output_summary(const char *output_json,
+                                         char *summary,
+                                         size_t summary_size)
+{
+    if (!summary || summary_size == 0) {
+        return;
+    }
+    summary[0] = '\0';
+    if (!output_json || output_json[0] == '\0') {
+        return;
+    }
+
+    cJSON *root = cJSON_Parse(output_json);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        compact_text_copy(summary, summary_size, output_json);
+        return;
+    }
+
+    const char *status = json_string(root, "status");
+    const char *action = json_string(root, "action");
+    const char *node_id = json_string(root, "node_id");
+    const char *result_text = NULL;
+    const char *error_text = NULL;
+
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    cJSON *error = cJSON_GetObjectItem(root, "error");
+    if (cJSON_IsObject(result)) {
+        result_text = json_string(result, "text");
+    }
+    if (cJSON_IsObject(error)) {
+        error_text = json_string(error, "message");
+    }
+
+    char compact[320] = {0};
+    compact_text_copy(compact, sizeof(compact),
+                      result_text && result_text[0] ? result_text : error_text);
+
+    snprintf(summary, summary_size,
+             "%s%s%s%s%s%s%s",
+             status && status[0] ? status : "unknown",
+             action && action[0] ? " action=" : "",
+             action && action[0] ? action : "",
+             node_id && node_id[0] ? " node=" : "",
+             node_id && node_id[0] ? node_id : "",
+             compact[0] ? " result=" : "",
+             compact[0] ? compact : "");
+    cJSON_Delete(root);
+}
+
 static void build_mesh_async_user_reply(const mesh_wait_task_ctx_t *ctx,
                                         const char *output_json,
                                         bool timed_out,
@@ -166,6 +216,7 @@ static bool is_control_action(const char *action)
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0 ||
@@ -778,9 +829,15 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                                      sizeof(output_json),
                                                                      wait_ms);
                 if (wait_err == ESP_OK) {
+                    char compact_summary[448] = {0};
+                    build_compact_output_summary(output_json,
+                                                 compact_summary,
+                                                 sizeof(compact_summary));
                     snprintf(output, output_size,
-                             "OK: mesh command completed command_id=%s output_message=%s",
-                             command_id_copy, output_json);
+                             "OK: mesh command completed command_id=%s %s",
+                             command_id_copy,
+                             compact_summary[0] ? compact_summary
+                                                : "result=ok");
                 } else {
                     snprintf(output, output_size,
                              "OK: queued MQTT mesh command action=%s topic=%s command_id=%s; OutputMessage wait timed out after %ums",

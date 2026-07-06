@@ -29,3 +29,8 @@ esp_err_t memory_append_today(const char *note);
  * @param days  Number of days to look back (default 3)
  */
 esp_err_t memory_read_recent(char *buf, size_t size, int days);
+
+/**
+ * Clear persisted long-term memory and daily memory notes.
+ */
+esp_err_t memory_clear_all(void);

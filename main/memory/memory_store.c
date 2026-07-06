@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include "esp_log.h"
 
@@ -104,4 +105,38 @@ esp_err_t memory_read_recent(char *buf, size_t size, int days)
     }
 
     return ESP_OK;
+}
+
+esp_err_t memory_clear_all(void)
+{
+    bool removed = false;
+
+    if (remove(ESPAGENT_MEMORY_FILE) == 0) {
+        removed = true;
+    }
+
+    DIR *dir = opendir(ESPAGENT_SPIFFS_BASE);
+    if (!dir) {
+        return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
+    }
+
+    struct dirent *entry = NULL;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strncmp(entry->d_name, "memory/", 7) != 0 ||
+            strstr(entry->d_name, ".md") == NULL) {
+            continue;
+        }
+
+        char path[320];
+        int n = snprintf(path, sizeof(path), "%s/%s", ESPAGENT_SPIFFS_BASE, entry->d_name);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            continue;
+        }
+        if (remove(path) == 0) {
+            removed = true;
+        }
+    }
+    closedir(dir);
+
+    return removed ? ESP_OK : ESP_ERR_NOT_FOUND;
 }

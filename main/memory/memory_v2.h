@@ -32,3 +32,5 @@ esp_err_t memory_v2_build_skill_summary(char *buf, size_t size);
 esp_err_t memory_v2_build_relevant_skill_summary(const char *query,
                                                  char *buf,
                                                  size_t size);
+
+esp_err_t memory_v2_clear_all(void);

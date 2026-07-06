@@ -24,6 +24,8 @@ esp_err_t tool_registry_init(void);
  * Returns NULL if no tools are registered.
  */
 const char *tool_registry_get_tools_json(void);
+const char *tool_registry_get_tools_json_compact_coordinator(void);
+const char *tool_registry_get_tools_json_mesh_only(void);
 
 /**
  * Get the registered tool table for internal tool composition.

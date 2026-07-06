@@ -14,6 +14,7 @@
 #include "tools/tool_virtual_device.h"
 #include "device/device_registry.h"
 #include "voice/voice_bridge.h"
+#include "voice/local_tts.h"
 
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -145,6 +146,22 @@ static void stateboard_note_event(const char *event_type,
                                   const char *status,
                                   const char *summary,
                                   const char *command_id);
+
+static size_t sensor_mqtt_pub_queue_depth_for_role(void)
+{
+    if (espagent_role_is_coordinator()) {
+        return 8;
+    }
+    return MQTT_PUB_QUEUE_DEPTH;
+}
+
+static uint32_t sensor_mqtt_stack_for_role(void)
+{
+    if (espagent_role_is_coordinator()) {
+        return 12 * 1024;
+    }
+    return ESPAGENT_SENSOR_MQTT_STACK;
+}
 
 static void mqtt_set_connected(bool connected)
 {
@@ -363,6 +380,32 @@ static int write_all(int fd, const uint8_t *data, size_t len)
     return 0;
 }
 
+static int recv_exact(int fd, void *buf, size_t len, int flags)
+{
+    uint8_t *dst = (uint8_t *)buf;
+    size_t off = 0;
+
+    while (off < len) {
+        int n = recv(fd, dst + off, len - off, flags);
+        if (n == 0) {
+            return -1;
+        }
+        if (n < 0) {
+            if ((errno == EAGAIN || errno == EWOULDBLOCK) && off == 0) {
+                return 0;
+            }
+            if (errno == EINTR) {
+                continue;
+            }
+            return -1;
+        }
+        off += (size_t)n;
+        flags &= ~MSG_DONTWAIT;
+    }
+
+    return (int)off;
+}
+
 static size_t mqtt_encode_remaining_len(uint8_t *out, size_t value)
 {
     size_t count = 0;
@@ -393,7 +436,7 @@ static int mqtt_read_remaining_len(int fd, size_t *out)
 
     for (int i = 0; i < 4; i++) {
         uint8_t byte = 0;
-        int n = recv(fd, &byte, 1, MSG_WAITALL);
+        int n = recv_exact(fd, &byte, 1, 0);
         if (n != 1) {
             return -1;
         }
@@ -415,7 +458,7 @@ static void mqtt_discard_bytes(int fd, size_t bytes)
     size_t left = bytes;
     while (left > 0) {
         size_t chunk = left < sizeof(scratch) ? left : sizeof(scratch);
-        int n = recv(fd, scratch, chunk, MSG_WAITALL);
+        int n = recv_exact(fd, scratch, chunk, 0);
         if (n <= 0) {
             return;
         }
@@ -444,7 +487,7 @@ static int mqtt_send_connect(int fd)
 static int mqtt_read_connack(int fd)
 {
     uint8_t resp[4] = {0};
-    int n = recv(fd, resp, sizeof(resp), MSG_WAITALL);
+    int n = recv_exact(fd, resp, sizeof(resp), 0);
     if (n != sizeof(resp)) {
         return -1;
     }
@@ -1281,6 +1324,7 @@ static bool policy_is_control_action(const char *action)
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0);
@@ -1371,6 +1415,19 @@ static bool guardian_control_args_allowed(const char *action,
             allowed = false;
             snprintf(reason, reason_size,
                      "persistent relay control requires confirmed=true or bounded duration_ms");
+        }
+    }
+
+    if (allowed && strcmp(action, "tts_speak") == 0) {
+        const char *text = json_optional_string(args, "text");
+        if (!text[0]) {
+            allowed = false;
+            snprintf(reason, reason_size, "tts_speak requires args.text");
+        } else if (strlen(text) > 320) {
+            allowed = false;
+            snprintf(reason, reason_size, "tts_speak text is too long");
+        } else {
+            snprintf(reason, reason_size, "allowed local TTS playback on control_agent");
         }
     }
 
@@ -1832,6 +1889,16 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = tool_servo_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "gpio_write") == 0) {
         err = tool_gpio_write_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "tts_speak") == 0) {
+        cJSON *root = cJSON_Parse(args);
+        const char *text = json_optional_string(root, "text");
+        if (!text[0]) {
+            snprintf(result, result_size, "Error: tts_speak requires args.text");
+            err = ESP_ERR_INVALID_ARG;
+        } else {
+            err = espagent_voice_local_tts_speak(text, result, result_size);
+        }
+        cJSON_Delete(root);
     } else if (strcmp(cmd->action, "gree_ac_control") == 0) {
         err = tool_gree_ac_control_execute(args, result, result_size);
     } else {
@@ -1869,6 +1936,7 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
         strcmp(cmd->action, "virtual_device_control") != 0 &&
         strcmp(cmd->action, "servo_write") != 0 &&
         strcmp(cmd->action, "gpio_write") != 0 &&
+        strcmp(cmd->action, "tts_speak") != 0 &&
         strcmp(cmd->action, "gree_ac_control") != 0 &&
         strcmp(cmd->action, "control_state") != 0 &&
         strcmp(cmd->action, "control_emergency_stop") != 0 &&
@@ -1997,7 +2065,7 @@ static int mqtt_connect_tcp(void)
 static void mqtt_poll_inbound(int fd)
 {
     uint8_t header = 0;
-    int n = recv(fd, &header, 1, MSG_DONTWAIT);
+    int n = recv_exact(fd, &header, 1, MSG_DONTWAIT);
     if (n <= 0) {
         return;
     }
@@ -2015,8 +2083,10 @@ static void mqtt_poll_inbound(int fd)
         mqtt_discard_bytes(fd, remaining);
         return;
     }
-    n = recv(fd, payload, remaining, MSG_WAITALL);
+    n = recv_exact(fd, payload, remaining, 0);
     if (n != (int)remaining) {
+        ESP_LOGW(TAG, "MQTT inbound packet truncated: type=0x%02x remaining=%u got=%d",
+                 packet_type, (unsigned)remaining, n);
         return;
     }
 
@@ -2339,7 +2409,8 @@ static void sensor_mqtt_task(void *arg)
         } else if (espagent_role_is_control()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 5);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_REQUEST, 5);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 6);
         } else if (espagent_role_is_guardian()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
@@ -2412,11 +2483,14 @@ esp_err_t sensor_mqtt_start(void)
     }
 
     if (!s_pub_queue) {
-        s_pub_queue = xQueueCreate(MQTT_PUB_QUEUE_DEPTH, sizeof(mqtt_pub_item_t));
+        size_t depth = sensor_mqtt_pub_queue_depth_for_role();
+        s_pub_queue = xQueueCreate(depth, sizeof(mqtt_pub_item_t));
         if (!s_pub_queue) {
             ESP_LOGE(TAG, "Failed to create MQTT publish queue");
             return ESP_ERR_NO_MEM;
         }
+        ESP_LOGI(TAG, "MQTT publish queue created: depth=%u role=%s",
+                 (unsigned)depth, espagent_node_role());
     }
     if (!s_mqtt_event_group) {
         s_mqtt_event_group = xEventGroupCreate();
@@ -2425,9 +2499,14 @@ esp_err_t sensor_mqtt_start(void)
         }
     }
 
+    uint32_t stack_size = sensor_mqtt_stack_for_role();
     BaseType_t ok = xTaskCreatePinnedToCore(sensor_mqtt_task, "sensor_mqtt",
-                                           ESPAGENT_SENSOR_MQTT_STACK, NULL,
+                                           stack_size, NULL,
                                            ESPAGENT_SENSOR_MQTT_PRIO, NULL,
                                            ESPAGENT_SENSOR_MQTT_CORE);
+    if (ok == pdPASS) {
+        ESP_LOGI(TAG, "sensor_mqtt task created: stack=%u role=%s",
+                 (unsigned)stack_size, espagent_node_role());
+    }
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
 }

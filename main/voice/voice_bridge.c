@@ -5,6 +5,7 @@
 #include "esp_timer.h"
 #include "espagent_config.h"
 #include "sensors/sensor_mqtt.h"
+#include "voice/local_tts.h"
 
 #include "cJSON.h"
 
@@ -40,6 +41,19 @@ esp_err_t espagent_voice_publish_tts_request(const char *text,
                                              const char *chat_id,
                                              const char *trace_id)
 {
+    return espagent_voice_publish_tts_request_to_device(text,
+                                                        ESPAGENT_VOICE_DEFAULT_DEVICE,
+                                                        source_channel,
+                                                        chat_id,
+                                                        trace_id);
+}
+
+esp_err_t espagent_voice_publish_tts_request_to_device(const char *text,
+                                                       const char *device_id,
+                                                       const char *source_channel,
+                                                       const char *chat_id,
+                                                       const char *trace_id)
+{
     if (!text || !text[0]) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -57,7 +71,8 @@ esp_err_t espagent_voice_publish_tts_request(const char *text,
     cJSON_AddStringToObject(root, "request_id", request_id);
     cJSON_AddStringToObject(root, "node_id", ESPAGENT_NODE_ID);
     cJSON_AddStringToObject(root, "role", ESPAGENT_NODE_ROLE);
-    cJSON_AddStringToObject(root, "device_id", ESPAGENT_VOICE_DEFAULT_DEVICE);
+    cJSON_AddStringToObject(root, "device_id",
+                            (device_id && device_id[0]) ? device_id : ESPAGENT_VOICE_DEFAULT_DEVICE);
     cJSON_AddStringToObject(root, "text", text);
     cJSON_AddBoolToObject(root, "auto_play", true);
     cJSON_AddNumberToObject(root, "ts_ms", (double)now_ms());
@@ -79,7 +94,7 @@ esp_err_t espagent_voice_publish_tts_request(const char *text,
                                                  text,
                                                  request_id,
                                                  "display_agent",
-                                                 ESPAGENT_VOICE_DEFAULT_DEVICE,
+                                                 (device_id && device_id[0]) ? device_id : ESPAGENT_VOICE_DEFAULT_DEVICE,
                                                  "tts_request");
     }
     cJSON_free(json);
@@ -229,11 +244,80 @@ static bool handle_stt_result(const char *payload, size_t payload_len)
     return true;
 }
 
+static bool voice_device_matches_local(const char *device_id)
+{
+    if (!device_id || !device_id[0]) {
+        return false;
+    }
+    return strcmp(device_id, ESPAGENT_NODE_ID) == 0 ||
+           strcmp(device_id, ESPAGENT_NODE_ROLE) == 0;
+}
+
+static bool handle_tts_request(const char *payload, size_t payload_len)
+{
+    char json_buf[1024];
+    size_t copy_len = payload_len >= sizeof(json_buf) ? sizeof(json_buf) - 1 : payload_len;
+    memcpy(json_buf, payload, copy_len);
+    json_buf[copy_len] = '\0';
+
+    cJSON *root = cJSON_Parse(json_buf);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    const cJSON *device_id = cJSON_GetObjectItem(root, "device_id");
+    const cJSON *request_id = cJSON_GetObjectItem(root, "request_id");
+    const cJSON *text = cJSON_GetObjectItem(root, "text");
+    const char *device_value = cJSON_IsString(device_id) ? device_id->valuestring : "";
+    const char *request_value = cJSON_IsString(request_id) ? request_id->valuestring : "";
+    const char *text_value = cJSON_IsString(text) ? text->valuestring : "";
+
+    if (!voice_device_matches_local(device_value) || !text_value[0]) {
+        cJSON_Delete(root);
+        return false;
+    }
+
+    char diag[256] = {0};
+    esp_err_t err = espagent_voice_local_tts_speak(text_value, diag, sizeof(diag));
+    ESP_LOGI(TAG, "Local voice TTS request handled: device=%s request_id=%s status=%s detail=%s",
+             device_value[0] ? device_value : "(none)",
+             request_value[0] ? request_value : "(none)",
+             esp_err_to_name(err),
+             diag[0] ? diag : "no detail");
+
+    cJSON *status_root = cJSON_CreateObject();
+    if (status_root) {
+        cJSON_AddStringToObject(status_root, "schema", "espagent.voice.tts_status.v1");
+        cJSON_AddStringToObject(status_root, "event", "tts_status");
+        cJSON_AddStringToObject(status_root, "request_id", request_value);
+        cJSON_AddStringToObject(status_root, "node_id", ESPAGENT_NODE_ID);
+        cJSON_AddStringToObject(status_root, "role", ESPAGENT_NODE_ROLE);
+        cJSON_AddStringToObject(status_root, "device_id", device_value);
+        cJSON_AddStringToObject(status_root, "status", err == ESP_OK ? "ok" : "error");
+        cJSON_AddStringToObject(status_root, "detail", diag[0] ? diag : esp_err_to_name(err));
+        cJSON_AddNumberToObject(status_root, "ts_ms", (double)now_ms());
+        char *status_json = cJSON_PrintUnformatted(status_root);
+        if (status_json) {
+            (void)sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, status_json);
+            cJSON_free(status_json);
+        }
+        cJSON_Delete(status_root);
+    }
+
+    cJSON_Delete(root);
+    return true;
+}
+
 bool espagent_voice_handle_mqtt_message(const char *topic,
                                         size_t topic_len,
                                         const char *payload,
                                         size_t payload_len)
 {
+    if (topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_VOICE_TTS_REQUEST)) {
+        return handle_tts_request(payload, payload_len);
+    }
+
     if (topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT)) {
         return handle_stt_result(payload, payload_len);
     }
