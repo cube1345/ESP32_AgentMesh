@@ -6,6 +6,7 @@
 #include "memory/memory_store.h"
 #include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
+#include "net/net_guard.h"
 #include "proactive/proactive_service.h"
 #include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
@@ -30,6 +31,7 @@ static const char *TAG = "agent";
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_SUMMARY_SIZE 4096
+#define AGENT_LLM_BACKGROUND_DEFER_MS 20000
 
 static bool message_prefers_direct_reply_no_tools(const char *message);
 static size_t append_prompt_format(char *prompt, size_t size, const char *fmt,
@@ -2019,6 +2021,9 @@ static void agent_loop_task(void *arg) {
     if (coordinator_transport_tight && history_limit > 3) {
       history_limit = 3;
     }
+    if (espagent_role_is_coordinator()) {
+      espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
+    }
 
     /* 1. Build system prompt */
     if (project_explanation_turn) {
@@ -2190,6 +2195,9 @@ static void agent_loop_task(void *arg) {
                  smalltalk_turn ? 1 : 0, general_qa_turn ? 1 : 0,
                  project_explanation_turn ? 1 : 0);
       }
+      if (espagent_role_is_coordinator()) {
+        espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
+      }
       err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
       if (compact_messages) {
         cJSON_Delete(compact_messages);
@@ -2202,6 +2210,9 @@ static void agent_loop_task(void *arg) {
         if (iteration == 0 && active_tools_json && !prefer_direct_reply) {
           ESP_LOGW(TAG,
                    "Retrying first LLM turn without tools after tool-enabled failure");
+          if (espagent_role_is_coordinator()) {
+            espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
+          }
           err = llm_chat_tools(system_prompt, messages, NULL, &resp);
           if (err == ESP_OK) {
             prefer_direct_reply = true;
@@ -2222,6 +2233,9 @@ static void agent_loop_task(void *arg) {
         ESP_LOGW(TAG,
                  "First LLM turn returned empty non-tool response with tools; retrying without tools");
         llm_response_free(&resp);
+        if (espagent_role_is_coordinator()) {
+          espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
+        }
         err = llm_chat_tools(system_prompt, messages, NULL, &resp);
         if (err == ESP_OK) {
           prefer_direct_reply = true;

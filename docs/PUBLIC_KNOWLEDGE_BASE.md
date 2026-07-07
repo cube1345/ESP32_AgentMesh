@@ -1199,6 +1199,11 @@ OTA 状态：
   - 这轮改动已通过完整 `idf.py build`，随后已烧录 `/dev/ttyUSB0` coordinator。
   - 对同一条长 explanation 压力问句再次实测，日志仍显示 `tight=1`，说明 coordinator 的 internal RAM 依旧紧张；但请求继续稳定成功，`Calling LLM API ... body: 3714 bytes`，且 `Before LLM HTTP heap: internal_free=20331 largest_internal=8192 psram_free=8186724`。
   - 与上一轮常见的 `largest_internal=7680` 相比，这轮至少把连续 internal block 稍微抬高到 `8192`，说明 Wi-Fi/LWIP 收缩对 TLS/HTTP 路径有一定帮助，但还没有把 coordinator 从 tight-memory 区间拉出来。
+- 2026-07-07 又补了一轮 coordinator 背景 MQTT 降噪，目标是让 LLM 调用窗口少受 housekeeping 干扰：
+  - `agent_loop.c` 在 coordinator turn 开始和每次 `llm_chat_tools()` 前都会调用 `espagent_net_guard_defer_background(20000)`，把当前对话标记为高优先级网络窗口。
+  - `sensor_mqtt.c` 对 coordinator 新增 `mqtt_coordinator_background_housekeeping_allowed()`：当 net guard 处于 defer 窗口时，暂停周期性 `nodes/.../state` 发布，并跳过 `nodes/+/state`、`nodes/+/telemetry` 的 watchdog/device_registry 处理和高频日志。
+  - 这轮改动已完成 build、烧录 `/dev/ttyUSB0` 和实机复测。热机后的 explanation 压测里，可以直接看到 `Coordinator MQTT housekeeping deferred during active LLM window: periodic_state/node_state/node_telemetry`，说明静默窗口已经在 LLM 前生效。
+  - 最新热机样本下，长 explanation 请求仍稳定成功；`Before LLM HTTP heap` 约为 `internal_free=23119 largest_internal=7680 psram_free=8186720`。这说明背景噪声被压下去了，但 `largest_internal` 仍然卡在 7.5KB~8KB 档，internal RAM 紧张问题还没有根治。
 - 后续如果继续优化 internal RAM，应优先压背景 MQTT state/telemetry/timeline 噪声和并发窗口，再评估是否需要进一步下调 socket/buffer 或动更高风险的 TLS 参数。
 - NVS 只有 24KB，后续如果存节点表、证书或更多运行时配置，建议扩容。
 - 本地工作区 `.git` 在当前工具环境里是只读 tmpfs 占位，普通 `git status` 不可用；当前私有仓库推送使用 `/tmp/ESP32_AgentMesh.git` 作为临时 Git 元数据目录完成。

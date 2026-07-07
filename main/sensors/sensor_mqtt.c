@@ -5,6 +5,7 @@
 #include "control/command_queue.h"
 #include "guardian/approval_queue.h"
 #include "mesh/mesh_protocol.h"
+#include "net/net_guard.h"
 #include "node/node_profile.h"
 #include "roles/role_config.h"
 #include "tools/tool_environment.h"
@@ -118,6 +119,7 @@ static bool s_mhz19_uart_ready = false;
 static QueueHandle_t s_pub_queue = NULL;
 static EventGroupHandle_t s_mqtt_event_group = NULL;
 static volatile bool s_mqtt_connected = false;
+static int64_t s_last_background_defer_log_ms = 0;
 static SemaphoreHandle_t s_output_mutex = NULL;
 static SemaphoreHandle_t s_policy_mutex = NULL;
 static output_cache_item_t s_output_cache[MQTT_OUTPUT_CACHE_DEPTH];
@@ -146,6 +148,7 @@ static void stateboard_note_event(const char *event_type,
                                   const char *status,
                                   const char *summary,
                                   const char *command_id);
+static bool mqtt_coordinator_background_housekeeping_allowed(const char *reason);
 
 static size_t sensor_mqtt_pub_queue_depth_for_role(void)
 {
@@ -161,6 +164,25 @@ static uint32_t sensor_mqtt_stack_for_role(void)
         return 12 * 1024;
     }
     return ESPAGENT_SENSOR_MQTT_STACK;
+}
+
+static bool mqtt_coordinator_background_housekeeping_allowed(const char *reason)
+{
+    if (!espagent_role_is_coordinator()) {
+        return true;
+    }
+    if (espagent_net_guard_background_allowed(0, 0)) {
+        return true;
+    }
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - s_last_background_defer_log_ms >= 2000) {
+        s_last_background_defer_log_ms = now_ms;
+        ESP_LOGI(TAG,
+                 "Coordinator MQTT housekeeping deferred during active LLM window: %s",
+                 reason ? reason : "background");
+    }
+    return false;
 }
 
 static void mqtt_set_connected(bool connected)
@@ -2130,15 +2152,26 @@ static void mqtt_poll_inbound(int fd)
                 snprintf(nodes_telemetry_filter, sizeof(nodes_telemetry_filter),
                          "%s/nodes/+/telemetry", ESPAGENT_MESH_TOPIC_PREFIX);
                 if (mqtt_topic_matches_filter(topic, topic_len, nodes_state_filter)) {
-                    guardian_watchdog_note_payload("state", msg, msg_len);
-                    (void)espagent_device_registry_note_mqtt_payload("state", msg, msg_len);
+                    if (mqtt_coordinator_background_housekeeping_allowed("node_state")) {
+                        guardian_watchdog_note_payload("state", msg, msg_len);
+                        (void)espagent_device_registry_note_mqtt_payload("state", msg, msg_len);
+                        ESP_LOGI(TAG, "MQTT inbound %.*s: %.*s",
+                                 (int)topic_len, (const char *)topic,
+                                 (int)msg_len, msg);
+                    }
                 } else if (mqtt_topic_matches_filter(topic, topic_len, nodes_telemetry_filter)) {
-                    guardian_watchdog_note_payload("telemetry", msg, msg_len);
-                    (void)espagent_device_registry_note_mqtt_payload("telemetry", msg, msg_len);
+                    if (mqtt_coordinator_background_housekeeping_allowed("node_telemetry")) {
+                        guardian_watchdog_note_payload("telemetry", msg, msg_len);
+                        (void)espagent_device_registry_note_mqtt_payload("telemetry", msg, msg_len);
+                        ESP_LOGI(TAG, "MQTT inbound %.*s: %.*s",
+                                 (int)topic_len, (const char *)topic,
+                                 (int)msg_len, msg);
+                    }
+                } else {
+                    ESP_LOGI(TAG, "MQTT inbound %.*s: %.*s",
+                             (int)topic_len, (const char *)topic,
+                             (int)msg_len, msg);
                 }
-                ESP_LOGI(TAG, "MQTT inbound %.*s: %.*s",
-                         (int)topic_len, (const char *)topic,
-                         (int)msg_len, msg);
             }
         }
     }
@@ -2454,6 +2487,10 @@ static void sensor_mqtt_task(void *arg)
             if (last_periodic_publish_ms == 0 ||
                 now_ms - last_periodic_publish_ms >= ESPAGENT_SENSOR_MQTT_PUBLISH_INTERVAL_MS) {
                 last_periodic_publish_ms = now_ms;
+                if (!publish_telemetry &&
+                    !mqtt_coordinator_background_housekeeping_allowed("periodic_state")) {
+                    continue;
+                }
                 if (publish_telemetry) {
                     esp_err_t telemetry_err = publish_sensor_data(fd);
                     if (telemetry_err == ESP_FAIL) {
