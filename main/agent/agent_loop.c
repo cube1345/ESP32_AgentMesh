@@ -169,6 +169,33 @@ static void build_project_explanation_prompt(char *prompt, size_t size,
   }
 }
 
+static void build_tight_coordinator_prompt(char *prompt, size_t size,
+                                           const espagent_msg_t *msg) {
+  if (!prompt || size == 0) {
+    return;
+  }
+
+  snprintf(
+      prompt, size,
+      "# ESPAgent Tight Coordinator\n\n"
+      "You are ESPAgent running on the coordinator node.\n"
+      "The current turn is under tight memory pressure, so keep reasoning compact and tool use minimal.\n"
+      "Be accurate and concise.\n"
+      "Use tools only when they are necessary to complete the user's request.\n"
+      "For ordinary sensing requests, prefer mesh_send_command to sensor_agent.\n"
+      "For remote actuator or device control requests, prefer mesh_send_command to control_agent.\n"
+      "For policy or audit requests, prefer mesh_send_command to guardian_agent.\n"
+      "Never claim a tool or mesh action succeeded unless the result says it succeeded.\n"
+      "If the request is ambiguous, ask one short follow-up question.\n");
+
+  if (msg && msg->channel[0]) {
+    append_prompt_format(prompt, size,
+                         "\nTurn channel: %s\n"
+                         "Respond naturally for this chat surface.\n",
+                         msg->channel);
+  }
+}
+
 static bool contains_substr_ci(const char *haystack, const char *needle) {
   if (!haystack || !needle || needle[0] == '\0') {
     return false;
@@ -1978,6 +2005,8 @@ static void agent_loop_task(void *arg) {
         espagent_role_is_coordinator() &&
         !project_explanation_turn &&
         message_is_general_qa_turn(msg.content);
+    bool coordinator_transport_tight =
+        espagent_role_is_coordinator() && llm_transport_heap_is_tight();
     bool prefer_direct_reply = message_prefers_direct_reply_no_tools(
                                    msg.content) ||
                                smalltalk_turn || general_qa_turn ||
@@ -1987,6 +2016,9 @@ static void agent_loop_task(void *arg) {
     int history_limit =
         history_limit_for_turn(smalltalk_turn, prefer_direct_reply,
                                project_explanation_turn);
+    if (coordinator_transport_tight && history_limit > 3) {
+      history_limit = 3;
+    }
 
     /* 1. Build system prompt */
     if (project_explanation_turn) {
@@ -1997,6 +2029,10 @@ static void agent_loop_task(void *arg) {
       build_lightweight_direct_reply_prompt(system_prompt,
                                            ESPAGENT_CONTEXT_BUF_SIZE,
                                            &msg);
+    } else if (coordinator_transport_tight) {
+      build_tight_coordinator_prompt(system_prompt,
+                                     ESPAGENT_CONTEXT_BUF_SIZE,
+                                     &msg);
     } else {
       context_build_system_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE);
       append_turn_context_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, &msg);
@@ -2008,14 +2044,15 @@ static void agent_loop_task(void *arg) {
     session_get_history_json(msg.chat_id, history_json,
                              ESPAGENT_LLM_STREAM_BUF_SIZE, history_limit);
     ESP_LOGI(TAG,
-             "History loaded: limit=%d bytes=%u direct_reply=%d smalltalk=%d general_qa=%d project_explain=%d",
+             "History loaded: limit=%d bytes=%u direct_reply=%d smalltalk=%d general_qa=%d project_explain=%d tight=%d",
              history_limit,
              (unsigned)strlen(history_json),
              prefer_direct_reply ? 1 : 0,
              smalltalk_turn ? 1 : 0,
              general_qa_turn ? 1 : 0,
-             project_explanation_turn ? 1 : 0);
-    if (!use_lightweight_direct_prompt) {
+             project_explanation_turn ? 1 : 0,
+             coordinator_transport_tight ? 1 : 0);
+    if (!use_lightweight_direct_prompt && !coordinator_transport_tight) {
       memset(relevance_query, 0, 1024);
       build_relevance_query(msg.content, relevance_query, 1024);
       if (!espagent_role_is_coordinator()) {
@@ -2061,9 +2098,12 @@ static void agent_loop_task(void *arg) {
                              "\n## Relevant Skill Details For This Turn\n\n%s\n",
                              turn_buf);
       }
-      append_pending_clarification_prompt(system_prompt,
+        append_pending_clarification_prompt(system_prompt,
                                           ESPAGENT_CONTEXT_BUF_SIZE,
                                           history_json);
+    } else if (coordinator_transport_tight) {
+      ESP_LOGW(TAG,
+               "Coordinator transport heap is tight; skipping skill/memory context expansion for this turn");
     }
 
     cJSON *messages = cJSON_Parse(history_json);
