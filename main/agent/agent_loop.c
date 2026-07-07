@@ -198,6 +198,44 @@ static bool contains_substr_ci(const char *haystack, const char *needle) {
   return false;
 }
 
+static bool is_ascii_word_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
+static bool contains_ascii_word_ci(const char *haystack, const char *needle) {
+  if (!haystack || !needle || needle[0] == '\0') {
+    return false;
+  }
+
+  const size_t needle_len = strlen(needle);
+  for (const char *p = haystack; *p; p++) {
+    size_t i = 0;
+    while (i < needle_len && p[i]) {
+      unsigned char hc = (unsigned char)p[i];
+      unsigned char nc = (unsigned char)needle[i];
+
+      if (hc >= 'A' && hc <= 'Z')
+        hc = (unsigned char)(hc - 'A' + 'a');
+      if (nc >= 'A' && nc <= 'Z')
+        nc = (unsigned char)(nc - 'A' + 'a');
+      if (hc != nc) {
+        break;
+      }
+      i++;
+    }
+    if (i == needle_len) {
+      char prev = (p == haystack) ? '\0' : p[-1];
+      char next = p[i];
+      if (!is_ascii_word_char(prev) && !is_ascii_word_char(next)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 static bool message_has_any_keyword(const char *message,
                                     const char *const *keywords,
                                     size_t keyword_count) {
@@ -1252,8 +1290,11 @@ static bool message_prefers_direct_reply_no_tools(const char *message) {
 
 static bool message_is_simple_greeting_or_smalltalk(const char *message) {
   static const char *const markers[] = {
-      "你好", "您好", "hello", "hi", "hey", "早上好", "中午好", "晚上好",
-      "在吗", "在不在", "收到吗", "谢谢", "感谢", "bye", "再见",
+      "你好", "您好", "早上好", "中午好", "晚上好",
+      "在吗", "在不在", "收到吗", "谢谢", "感谢", "再见",
+  };
+  static const char *const ascii_markers[] = {
+      "hello", "hi", "hey", "bye",
   };
 
   if (!message || message[0] == '\0') {
@@ -1264,8 +1305,19 @@ static bool message_is_simple_greeting_or_smalltalk(const char *message) {
     return false;
   }
 
-  return message_has_any_keyword(message, markers,
-                                 sizeof(markers) / sizeof(markers[0]));
+  if (message_has_any_keyword(message, markers,
+                              sizeof(markers) / sizeof(markers[0]))) {
+    return true;
+  }
+
+  for (size_t i = 0; i < sizeof(ascii_markers) / sizeof(ascii_markers[0]);
+       i++) {
+    if (contains_ascii_word_ci(message, ascii_markers[i])) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static bool message_is_general_qa_turn(const char *message) {
@@ -1316,8 +1368,12 @@ static bool message_is_project_explanation_turn(const char *message) {
       "skills",       "memory",        "cache",         "mcp",
       "feishu",       "websocket",     "mqtt",          "esp32",
       "coordinator",  "guardian",      "sensor_agent",  "control_agent",
-      "为什么",       "什么意思",      "怎么做",        "如何修改",
-      "如何优化",     "介绍一下",      "解释一下",      "说一下",
+      "project",      "architecture",  "design",        "implementation",
+      "prompt",       "routing",       "orchestration", "context",
+      "why",          "meaning",       "how to",        "explain",
+      "introduce",    "overview",      "what does",     "为什么",
+      "什么意思",      "怎么做",        "如何修改",      "如何优化",
+      "介绍一下",      "解释一下",      "说一下",
   };
 
   if (!message || message[0] == '\0') {
