@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { URL } from 'node:url';
 import mqtt from 'mqtt';
+import { WebSocketServer, WebSocket } from 'ws';
 
 const PORT = Number(process.env.ESPAGENT_DASHBOARD_PORT || 4175);
 const MQTT_HOST = process.env.ESPAGENT_MQTT_HOST || 'broker.emqx.io';
@@ -8,6 +9,22 @@ const MQTT_PORT = Number(process.env.ESPAGENT_MQTT_PORT || 1883);
 const MQTT_PROTOCOL = process.env.ESPAGENT_MQTT_PROTOCOL || 'mqtt';
 const TOPIC_PREFIX = (process.env.ESPAGENT_TOPIC_PREFIX || 'espagent/cube1345').replace(/\/+$/, '');
 const MQTT_URL = `${MQTT_PROTOCOL}://${MQTT_HOST}:${MQTT_PORT}`;
+const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
+const CHAT_GATEWAY_PATH = '/ws';
+const runtimeSkills = new Map();
+
+function deriveDefaultAgentWsUrl() {
+  if (!SKILLS_API_BASE) return '';
+  try {
+    const upstream = new URL(SKILLS_API_BASE);
+    const protocol = upstream.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${upstream.hostname}:18789/`;
+  } catch {
+    return '';
+  }
+}
+
+const AGENT_WS_URL = (process.env.ESPAGENT_AGENT_WS_URL || deriveDefaultAgentWsUrl()).trim();
 
 function nowIso() {
   return new Date().toISOString();
@@ -41,6 +58,88 @@ function safeJsonParse(input) {
   }
 }
 
+function skillDraftToMarkdown(skill) {
+  const lines = [
+    `# ${skill.name || 'Untitled Skill'}`,
+    '',
+    `- Scope: ${skill.scope || 'unspecified'}`,
+    `- Trigger: ${skill.trigger || 'manual'}`,
+    `- Policy: ${skill.policy || 'none'}`,
+    `- Enabled: ${skill.enabled ? 'true' : 'false'}`,
+    '',
+    '## Prompt',
+    '',
+    skill.prompt || ''
+  ];
+  return lines.join('\n').trimEnd() + '\n';
+}
+
+function normalizeSkillName(name) {
+  return String(name || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 48);
+}
+
+function draftToRuntimeRecord(skill, source = 'local_mock', message = 'runtime skill installed') {
+  const runtimeName = normalizeSkillName(skill.name || skill.id);
+  return {
+    id: skill.id || runtimeName,
+    runtimeName,
+    title: skill.name || runtimeName,
+    path: `/spiffs/skills/${runtimeName}.md`,
+    source,
+    installedAt: nowIso(),
+    cacheState: source === 'proxy' ? 'unknown' : 'invalidated',
+    status: 'installed',
+    scope: skill.scope || 'unspecified',
+    enabled: Boolean(skill.enabled),
+    lastMessage: message
+  };
+}
+
+function upstreamSkillToRuntimeRecord(item) {
+  const runtimeName = normalizeSkillName(item?.name || item?.title || 'unknown');
+  return {
+    id: runtimeName,
+    runtimeName,
+    title: item?.title || item?.name || runtimeName,
+    path: item?.path || `/spiffs/skills/${runtimeName}.md`,
+    source: 'proxy',
+    installedAt: nowIso(),
+    cacheState: 'unknown',
+    status: 'installed',
+    scope: 'runtime',
+    enabled: true,
+    lastMessage: typeof item?.size_bytes === 'number'
+      ? `upstream listed, ${item.size_bytes} bytes`
+      : 'upstream listed'
+  };
+}
+
+function listRuntimeSkills() {
+  return Array.from(runtimeSkills.values()).sort((a, b) => {
+    return String(b.installedAt).localeCompare(String(a.installedAt));
+  });
+}
+
+async function fetchUpstreamRuntimeSkills() {
+  const response = await fetch(`${SKILLS_API_BASE}/api/skills`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.ok === false || !Array.isArray(payload?.skills)) {
+    throw new Error(payload?.error || `HTTP ${response.status}`);
+  }
+
+  runtimeSkills.clear();
+  for (const item of payload.skills) {
+    const record = upstreamSkillToRuntimeRecord(item);
+    runtimeSkills.set(record.runtimeName, record);
+  }
+  return listRuntimeSkills();
+}
+
 function createStore() {
   return {
     mqtt: {
@@ -48,6 +147,15 @@ function createStore() {
       url: MQTT_URL,
       topicPrefix: TOPIC_PREFIX,
       lastEventAt: null
+    },
+    chatGateway: {
+      enabled: Boolean(AGENT_WS_URL),
+      path: CHAT_GATEWAY_PATH,
+      upstreamUrl: AGENT_WS_URL || null,
+      activeSessions: 0,
+      connectedSessions: 0,
+      lastEventAt: null,
+      lastError: null
     },
     nodes: new Map(),
     telemetry: new Map(),
@@ -178,8 +286,154 @@ function toDashboardPayload() {
     preferences,
     flows,
     mqtt: store.mqtt,
+    chatGateway: store.chatGateway,
     guardian: store.guardian
   };
+}
+
+function noteChatGatewayEvent(error = null) {
+  store.chatGateway.lastEventAt = nowIso();
+  store.chatGateway.lastError = error;
+}
+
+function sendWsJson(socket, payload) {
+  if (socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  socket.send(JSON.stringify(payload));
+}
+
+function createChatSession(downstream) {
+  const session = {
+    downstream,
+    upstream: null,
+    pendingMessages: [],
+    upstreamConnected: false
+  };
+
+  function ensureUpstream() {
+    if (!AGENT_WS_URL) {
+      noteChatGatewayEvent('ESPAGENT_AGENT_WS_URL is empty');
+      sendWsJson(downstream, {
+        type: 'system',
+        content: '聊天网关未配置上游 ESP32 WebSocket 地址。'
+      });
+      return null;
+    }
+
+    if (session.upstream &&
+        (session.upstream.readyState === WebSocket.OPEN ||
+         session.upstream.readyState === WebSocket.CONNECTING)) {
+      return session.upstream;
+    }
+
+    const upstream = new WebSocket(AGENT_WS_URL);
+    session.upstream = upstream;
+    noteChatGatewayEvent(null);
+
+    upstream.on('open', () => {
+      session.upstreamConnected = true;
+      store.chatGateway.connectedSessions += 1;
+      noteChatGatewayEvent(null);
+      sendWsJson(downstream, {
+        type: 'system',
+        content: `已连接到上游 ESP32 网关：${AGENT_WS_URL}`
+      });
+      while (session.pendingMessages.length > 0 && upstream.readyState === WebSocket.OPEN) {
+        upstream.send(session.pendingMessages.shift());
+      }
+    });
+
+    upstream.on('message', (data) => {
+      noteChatGatewayEvent(null);
+      if (downstream.readyState === WebSocket.OPEN) {
+        downstream.send(typeof data === 'string' ? data : data.toString());
+      }
+    });
+
+    upstream.on('close', () => {
+      if (session.upstreamConnected) {
+        store.chatGateway.connectedSessions = Math.max(0, store.chatGateway.connectedSessions - 1);
+      }
+      session.upstreamConnected = false;
+      session.upstream = null;
+      noteChatGatewayEvent('upstream websocket closed');
+      sendWsJson(downstream, {
+        type: 'system',
+        content: '上游 ESP32 WebSocket 已断开。下一次发送时会自动重连。'
+      });
+    });
+
+    upstream.on('error', (error) => {
+      noteChatGatewayEvent(error instanceof Error ? error.message : 'upstream websocket error');
+      sendWsJson(downstream, {
+        type: 'system',
+        content: `上游 ESP32 WebSocket 异常：${error instanceof Error ? error.message : 'unknown error'}`
+      });
+    });
+
+    return upstream;
+  }
+
+  store.chatGateway.activeSessions += 1;
+  noteChatGatewayEvent(null);
+  ensureUpstream();
+
+  downstream.on('message', (raw) => {
+    const text = typeof raw === 'string' ? raw : raw.toString();
+    const payload = safeJsonParse(text);
+    if (!payload || payload.type !== 'message' || typeof payload.content !== 'string') {
+      sendWsJson(downstream, {
+        type: 'system',
+        content: '网关只接受 {"type":"message","content":"...","chat_id":"..."} 格式。'
+      });
+      return;
+    }
+
+    const upstream = ensureUpstream();
+    if (!upstream) {
+      return;
+    }
+
+    if (upstream.readyState === WebSocket.OPEN) {
+      upstream.send(text);
+      noteChatGatewayEvent(null);
+      return;
+    }
+
+    if (upstream.readyState === WebSocket.CONNECTING) {
+      if (session.pendingMessages.length >= 16) {
+        session.pendingMessages.shift();
+      }
+      session.pendingMessages.push(text);
+      sendWsJson(downstream, {
+        type: 'system',
+        content: '上游网关正在连接，消息已进入本地等待队列。'
+      });
+      return;
+    }
+
+    sendWsJson(downstream, {
+      type: 'system',
+      content: '上游网关当前不可用，请重试。'
+    });
+  });
+
+  downstream.on('close', () => {
+    store.chatGateway.activeSessions = Math.max(0, store.chatGateway.activeSessions - 1);
+    if (session.upstreamConnected) {
+      store.chatGateway.connectedSessions = Math.max(0, store.chatGateway.connectedSessions - 1);
+    }
+    session.upstreamConnected = false;
+    noteChatGatewayEvent(null);
+    if (session.upstream &&
+        (session.upstream.readyState === WebSocket.OPEN ||
+         session.upstream.readyState === WebSocket.CONNECTING)) {
+      session.upstream.close();
+    }
+    session.upstream = null;
+    session.pendingMessages.length = 0;
+  });
 }
 
 function handleTelemetry(topic, payload) {
@@ -344,6 +598,32 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'GET' && url.pathname === '/api/skills/runtime') {
+    if (SKILLS_API_BASE) {
+      fetchUpstreamRuntimeSkills()
+        .then((skills) => {
+          sendJson(res, 200, {
+            skills,
+            source: 'proxy'
+          });
+        })
+        .catch((error) => {
+          sendJson(res, 502, {
+            skills: listRuntimeSkills(),
+            source: 'proxy',
+            error: error instanceof Error ? error.message : 'upstream runtime list failed'
+          });
+        });
+      return;
+    }
+
+    sendJson(res, 200, {
+      skills: listRuntimeSkills(),
+      source: 'local_mock'
+    });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/skills') {
     let body = '';
     req.on('data', (chunk) => {
@@ -351,7 +631,112 @@ const server = http.createServer((req, res) => {
     });
     req.on('end', () => {
       const payload = safeJsonParse(body);
-      sendJson(res, 200, Array.isArray(payload?.skills) ? payload.skills : []);
+      const skills = Array.isArray(payload?.skills) ? payload.skills : [];
+      sendJson(res, 200, { skills });
+    });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/skills/install') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      const payload = safeJsonParse(body);
+      const skill = payload?.skill;
+      const confirmed = Boolean(payload?.confirmed);
+      const source = SKILLS_API_BASE ? 'proxy' : 'local_mock';
+
+      if (!skill || typeof skill !== 'object') {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'missing skill payload',
+          error: 'missing skill payload'
+        });
+        return;
+      }
+      if (!confirmed) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'skill install requires confirmed=true',
+          error: 'skill install requires confirmed=true'
+        });
+        return;
+      }
+
+      const runtimeName = normalizeSkillName(skill.name || skill.id);
+      if (!runtimeName) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'invalid runtime skill name',
+          error: 'invalid runtime skill name'
+        });
+        return;
+      }
+
+      if (SKILLS_API_BASE) {
+        try {
+          const upstream = await fetch(`${SKILLS_API_BASE}/api/skills`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: runtimeName,
+              content: skillDraftToMarkdown(skill),
+              confirmed: true
+            })
+          });
+          const upstreamPayload = await upstream.json().catch(() => ({}));
+          if (!upstream.ok || upstreamPayload?.ok === false) {
+            sendJson(res, 502, {
+              ok: false,
+              source,
+              message: 'runtime install failed on upstream gateway',
+              error: upstreamPayload?.error || `HTTP ${upstream.status}`
+            });
+            return;
+          }
+
+          const installed = upstreamSkillToRuntimeRecord({
+            name: runtimeName,
+            title: skill.name || runtimeName,
+            path: `/spiffs/skills/${runtimeName}.md`
+          });
+          installed.lastMessage = upstreamPayload?.message || 'proxied to runtime gateway';
+          runtimeSkills.set(installed.runtimeName, installed);
+          sendJson(res, 200, {
+            ok: true,
+            source,
+            message: installed.lastMessage,
+            skill: installed
+          });
+          return;
+        } catch (error) {
+          sendJson(res, 502, {
+            ok: false,
+            source,
+            message: 'runtime install request failed',
+            error: error instanceof Error ? error.message : 'runtime install request failed'
+          });
+          return;
+        }
+      }
+
+      const installed = draftToRuntimeRecord(
+        skill,
+        'local_mock',
+        'front-end runtime install simulated; ESP32 SPIFFS not yet connected'
+      );
+      runtimeSkills.set(installed.runtimeName, installed);
+      sendJson(res, 200, {
+        ok: true,
+        source,
+        message: installed.lastMessage,
+        skill: installed
+      });
     });
     return;
   }
@@ -371,7 +756,25 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: 'not found' });
 });
 
+const wsServer = new WebSocketServer({ noServer: true });
+wsServer.on('connection', (socket) => {
+  createChatSession(socket);
+});
+
+server.on('upgrade', (req, socket, head) => {
+  const url = new URL(req.url || '/', `http://${req.headers.host || '127.0.0.1'}`);
+  if (url.pathname !== CHAT_GATEWAY_PATH) {
+    socket.destroy();
+    return;
+  }
+
+  wsServer.handleUpgrade(req, socket, head, (client) => {
+    wsServer.emit('connection', client, req);
+  });
+});
+
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[dashboard] http://127.0.0.1:${PORT}`);
   console.log(`[dashboard] mqtt=${MQTT_URL} prefix=${TOPIC_PREFIX}`);
+  console.log(`[dashboard] chat-gateway=${CHAT_GATEWAY_PATH} upstream=${AGENT_WS_URL || 'disabled'}`);
 });

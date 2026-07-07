@@ -50,6 +50,33 @@ export interface SkillDraft {
   enabled: boolean;
 }
 
+export interface RuntimeSkillRecord {
+  id: string;
+  runtimeName: string;
+  title: string;
+  path: string;
+  source: 'local_mock' | 'proxy';
+  installedAt: string;
+  cacheState: 'invalidated' | 'unknown';
+  status: 'installed' | 'pending' | 'failed';
+  scope: string;
+  enabled: boolean;
+  lastMessage?: string;
+}
+
+export interface RuntimeSkillListResponse {
+  skills: RuntimeSkillRecord[];
+  source: 'local_mock' | 'proxy';
+}
+
+export interface RuntimeSkillInstallResponse {
+  ok: boolean;
+  skill?: RuntimeSkillRecord;
+  source: 'local_mock' | 'proxy';
+  message: string;
+  error?: string;
+}
+
 export interface UserPreferenceProfile {
   preferredChannel: string;
   voiceOutput: boolean;
@@ -82,6 +109,15 @@ export interface DashboardPayload {
     url: string;
     topicPrefix: string;
     lastEventAt: string | null;
+  };
+  chatGateway?: {
+    enabled: boolean;
+    path: string;
+    upstreamUrl: string | null;
+    activeSessions: number;
+    connectedSessions: number;
+    lastEventAt: string | null;
+    lastError: string | null;
   };
   guardian?: {
     updatedAt: string;

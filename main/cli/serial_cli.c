@@ -256,6 +256,20 @@ static int cmd_set_model_provider(int argc, char **argv)
     return 0;
 }
 
+static int cmd_llm_last_error(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    char buf[256] = {0};
+    if (llm_get_last_error(buf, sizeof(buf))) {
+        printf("Last LLM error: %s\n", buf);
+    } else {
+        printf("Last LLM error: (empty)\n");
+    }
+    return 0;
+}
+
 /* --- memory_read command --- */
 static int cmd_memory_read(int argc, char **argv)
 {
@@ -1482,6 +1496,13 @@ esp_err_t serial_cli_init(void)
         .argtable = &provider_args,
     };
     esp_console_cmd_register(&provider_cmd);
+
+    esp_console_cmd_t llm_last_error_cmd = {
+        .command = "llm_last_error",
+        .help = "Show the latest LLM transport/upstream failure summary",
+        .func = &cmd_llm_last_error,
+    };
+    esp_console_cmd_register(&llm_last_error_cmd);
 
     /* skill_list */
     esp_console_cmd_t skill_list_cmd = {

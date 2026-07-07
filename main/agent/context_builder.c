@@ -224,6 +224,18 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "- Persistent memory and skills exist in SPIFFS. Keep outputs concise and only use memory tools when the fact is stable and useful.\n"
             "- Skills live under " ESPAGENT_SKILLS_PREFIX " and should be read when a task clearly matches them.\n\n"
             "Provide the final answer as normal text after any needed tool calls.\n");
+
+        char compact_skills[2048] = {0};
+        if (skill_loader_build_summary(compact_skills, sizeof(compact_skills)) > 0 &&
+            compact_skills[0]) {
+            off = append_section_text_limited(buf, size, off,
+                                              "Skills Summary",
+                                              compact_skills,
+                                              CONTEXT_SECTION_MAX_SHORT);
+        }
+
+        ESP_LOGI(TAG, "System prompt built (coordinator compact): %d bytes", (int)off);
+        return ESP_OK;
     } else {
         off = append_format(
             buf, size, off,
@@ -297,11 +309,6 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "Lua script execution is a system-level extension capability. Call lua_runtime_info before relying on it. Use lua_list_scripts when the path is unknown, and lua_list_modules when module availability matters. Only call lua_run_script, lua_run_script_async, or lua_run_source when the user explicitly confirms running a known script or development test. Lua scripts must not be used to bypass sandbox, Guardian policy, Mesh command validation, or hardware interlocks. When Lua is linked, scripts may call require('espagent') or global espagent; espagent.call_capability(name, args_json) still goes through ESPAgent tool sandbox and role policy. Inline source is for development smoke tests; production behavior should use versioned scripts under SPIFFS.\n"
             "If a tool returns a sandbox denial, explain the denial and ask for the missing confirmation or safer parameters. Do not retry by using a different tool to bypass the sandbox.\n\n"
             "For the onboard RGB status light, the configured WS2812 default pin is GPIO " ESPAGENT_STRINGIFY(ESPAGENT_WS2812_DEFAULT_GPIO) ".\n");
-    }
-
-    if (coordinator_compact) {
-        ESP_LOGI(TAG, "System prompt built (coordinator compact): %d bytes", (int)off);
-        return ESP_OK;
     }
 
     off = append_format(
@@ -418,6 +425,14 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
     if (dynamic_extension_build_catalog(scratch, 2048) == ESP_OK && scratch[0]) {
         off = append_section_text_limited(buf, size, off,
                                           "Dynamic Hardware Extension Catalog",
+                                          scratch,
+                                          CONTEXT_SECTION_MAX_MED);
+    }
+
+    scratch[0] = '\0';
+    if (skill_loader_build_summary(scratch, 4096) > 0 && scratch[0]) {
+        off = append_section_text_limited(buf, size, off,
+                                          "Skills Summary",
                                           scratch,
                                           CONTEXT_SECTION_MAX_MED);
     }

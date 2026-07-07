@@ -612,11 +612,7 @@ esp_err_t espagent_app_start_network_services(void)
     }
 
     if (espagent_role_runs_chat_channels()) {
-        if (espagent_role_is_coordinator()) {
-            ESP_LOGI(TAG, "WebSocket chat gateway deferred on coordinator to preserve Feishu/LLM memory headroom");
-        } else {
-            ESP_RETURN_ON_ERROR(ws_server_start(), TAG, "ws_server_start failed");
-        }
+        ESP_RETURN_ON_ERROR(ws_server_start(), TAG, "ws_server_start failed");
     } else {
         ESP_LOGI(TAG, "WebSocket chat gateway skipped for role=%s", ESPAGENT_NODE_ROLE);
     }

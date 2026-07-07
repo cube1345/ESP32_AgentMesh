@@ -15,7 +15,9 @@ static bool is_action_command(const char *command)
     return command &&
            (strcmp(command, "clear") == 0 ||
             strcmp(command, "clear_all_memory") == 0 ||
-            strcmp(command, "context_status") == 0);
+            strcmp(command, "context_status") == 0 ||
+            strcmp(command, "skills_list") == 0 ||
+            strcmp(command, "skills_show") == 0);
 }
 
 static const slash_command_spec_t s_commands[] = {
@@ -32,6 +34,16 @@ static const slash_command_spec_t s_commands[] = {
     {
         .name = "context_status",
         .usage = "/context_status",
+        .template_text = NULL,
+    },
+    {
+        .name = "skills_list",
+        .usage = "/skills_list",
+        .template_text = NULL,
+    },
+    {
+        .name = "skills_show",
+        .usage = "/skills_show <skill_name>",
         .template_text = NULL,
     },
     {
@@ -200,6 +212,10 @@ static void build_help_text(espagent_slash_result_t *result)
                     "/clear_all_memory - clear session + MEMORY/profile/skills/trace\n");
     off += snprintf(result->text + off, sizeof(result->text) - off,
                     "/context_status - show current chat_id history/brief/trace usage\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/skills_list - show all loaded skills\n");
+    off += snprintf(result->text + off, sizeof(result->text) - off,
+                    "/skills_show <skill_name> - show one skill content\n");
     for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]) && off < sizeof(result->text); i++) {
         off += snprintf(result->text + off, sizeof(result->text) - off,
                         "%s - %s\n", s_commands[i].usage, s_commands[i].name);
@@ -250,6 +266,17 @@ bool espagent_slash_try_handle(const char *input, espagent_slash_result_t *resul
 
         snprintf(result->command, sizeof(result->command), "%s", command);
         if (is_action_command(command)) {
+            if (strcmp(command, "skills_show") == 0) {
+                if (!p || p[0] == '\0') {
+                    result->type = ESPAGENT_SLASH_ERROR;
+                    snprintf(result->text, sizeof(result->text),
+                             "Missing skill name after /skills_show.\nUsage: /skills_show <skill_name>");
+                    return true;
+                }
+                result->type = ESPAGENT_SLASH_ACTION;
+                snprintf(result->text, sizeof(result->text), "%s", p);
+                return true;
+            }
             result->type = ESPAGENT_SLASH_ACTION;
             snprintf(result->text, sizeof(result->text), "%s", command);
             return true;

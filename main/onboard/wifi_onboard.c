@@ -4,6 +4,7 @@
 #include "device/device_registry.h"
 #include "gateway/ble_mesh_bridge.h"
 #include "node/node_profile.h"
+#include "skills/skill_runtime.h"
 #include "tools/tool_gateway.h"
 #include "wifi/wifi_manager.h"
 
@@ -389,6 +390,110 @@ static esp_err_t http_post_ota_plan(httpd_req_t *req)
     return err == ESP_OK ? send_err : ESP_FAIL;
 }
 
+static esp_err_t http_get_skills(httpd_req_t *req)
+{
+    char json[4096] = {0};
+    esp_err_t err = skill_runtime_list_json(json, sizeof(json));
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "skills unavailable");
+        return ESP_FAIL;
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    return httpd_resp_send(req, json, strlen(json));
+}
+
+static esp_err_t http_post_skills(httpd_req_t *req)
+{
+    char *body = NULL;
+    esp_err_t err = read_json_body(req, &body);
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON body");
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid JSON");
+        return ESP_FAIL;
+    }
+
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(root, "name"));
+    const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(root, "content"));
+    bool confirmed = cJSON_IsTrue(cJSON_GetObjectItem(root, "confirmed"));
+    char name_copy[64] = {0};
+    if (name) {
+        strlcpy(name_copy, name, sizeof(name_copy));
+    }
+
+    char message[256] = {0};
+    err = skill_runtime_upsert(name, content, confirmed, message, sizeof(message));
+    cJSON_Delete(root);
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "name", name_copy);
+    cJSON_AddStringToObject(resp, "message", message[0] ? message : (err == ESP_OK ? "OK" : "skill update failed"));
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_send(req, json, strlen(json));
+    free(json);
+    return err == ESP_OK ? send_err : ESP_FAIL;
+}
+
+static esp_err_t http_delete_skills(httpd_req_t *req)
+{
+    char query[160] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing query string");
+        return ESP_FAIL;
+    }
+
+    char name[64] = {0};
+    char confirmed_text[16] = {0};
+    if (httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing skill name");
+        return ESP_FAIL;
+    }
+    bool confirmed =
+        httpd_query_key_value(query, "confirmed", confirmed_text, sizeof(confirmed_text)) == ESP_OK &&
+        (strcmp(confirmed_text, "true") == 0 || strcmp(confirmed_text, "1") == 0);
+
+    char message[256] = {0};
+    esp_err_t err = skill_runtime_delete(name, confirmed, message, sizeof(message));
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(resp, "name", name);
+    cJSON_AddStringToObject(resp, "message", message[0] ? message : (err == ESP_OK ? "OK" : "skill delete failed"));
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_send(req, json, strlen(json));
+    free(json);
+    return err == ESP_OK ? send_err : ESP_FAIL;
+}
+
 /*
  * Sync one JSON string field into NVS.
  * - missing field: leave current NVS value unchanged
@@ -566,7 +671,8 @@ static httpd_handle_t start_http_server(bool captive)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = ESPAGENT_ONBOARD_HTTP_PORT;
-    config.max_uri_handlers = captive ? 16 : 8;
+    /* Base admin routes now include config/status/devices/save/OTA/BLE/skills APIs. */
+    config.max_uri_handlers = 24;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
 
@@ -617,6 +723,21 @@ static httpd_handle_t start_http_server(bool captive)
         .uri = "/ota/plan", .method = HTTP_POST, .handler = http_post_ota_plan,
     };
     httpd_register_uri_handler(s_server, &uri_ota_plan);
+
+    httpd_uri_t uri_skills_get = {
+        .uri = "/api/skills", .method = HTTP_GET, .handler = http_get_skills,
+    };
+    httpd_register_uri_handler(s_server, &uri_skills_get);
+
+    httpd_uri_t uri_skills_post = {
+        .uri = "/api/skills", .method = HTTP_POST, .handler = http_post_skills,
+    };
+    httpd_register_uri_handler(s_server, &uri_skills_post);
+
+    httpd_uri_t uri_skills_delete = {
+        .uri = "/api/skills", .method = HTTP_DELETE, .handler = http_delete_skills,
+    };
+    httpd_register_uri_handler(s_server, &uri_skills_delete);
 
     if (captive) {
         /* Captive portal detection endpoints */

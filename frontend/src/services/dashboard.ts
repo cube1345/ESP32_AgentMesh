@@ -1,6 +1,12 @@
 import axios from 'axios';
 import { mockDashboardPayload } from '../data/mock';
-import type { DashboardPayload, SkillDraft, UserPreferenceProfile } from '../types';
+import type {
+  DashboardPayload,
+  RuntimeSkillInstallResponse,
+  RuntimeSkillListResponse,
+  SkillDraft,
+  UserPreferenceProfile
+} from '../types';
 
 const api = axios.create({
   baseURL: '/api',
@@ -34,6 +40,14 @@ function isSkillArray(value: unknown): value is SkillDraft[] {
   return Array.isArray(value);
 }
 
+function isRuntimeSkillListResponse(value: unknown): value is RuntimeSkillListResponse {
+  return isObject(value) && Array.isArray(value.skills);
+}
+
+function isRuntimeSkillInstallResponse(value: unknown): value is RuntimeSkillInstallResponse {
+  return isObject(value) && typeof value.ok === 'boolean';
+}
+
 function isPreferenceProfile(value: unknown): value is UserPreferenceProfile {
   return isObject(value);
 }
@@ -49,12 +63,54 @@ export async function fetchDashboard(): Promise<DashboardPayload> {
 
 export async function saveSkills(skills: SkillDraft[]): Promise<SkillDraft[]> {
   try {
-    const response = await api.post<SkillDraft[]>('/skills', { skills });
-    return isSkillArray(response.data)
-      ? response.data
+    const response = await api.post<SkillDraft[] | { skills?: SkillDraft[] }>('/skills', { skills });
+    const payload = response.data;
+    if (isSkillArray(payload)) {
+      return payload;
+    }
+    return isObject(payload) && isSkillArray(payload.skills)
+      ? payload.skills
       : JSON.parse(JSON.stringify(skills)) as SkillDraft[];
   } catch {
     return JSON.parse(JSON.stringify(skills)) as SkillDraft[];
+  }
+}
+
+export async function fetchRuntimeSkills(): Promise<RuntimeSkillListResponse> {
+  try {
+    const response = await api.get<RuntimeSkillListResponse>('/skills/runtime');
+    return isRuntimeSkillListResponse(response.data)
+      ? response.data
+      : { skills: [], source: 'local_mock' };
+  } catch {
+    return { skills: [], source: 'local_mock' };
+  }
+}
+
+export async function installRuntimeSkill(
+  skill: SkillDraft,
+  confirmed = true
+): Promise<RuntimeSkillInstallResponse> {
+  try {
+    const response = await api.post<RuntimeSkillInstallResponse>('/skills/install', {
+      skill,
+      confirmed
+    });
+    return isRuntimeSkillInstallResponse(response.data)
+      ? response.data
+      : {
+          ok: false,
+          source: 'local_mock',
+          message: 'invalid install response',
+          error: 'invalid install response'
+        };
+  } catch (error) {
+    return {
+      ok: false,
+      source: 'local_mock',
+      message: 'install request failed',
+      error: error instanceof Error ? error.message : 'install request failed'
+    };
   }
 }
 

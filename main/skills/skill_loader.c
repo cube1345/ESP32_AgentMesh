@@ -3,12 +3,24 @@
 #include "espagent_config.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <ctype.h>
 #include "esp_log.h"
 
 static const char *TAG = "skills";
 static const char *SKILLS_SUMMARY_CACHE_KEY = "prompt:skills_summary";
+
+#define SKILL_LOADER_MAX_FILES 16
+#define SKILL_LOADER_MAX_FILE_TEXT 2048
+
+typedef struct {
+    char rel_name[96];
+    char path[320];
+    char title[96];
+    char desc[256];
+} skill_file_info_t;
 
 /*
  * Skills are stored as markdown files in spiffs_data/skills/
@@ -100,6 +112,122 @@ static void extract_description(FILE *f, char *out, size_t out_size)
     out[off] = '\0';
 }
 
+static bool contains_ci(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !needle[0]) {
+        return false;
+    }
+
+    size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i]) {
+            unsigned char hc = (unsigned char)p[i];
+            unsigned char nc = (unsigned char)needle[i];
+            if (hc >= 'A' && hc <= 'Z') hc = (unsigned char)(hc - 'A' + 'a');
+            if (nc >= 'A' && nc <= 'Z') nc = (unsigned char)(nc - 'A' + 'a');
+            if (hc != nc) {
+                break;
+            }
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int skill_query_score(const char *query,
+                             const char *name,
+                             const char *title,
+                             const char *desc,
+                             const char *content)
+{
+    if (!query || !query[0]) {
+        return 0;
+    }
+
+    int score = 0;
+    char token[48];
+    size_t ti = 0;
+    for (const unsigned char *p = (const unsigned char *)query; ; p++) {
+        unsigned char c = *p;
+        bool token_char = (c >= '0' && c <= '9') ||
+                          (c >= 'A' && c <= 'Z') ||
+                          (c >= 'a' && c <= 'z') ||
+                          (c & 0x80);
+        if (token_char && ti + 1 < sizeof(token)) {
+            token[ti++] = (char)c;
+            continue;
+        }
+        if (ti > 0) {
+            token[ti] = '\0';
+            if (ti >= 2) {
+                if (contains_ci(name, token)) score += 4;
+                if (contains_ci(title, token)) score += 6;
+                if (contains_ci(desc, token)) score += 3;
+                if (contains_ci(content, token)) score += 2;
+            }
+            ti = 0;
+        }
+        if (c == '\0') {
+            break;
+        }
+    }
+    return score;
+}
+
+static int enumerate_skill_files(skill_file_info_t *items, int max_items)
+{
+    if (!items || max_items <= 0) {
+        return 0;
+    }
+
+    DIR *dir = opendir(ESPAGENT_SPIFFS_BASE);
+    if (!dir) {
+        return 0;
+    }
+
+    int count = 0;
+    struct dirent *ent;
+    const char *skills_subdir = "skills/";
+    const size_t subdir_len = strlen(skills_subdir);
+    while ((ent = readdir(dir)) != NULL && count < max_items) {
+        const char *name = ent->d_name;
+        if (strncmp(name, skills_subdir, subdir_len) != 0) {
+            continue;
+        }
+        size_t name_len = strlen(name);
+        if (name_len < subdir_len + 4 || strcmp(name + name_len - 3, ".md") != 0) {
+            continue;
+        }
+
+        skill_file_info_t *item = &items[count];
+        memset(item, 0, sizeof(*item));
+        snprintf(item->rel_name, sizeof(item->rel_name), "%s", name + subdir_len);
+        char *dot = strrchr(item->rel_name, '.');
+        if (dot) {
+            *dot = '\0';
+        }
+        snprintf(item->path, sizeof(item->path), "%s/%s", ESPAGENT_SPIFFS_BASE, name);
+
+        FILE *f = fopen(item->path, "r");
+        if (!f) {
+            continue;
+        }
+        char first_line[128];
+        if (fgets(first_line, sizeof(first_line), f)) {
+            extract_title(first_line, strlen(first_line), item->title, sizeof(item->title));
+            extract_description(f, item->desc, sizeof(item->desc));
+        }
+        fclose(f);
+        count++;
+    }
+    closedir(dir);
+    return count;
+}
+
 static size_t build_summary_uncached(char *buf, size_t size)
 {
     DIR *dir = opendir(ESPAGENT_SPIFFS_BASE);
@@ -183,6 +311,175 @@ size_t skill_loader_build_summary(char *buf, size_t size)
         }
     }
     return off;
+}
+
+esp_err_t skill_loader_build_index_text(char *buf, size_t size)
+{
+    if (!buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    skill_file_info_t *items = calloc(SKILL_LOADER_MAX_FILES, sizeof(skill_file_info_t));
+    if (!items) {
+        buf[0] = '\0';
+        return ESP_ERR_NO_MEM;
+    }
+
+    int count = enumerate_skill_files(items, SKILL_LOADER_MAX_FILES);
+    if (count <= 0) {
+        buf[0] = '\0';
+        free(items);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t off = 0;
+    for (int i = 0; i < count && off < size - 1; i++) {
+        off += snprintf(buf + off, size - off,
+                        "- %s: %s%s%s\n",
+                        items[i].rel_name,
+                        items[i].title[0] ? items[i].title : "(untitled)",
+                        items[i].desc[0] ? " | " : "",
+                        items[i].desc);
+    }
+    free(items);
+    return off > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t skill_loader_read_skill_by_name(const char *name,
+                                          char *buf,
+                                          size_t size,
+                                          char *resolved_title,
+                                          size_t resolved_title_size)
+{
+    if (!name || !name[0] || !buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    skill_file_info_t *items = calloc(SKILL_LOADER_MAX_FILES, sizeof(skill_file_info_t));
+    if (!items) {
+        buf[0] = '\0';
+        return ESP_ERR_NO_MEM;
+    }
+
+    int count = enumerate_skill_files(items, SKILL_LOADER_MAX_FILES);
+    for (int i = 0; i < count; i++) {
+        if (strcmp(items[i].rel_name, name) != 0 &&
+            strcmp(items[i].title, name) != 0) {
+            continue;
+        }
+
+        FILE *f = fopen(items[i].path, "r");
+        if (!f) {
+            free(items);
+            return ESP_FAIL;
+        }
+        size_t n = fread(buf, 1, size - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+        if (resolved_title && resolved_title_size > 0) {
+            snprintf(resolved_title, resolved_title_size, "%s",
+                     items[i].title[0] ? items[i].title : items[i].rel_name);
+        }
+        free(items);
+        return ESP_OK;
+    }
+    free(items);
+    buf[0] = '\0';
+    return ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t skill_loader_build_relevant_details(const char *query,
+                                              char *buf,
+                                              size_t size,
+                                              int max_skills)
+{
+    if (!query || !query[0] || !buf || size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (max_skills <= 0) {
+        max_skills = 2;
+    }
+
+    skill_file_info_t *items = calloc(SKILL_LOADER_MAX_FILES, sizeof(skill_file_info_t));
+    char *file_text = calloc(1, SKILL_LOADER_MAX_FILE_TEXT);
+    if (!items || !file_text) {
+        free(items);
+        free(file_text);
+        buf[0] = '\0';
+        return ESP_ERR_NO_MEM;
+    }
+
+    int count = enumerate_skill_files(items, SKILL_LOADER_MAX_FILES);
+    if (count <= 0) {
+        buf[0] = '\0';
+        free(items);
+        free(file_text);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    int best_index[SKILL_LOADER_MAX_FILES];
+    int best_score[SKILL_LOADER_MAX_FILES];
+    int matched = 0;
+
+    for (int i = 0; i < count; i++) {
+        file_text[0] = '\0';
+        FILE *f = fopen(items[i].path, "r");
+        if (f) {
+            size_t n = fread(file_text, 1, SKILL_LOADER_MAX_FILE_TEXT - 1, f);
+            file_text[n] = '\0';
+            fclose(f);
+        }
+        int score = skill_query_score(query,
+                                      items[i].rel_name,
+                                      items[i].title,
+                                      items[i].desc,
+                                      file_text);
+        if (score <= 0) {
+            continue;
+        }
+        int pos = matched++;
+        best_index[pos] = i;
+        best_score[pos] = score;
+        for (int j = pos; j > 0; j--) {
+            if (best_score[j] > best_score[j - 1]) {
+                int tmp_score = best_score[j];
+                int tmp_index = best_index[j];
+                best_score[j] = best_score[j - 1];
+                best_index[j] = best_index[j - 1];
+                best_score[j - 1] = tmp_score;
+                best_index[j - 1] = tmp_index;
+            }
+        }
+    }
+
+    if (matched <= 0) {
+        buf[0] = '\0';
+        free(items);
+        free(file_text);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    size_t off = 0;
+    int limit = matched < max_skills ? matched : max_skills;
+    for (int r = 0; r < limit && off < size - 1; r++) {
+        int idx = best_index[r];
+        file_text[0] = '\0';
+        FILE *f = fopen(items[idx].path, "r");
+        if (!f) {
+            continue;
+        }
+        size_t n = fread(file_text, 1, SKILL_LOADER_MAX_FILE_TEXT - 1, f);
+        file_text[n] = '\0';
+        fclose(f);
+        off += snprintf(buf + off, size - off,
+                        "### %s (%s)\n\n%s\n\n",
+                        items[idx].title[0] ? items[idx].title : items[idx].rel_name,
+                        items[idx].rel_name,
+                        file_text);
+    }
+    free(items);
+    free(file_text);
+    return off > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
 }
 
 void skill_loader_invalidate_cache(void)

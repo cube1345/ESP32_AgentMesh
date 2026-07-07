@@ -27,6 +27,18 @@ esp_err_t llm_set_provider(const char *provider);
  */
 esp_err_t llm_set_model(const char *model);
 
+/**
+ * Copy the latest LLM failure summary into caller buffer.
+ * Returns true when a non-empty error summary is available.
+ */
+bool llm_get_last_error(char *buf, size_t buf_size);
+
+/**
+ * Returns true when coordinator-side internal heap is too tight for a full
+ * tools-enabled follow-up LLM round.
+ */
+bool llm_transport_heap_is_tight(void);
+
 /* ── Tool Use Support ──────────────────────────────────────────── */
 
 typedef struct {

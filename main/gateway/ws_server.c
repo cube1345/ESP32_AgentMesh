@@ -1,6 +1,7 @@
 #include "ws_server.h"
 #include "espagent_config.h"
 #include "bus/message_bus.h"
+#include "skills/skill_runtime.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -9,6 +10,7 @@
 #include "cJSON.h"
 
 static const char *TAG = "ws";
+static const int MAX_SKILL_API_BODY_BYTES = (12 * 1024) + 512;
 
 static httpd_handle_t s_server = NULL;
 
@@ -44,6 +46,11 @@ static ws_client_t *find_client_by_chat_id(const char *chat_id)
 
 static ws_client_t *add_client(int fd)
 {
+    ws_client_t *existing = find_client_by_fd(fd);
+    if (existing) {
+        return existing;
+    }
+
     for (int i = 0; i < ESPAGENT_WS_MAX_CLIENTS; i++) {
         if (!s_clients[i].active) {
             s_clients[i].fd = fd;
@@ -66,6 +73,169 @@ static void remove_client(int fd)
             return;
         }
     }
+}
+
+static void set_api_headers(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Headers", "Content-Type");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+}
+
+static esp_err_t send_api_json(httpd_req_t *req, const char *status, const char *json)
+{
+    set_api_headers(req);
+    if (status && status[0]) {
+        httpd_resp_set_status(req, status);
+    }
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t send_api_error(httpd_req_t *req, const char *status, const char *error)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    cJSON_AddBoolToObject(root, "ok", false);
+    cJSON_AddStringToObject(root, "error", error ? error : "unknown error");
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    esp_err_t err = send_api_json(req, status, json);
+    cJSON_free(json);
+    return err;
+}
+
+static esp_err_t read_request_body(httpd_req_t *req, char **body_out)
+{
+    if (!req || !body_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *body_out = NULL;
+    if (req->content_len <= 0 || req->content_len > MAX_SKILL_API_BODY_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char *body = calloc(1, (size_t)req->content_len + 1);
+    if (!body) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int received = 0;
+    while (received < req->content_len) {
+        int ret = httpd_req_recv(req, body + received, req->content_len - received);
+        if (ret <= 0) {
+            free(body);
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    body[received] = '\0';
+    *body_out = body;
+    return ESP_OK;
+}
+
+static esp_err_t http_get_skills(httpd_req_t *req)
+{
+    char json[4096];
+    esp_err_t err = skill_runtime_list_json(json, sizeof(json));
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {
+        return send_api_error(req, "500 Internal Server Error", "failed to enumerate skills");
+    }
+    return send_api_json(req, "200 OK", json);
+}
+
+static esp_err_t http_post_skills(httpd_req_t *req)
+{
+    char *body = NULL;
+    if (read_request_body(req, &body) != ESP_OK) {
+        return send_api_error(req, "400 Bad Request", "invalid request body");
+    }
+
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        return send_api_error(req, "400 Bad Request", "invalid JSON body");
+    }
+
+    const char *name = cJSON_GetStringValue(cJSON_GetObjectItem(root, "name"));
+    const char *content = cJSON_GetStringValue(cJSON_GetObjectItem(root, "content"));
+    bool confirmed = cJSON_IsTrue(cJSON_GetObjectItem(root, "confirmed"));
+
+    char message[256];
+    esp_err_t err = skill_runtime_upsert(name, content, confirmed, message, sizeof(message));
+    cJSON_Delete(root);
+    if (err != ESP_OK) {
+        return send_api_error(req,
+                              err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_ARG
+                                  ? "400 Bad Request"
+                                  : "500 Internal Server Error",
+                              message);
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "name", name ? name : "");
+    cJSON_AddStringToObject(resp, "message", message);
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    esp_err_t send_err = send_api_json(req, "200 OK", json);
+    cJSON_free(json);
+    return send_err;
+}
+
+static esp_err_t http_delete_skills(httpd_req_t *req)
+{
+    char query[160];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_api_error(req, "400 Bad Request", "missing query string");
+    }
+
+    char name[64] = {0};
+    char confirmed_text[16] = {0};
+    if (httpd_query_key_value(query, "name", name, sizeof(name)) != ESP_OK) {
+        return send_api_error(req, "400 Bad Request", "missing skill name");
+    }
+    bool confirmed =
+        httpd_query_key_value(query, "confirmed", confirmed_text, sizeof(confirmed_text)) == ESP_OK &&
+        (strcmp(confirmed_text, "true") == 0 || strcmp(confirmed_text, "1") == 0);
+
+    char message[256];
+    esp_err_t err = skill_runtime_delete(name, confirmed, message, sizeof(message));
+    if (err != ESP_OK) {
+        return send_api_error(req,
+                              err == ESP_ERR_INVALID_STATE || err == ESP_ERR_INVALID_ARG || err == ESP_ERR_NOT_FOUND
+                                  ? "400 Bad Request"
+                                  : "500 Internal Server Error",
+                              message);
+    }
+
+    cJSON *resp = cJSON_CreateObject();
+    if (!resp) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    cJSON_AddBoolToObject(resp, "ok", true);
+    cJSON_AddStringToObject(resp, "name", name);
+    cJSON_AddStringToObject(resp, "message", message);
+    char *json = cJSON_PrintUnformatted(resp);
+    cJSON_Delete(resp);
+    if (!json) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+    }
+    esp_err_t send_err = send_api_json(req, "200 OK", json);
+    cJSON_free(json);
+    return send_err;
 }
 
 static esp_err_t ws_handler(httpd_req_t *req)
@@ -98,6 +268,14 @@ static esp_err_t ws_handler(httpd_req_t *req)
 
     int fd = httpd_req_to_sockfd(req);
     ws_client_t *client = find_client_by_fd(fd);
+    if (!client) {
+        client = add_client(fd);
+        if (!client) {
+            free(ws_pkt.payload);
+            ESP_LOGW(TAG, "Failed to track websocket client fd=%d", fd);
+            return ESP_ERR_NO_MEM;
+        }
+    }
 
     /* Parse JSON message */
     cJSON *root = cJSON_Parse((char *)ws_pkt.payload);
@@ -121,7 +299,7 @@ static esp_err_t ws_handler(httpd_req_t *req)
             chat_id = cid->valuestring;
             /* Update client's chat_id if provided */
             if (client) {
-                strncpy(client->chat_id, chat_id, sizeof(client->chat_id) - 1);
+                snprintf(client->chat_id, sizeof(client->chat_id), "%s", chat_id);
             }
         }
 
@@ -164,6 +342,27 @@ esp_err_t ws_server_start(void)
         .is_websocket = true,
     };
     httpd_register_uri_handler(s_server, &ws_uri);
+
+    httpd_uri_t skills_get_uri = {
+        .uri = "/api/skills",
+        .method = HTTP_GET,
+        .handler = http_get_skills,
+    };
+    httpd_register_uri_handler(s_server, &skills_get_uri);
+
+    httpd_uri_t skills_post_uri = {
+        .uri = "/api/skills",
+        .method = HTTP_POST,
+        .handler = http_post_skills,
+    };
+    httpd_register_uri_handler(s_server, &skills_post_uri);
+
+    httpd_uri_t skills_delete_uri = {
+        .uri = "/api/skills",
+        .method = HTTP_DELETE,
+        .handler = http_delete_skills,
+    };
+    httpd_register_uri_handler(s_server, &skills_delete_uri);
 
     ESP_LOGI(TAG, "WebSocket server started on port %d", ESPAGENT_WS_PORT);
     return ESP_OK;

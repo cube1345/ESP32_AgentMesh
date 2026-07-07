@@ -9,6 +9,7 @@
 #include "proactive/proactive_service.h"
 #include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
+#include "skills/skill_loader.h"
 #include "espagent_config.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_registry.h"
@@ -28,6 +29,9 @@
 static const char *TAG = "agent";
 
 #define TOOL_OUTPUT_SIZE (8 * 1024)
+#define TOOL_SUMMARY_SIZE 4096
+
+static bool message_prefers_direct_reply_no_tools(const char *message);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -642,6 +646,122 @@ static uint32_t parse_light_sequence_delay_ms(const char *message) {
   return 1000;
 }
 
+static bool extract_next_number_token(const char **cursor,
+                                      double *out_value,
+                                      char *token_buf,
+                                      size_t token_buf_size) {
+  if (!cursor || !*cursor || !out_value || !token_buf || token_buf_size < 2) {
+    return false;
+  }
+
+  const char *p = *cursor;
+  while (*p) {
+    const bool signed_number =
+        ((*p == '+' || *p == '-') &&
+         (isdigit((unsigned char)p[1]) ||
+          (p[1] == '.' && isdigit((unsigned char)p[2]))));
+    const bool unsigned_number =
+        isdigit((unsigned char)*p) ||
+        (*p == '.' && isdigit((unsigned char)p[1]));
+    if (signed_number || unsigned_number) {
+      break;
+    }
+    p++;
+  }
+
+  if (!*p) {
+    *cursor = p;
+    return false;
+  }
+
+  char *endptr = NULL;
+  double value = strtod(p, &endptr);
+  if (endptr == p) {
+    *cursor = p + 1;
+    return false;
+  }
+
+  size_t copy_len = (size_t)(endptr - p);
+  if (copy_len >= token_buf_size) {
+    copy_len = token_buf_size - 1;
+  }
+  memcpy(token_buf, p, copy_len);
+  token_buf[copy_len] = '\0';
+
+  *out_value = value;
+  *cursor = endptr;
+  return true;
+}
+
+static bool try_execute_deterministic_number_compare(const espagent_msg_t *msg,
+                                                     char **final_text) {
+  if (!msg || !msg->content || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content)) {
+    return false;
+  }
+
+  const bool ask_larger =
+      contains_substr_ci(msg->content, "谁大") ||
+      contains_substr_ci(msg->content, "哪个大") ||
+      contains_substr_ci(msg->content, "哪个更大");
+  const bool ask_smaller =
+      contains_substr_ci(msg->content, "谁小") ||
+      contains_substr_ci(msg->content, "哪个小") ||
+      contains_substr_ci(msg->content, "哪个更小");
+
+  if (!ask_larger && !ask_smaller) {
+    return false;
+  }
+
+  const char *cursor = msg->content;
+  char lhs_token[32] = {0};
+  char rhs_token[32] = {0};
+  double lhs = 0.0;
+  double rhs = 0.0;
+  if (!extract_next_number_token(&cursor, &lhs, lhs_token, sizeof(lhs_token)) ||
+      !extract_next_number_token(&cursor, &rhs, rhs_token, sizeof(rhs_token))) {
+    return false;
+  }
+
+  const char *winner_token = NULL;
+  const char *loser_token = NULL;
+  if (lhs > rhs) {
+    winner_token = lhs_token;
+    loser_token = rhs_token;
+  } else if (rhs > lhs) {
+    winner_token = rhs_token;
+    loser_token = lhs_token;
+  } else {
+    winner_token = lhs_token;
+    loser_token = rhs_token;
+  }
+
+  char reply_buf[160] = {0};
+  const bool concise_only =
+      message_prefers_direct_reply_no_tools(msg->content) ||
+      contains_substr_ci(msg->content, "最终答案") ||
+      contains_substr_ci(msg->content, "不要解释");
+
+  if (lhs == rhs) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             concise_only ? "%s" : "%s 和 %s 一样大。",
+             lhs_token, lhs_token, rhs_token);
+  } else if (ask_smaller) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             concise_only ? "%s" : "%s 更小。",
+             loser_token, loser_token);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf),
+             concise_only ? "%s" : "%s 更大。",
+             winner_token, winner_token);
+  }
+
+  ESP_LOGI(TAG, "=== CONV === Deterministic number compare => %s", reply_buf);
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
                                                      char *tool_output,
                                                      size_t tool_output_size,
@@ -1246,6 +1366,74 @@ static void compact_for_trace(const char *in, char *out, size_t out_size) {
   terminate_at_utf8_boundary(out, strlen(out));
 }
 
+static void append_tool_summary_line(char *summary,
+                                     size_t summary_size,
+                                     const char *tool_name,
+                                     const char *tool_output) {
+  if (!summary || summary_size == 0 || !tool_name || !tool_output) {
+    return;
+  }
+
+  char compact[256] = {0};
+  compact_for_trace(tool_output, compact, sizeof(compact));
+  size_t off = strnlen(summary, summary_size - 1);
+  if (off >= summary_size - 1) {
+    return;
+  }
+  snprintf(summary + off, summary_size - off, "- %s: %s\n", tool_name,
+           compact);
+}
+
+static cJSON *build_compact_finalization_messages(const char *user_text,
+                                                  const char *tool_summary) {
+  if (!user_text || !tool_summary || tool_summary[0] == '\0') {
+    return NULL;
+  }
+
+  cJSON *messages = cJSON_CreateArray();
+  cJSON *user_msg = cJSON_CreateObject();
+  if (!messages || !user_msg) {
+    cJSON_Delete(messages);
+    cJSON_Delete(user_msg);
+    return NULL;
+  }
+
+  char *content = heap_caps_calloc(1, 2048, MALLOC_CAP_SPIRAM);
+  if (!content) {
+    cJSON_Delete(user_msg);
+    cJSON_Delete(messages);
+    return NULL;
+  }
+
+  snprintf(content, 2048,
+           "Original user request:\n%s\n\n"
+           "Executed tool results:\n%s\n"
+           "Write the final answer using only these confirmed results. "
+           "Do not request more tools.",
+           user_text, tool_summary);
+  cJSON_AddStringToObject(user_msg, "role", "user");
+  cJSON_AddStringToObject(user_msg, "content", content);
+  cJSON_AddItemToArray(messages, user_msg);
+  free(content);
+  return messages;
+}
+
+static char *build_direct_tool_summary_reply(const char *tool_summary) {
+  if (!tool_summary || tool_summary[0] == '\0') {
+    return NULL;
+  }
+
+  char *reply = heap_caps_calloc(1, 3072, MALLOC_CAP_SPIRAM);
+  if (!reply) {
+    return NULL;
+  }
+
+  snprintf(reply, 3072,
+           "本轮工具已经执行完成。当前 coordinator 可用内存过低，为避免第二次模型请求失败，先直接返回确认结果：\n\n%s",
+           tool_summary);
+  return reply;
+}
+
 static void append_tool_trace(const espagent_msg_t *msg,
                               const char *event_type,
                               const llm_tool_call_t *call,
@@ -1305,7 +1493,8 @@ static void publish_local_tool_output(const llm_tool_call_t *call,
 /* Build the user message with tool_result blocks */
 static cJSON *build_tool_results(const llm_response_t *resp,
                                  const espagent_msg_t *msg, char *tool_output,
-                                 size_t tool_output_size, char *tool_fallback,
+                                 size_t tool_output_size, char *tool_summary,
+                                 size_t tool_summary_size, char *tool_fallback,
                                  size_t tool_fallback_size) {
   cJSON *content = cJSON_CreateArray();
 
@@ -1327,6 +1516,8 @@ static cJSON *build_tool_results(const llm_response_t *resp,
                             tool_output);
       append_tool_trace(msg, "tool_result", call, tool_output);
       publish_local_tool_output(call, tool_output, ESP_ERR_INVALID_STATE);
+      append_tool_summary_line(tool_summary, tool_summary_size, call->name,
+                               tool_output);
       free(patched_input);
 
       cJSON *result_block = cJSON_CreateObject();
@@ -1348,6 +1539,8 @@ static cJSON *build_tool_results(const llm_response_t *resp,
     append_tool_trace(msg, "tool_result", call, tool_output);
     publish_local_tool_output(call, tool_output,
                               tool_error ? ESP_FAIL : ESP_OK);
+    append_tool_summary_line(tool_summary, tool_summary_size, call->name,
+                             tool_output);
     free(patched_input);
 
     if (tool_fallback && tool_fallback_size > 0 &&
@@ -1435,6 +1628,55 @@ static bool handle_slash_action(const espagent_msg_t *msg,
     return send_direct_text_reply(msg, reply);
   }
 
+  if (strcmp(slash->command, "skills_list") == 0) {
+    char *skills_text = heap_caps_calloc(1, 3072, MALLOC_CAP_SPIRAM);
+    if (!skills_text) {
+      snprintf(reply, sizeof(reply), "内存不足，无法列出 skills。");
+      return send_direct_text_reply(msg, reply);
+    }
+
+    esp_err_t err =
+        skill_loader_build_index_text(skills_text, 3072);
+    bool ok = false;
+    if (err == ESP_OK && skills_text[0]) {
+      ok = send_direct_text_reply(msg, skills_text);
+    } else {
+      snprintf(reply, sizeof(reply), "当前没有可用的 skills。");
+      ok = send_direct_text_reply(msg, reply);
+    }
+    free(skills_text);
+    return ok;
+  }
+
+  if (strcmp(slash->command, "skills_show") == 0) {
+    char *skill_text = heap_caps_calloc(1, 4096, MALLOC_CAP_SPIRAM);
+    char title[128] = {0};
+    if (!skill_text) {
+      snprintf(reply, sizeof(reply), "内存不足，无法读取 skill 内容。");
+      return send_direct_text_reply(msg, reply);
+    }
+
+    esp_err_t err = skill_loader_read_skill_by_name(
+        slash->text, skill_text, 4096, title, sizeof(title));
+    bool ok = false;
+    if (err == ESP_OK && skill_text[0]) {
+      char *full_reply = heap_caps_calloc(1, 4608, MALLOC_CAP_SPIRAM);
+      if (full_reply) {
+        snprintf(full_reply, 4608, "# %s\n\n%s",
+                 title[0] ? title : slash->text, skill_text);
+        ok = send_direct_text_reply(msg, full_reply);
+        free(full_reply);
+      } else {
+        ok = send_direct_text_reply(msg, skill_text);
+      }
+    } else {
+      snprintf(reply, sizeof(reply), "未找到 skill: %.320s", slash->text);
+      ok = send_direct_text_reply(msg, reply);
+    }
+    free(skill_text);
+    return ok;
+  }
+
   snprintf(reply, sizeof(reply), "Unsupported slash action: /%s",
            slash->command);
   return send_direct_text_reply(msg, reply);
@@ -1449,12 +1691,15 @@ static void agent_loop_task(void *arg) {
   char *history_json =
       heap_caps_calloc(1, ESPAGENT_LLM_STREAM_BUF_SIZE, MALLOC_CAP_SPIRAM);
   char *tool_output = heap_caps_calloc(1, TOOL_OUTPUT_SIZE, MALLOC_CAP_SPIRAM);
+  char *tool_summary =
+      heap_caps_calloc(1, TOOL_SUMMARY_SIZE, MALLOC_CAP_SPIRAM);
   char *tool_fallback =
       heap_caps_calloc(1, TOOL_OUTPUT_SIZE + 512, MALLOC_CAP_SPIRAM);
   char *relevance_query = heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM);
   char *turn_buf = heap_caps_calloc(1, 2048, MALLOC_CAP_SPIRAM);
 
-  if (!system_prompt || !history_json || !tool_output || !tool_fallback ||
+  if (!system_prompt || !history_json || !tool_output || !tool_summary ||
+      !tool_fallback ||
       !relevance_query || !turn_buf) {
     ESP_LOGE(TAG, "Failed to allocate PSRAM buffers");
     vTaskDelete(NULL);
@@ -1578,6 +1823,17 @@ static void agent_loop_task(void *arg) {
                                turn_buf);
       }
     }
+    memset(turn_buf, 0, 2048);
+    if (skill_loader_build_relevant_details(relevance_query,
+                                            turn_buf,
+                                            2048,
+                                            2) == ESP_OK &&
+        turn_buf[0]) {
+      append_prompt_format(system_prompt,
+                           ESPAGENT_CONTEXT_BUF_SIZE,
+                           "\n## Relevant Skill Details For This Turn\n\n%s\n",
+                           turn_buf);
+    }
     append_pending_clarification_prompt(system_prompt,
                                         ESPAGENT_CONTEXT_BUF_SIZE,
                                         history_json);
@@ -1598,9 +1854,11 @@ static void agent_loop_task(void *arg) {
     bool sent_working_status = false;
     bool mesh_related_tool_seen = false;
     esp_err_t last_llm_err = ESP_OK;
+    tool_summary[0] = '\0';
     tool_fallback[0] = '\0';
 
-    if (!try_execute_deterministic_light_workflow(&msg, tool_output,
+    if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
+        !try_execute_deterministic_light_workflow(&msg, tool_output,
                                                   TOOL_OUTPUT_SIZE,
                                                   &final_text)) {
       try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
@@ -1612,7 +1870,8 @@ static void agent_loop_task(void *arg) {
 #if ESPAGENT_AGENT_SEND_WORKING_STATUS
       if (!proactive_turn && !sent_working_status && !prefer_direct_reply &&
           strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) != 0 &&
-          strcmp(msg.channel, ESPAGENT_CHAN_FEISHU) != 0) {
+          strcmp(msg.channel, ESPAGENT_CHAN_FEISHU) != 0 &&
+          strcmp(msg.channel, ESPAGENT_CHAN_WEBSOCKET) != 0) {
         espagent_msg_t status = {0};
         strncpy(status.channel, msg.channel, sizeof(status.channel) - 1);
         strncpy(status.chat_id, msg.chat_id, sizeof(status.chat_id) - 1);
@@ -1629,6 +1888,8 @@ static void agent_loop_task(void *arg) {
 #endif
 
       llm_response_t resp;
+      cJSON *llm_messages = messages;
+      cJSON *compact_messages = NULL;
       const char *selected_tools_json = tools_json;
       if (espagent_role_is_coordinator()) {
         if (message_should_have_used_mesh(msg.content) && tools_json_mesh_only) {
@@ -1638,10 +1899,31 @@ static void agent_loop_task(void *arg) {
         }
       }
       const char *active_tools_json = prefer_direct_reply ? NULL : selected_tools_json;
+      if (!prefer_direct_reply &&
+          espagent_role_is_coordinator() &&
+          iteration > 0 &&
+          llm_transport_heap_is_tight()) {
+        active_tools_json = NULL;
+        compact_messages =
+            build_compact_finalization_messages(msg.content, tool_summary);
+        if (compact_messages) {
+          llm_messages = compact_messages;
+          ESP_LOGW(
+              TAG,
+              "Coordinator follow-up LLM round switched to compact no-tools finalization due to tight transport heap");
+        } else {
+          ESP_LOGW(TAG,
+                   "Coordinator follow-up LLM round forced to no-tools finalization due to tight transport heap");
+        }
+      }
       if (prefer_direct_reply && iteration == 0) {
         ESP_LOGI(TAG, "Direct-reply heuristic enabled for this turn; first LLM call runs without tools");
       }
-      err = llm_chat_tools(system_prompt, messages, active_tools_json, &resp);
+      err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
+      if (compact_messages) {
+        cJSON_Delete(compact_messages);
+        compact_messages = NULL;
+      }
 
       if (err != ESP_OK) {
         last_llm_err = err;
@@ -1721,6 +2003,7 @@ static void agent_loop_task(void *arg) {
       /* Execute tools and append results */
       cJSON *tool_results =
           build_tool_results(&resp, &msg, tool_output, TOOL_OUTPUT_SIZE,
+                             tool_summary, TOOL_SUMMARY_SIZE,
                              tool_fallback, TOOL_OUTPUT_SIZE + 512);
       cJSON *result_msg = cJSON_CreateObject();
       cJSON_AddStringToObject(result_msg, "role", "user");
@@ -1729,6 +2012,19 @@ static void agent_loop_task(void *arg) {
 
       llm_response_free(&resp);
       iteration++;
+
+      if (!final_text &&
+          espagent_role_is_coordinator() &&
+          iteration > 0 &&
+          llm_transport_heap_is_tight() &&
+          tool_summary[0]) {
+        final_text = build_direct_tool_summary_reply(tool_summary);
+        if (final_text) {
+          ESP_LOGW(TAG,
+                   "Coordinator follow-up finalized locally from tool summary due to tight transport heap");
+          break;
+        }
+      }
     }
 
     cJSON_Delete(messages);
@@ -1745,10 +2041,17 @@ static void agent_loop_task(void *arg) {
       } else if (iteration >= ESPAGENT_AGENT_MAX_TOOL_ITER) {
         final_text = strdup("我已经开始处理这个问题，但工具调用轮次达到上限，没能整理出最终答复。请把问题再缩小一点，或者分步问我。");
       } else if (last_llm_err != ESP_OK) {
-        char err_text[160];
-        snprintf(err_text, sizeof(err_text),
-                 "模型服务这次调用失败了：%s。请稍后重试。",
-                 esp_err_to_name(last_llm_err));
+        char llm_error[192] = {0};
+        char err_text[320];
+        if (llm_get_last_error(llm_error, sizeof(llm_error))) {
+          snprintf(err_text, sizeof(err_text),
+                   "模型服务这次调用失败了：%s。请稍后重试。",
+                   llm_error);
+        } else {
+          snprintf(err_text, sizeof(err_text),
+                   "模型服务这次调用失败了：%s。请稍后重试。",
+                   esp_err_to_name(last_llm_err));
+        }
         final_text = strdup(err_text);
       }
     }

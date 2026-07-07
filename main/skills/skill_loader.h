@@ -19,6 +19,19 @@ esp_err_t skill_loader_init(void);
  */
 size_t skill_loader_build_summary(char *buf, size_t size);
 
+esp_err_t skill_loader_build_index_text(char *buf, size_t size);
+
+esp_err_t skill_loader_read_skill_by_name(const char *name,
+                                          char *buf,
+                                          size_t size,
+                                          char *resolved_title,
+                                          size_t resolved_title_size);
+
+esp_err_t skill_loader_build_relevant_details(const char *query,
+                                              char *buf,
+                                              size_t size,
+                                              int max_skills);
+
 /**
  * Drop cached skill metadata so the next prompt rebuild sees SPIFFS changes.
  */

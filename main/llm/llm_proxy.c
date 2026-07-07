@@ -5,6 +5,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include "esp_log.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
@@ -20,14 +21,52 @@ static const char *TAG = "llm";
 #define LLM_MODEL_MAX_LEN   64
 #define LLM_DUMP_MAX_BYTES   (16 * 1024)
 #define LLM_DUMP_CHUNK_BYTES 320
-#define LLM_HTTP_BUFFER_SIZE 2048
+#define LLM_HTTP_BUFFER_SIZE_RX 1024
+#define LLM_HTTP_BUFFER_SIZE_TX 1024
+#define LLM_HTTP_BUFFER_SIZE_TIGHT_RX 512
+#define LLM_HTTP_BUFFER_SIZE_TIGHT_TX 512
 #define LLM_RETRY_DELAY_MS   600
 #define LLM_MIN_INTERNAL_FREE_FOR_TLS   (96 * 1024)
 #define LLM_MIN_INTERNAL_LARGEST_BLOCK  (32 * 1024)
+#define LLM_COORDINATOR_MAX_TOKENS_NORMAL 1536
+#define LLM_COORDINATOR_MAX_TOKENS_TIGHT   768
 
 static char s_api_key[LLM_API_KEY_MAX_LEN] = {0};
 static char s_model[LLM_MODEL_MAX_LEN] = ESPAGENT_LLM_DEFAULT_MODEL;
 static char s_provider[16] = ESPAGENT_LLM_PROVIDER_DEFAULT;
+static char s_last_error[256] = {0};
+
+static void llm_sanitize_preview(char *text)
+{
+    if (!text) {
+        return;
+    }
+
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        if (text[i] == '\r' || text[i] == '\n' || text[i] == '\t') {
+            text[i] = ' ';
+        }
+    }
+}
+
+static void llm_set_last_errorf(const char *fmt, ...)
+{
+    if (!fmt) {
+        s_last_error[0] = '\0';
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(s_last_error, sizeof(s_last_error), fmt, ap);
+    va_end(ap);
+    llm_sanitize_preview(s_last_error);
+}
+
+static void llm_clear_last_error(void)
+{
+    s_last_error[0] = '\0';
+}
 
 static void llm_log_payload(const char *label, const char *payload)
 {
@@ -88,6 +127,16 @@ static void safe_copy(char *dst, size_t dst_size, const char *src)
     dst[n] = '\0';
 }
 
+bool llm_get_last_error(char *buf, size_t buf_size)
+{
+    if (!buf || buf_size == 0) {
+        return false;
+    }
+
+    safe_copy(buf, buf_size, s_last_error);
+    return s_last_error[0] != '\0';
+}
+
 static void llm_log_heap_state(const char *label)
 {
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
@@ -107,6 +156,30 @@ static bool llm_internal_heap_is_tight(void)
     size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
     return free_internal < LLM_MIN_INTERNAL_FREE_FOR_TLS ||
            largest_internal < LLM_MIN_INTERNAL_LARGEST_BLOCK;
+}
+
+bool llm_transport_heap_is_tight(void)
+{
+    return llm_internal_heap_is_tight();
+}
+
+static int llm_effective_max_tokens(void)
+{
+    int max_tokens = ESPAGENT_LLM_MAX_TOKENS;
+    if (!espagent_role_is_coordinator()) {
+        return max_tokens;
+    }
+
+    const int cap = llm_internal_heap_is_tight()
+                        ? LLM_COORDINATOR_MAX_TOKENS_TIGHT
+                        : LLM_COORDINATOR_MAX_TOKENS_NORMAL;
+    if (max_tokens > cap) {
+        max_tokens = cap;
+    }
+    if (max_tokens < 256) {
+        max_tokens = 256;
+    }
+    return max_tokens;
 }
 
 /* ── Response buffer ──────────────────────────────────────────── */
@@ -268,8 +341,10 @@ esp_err_t llm_proxy_init(void)
 
     if (s_api_key[0]) {
         ESP_LOGI(TAG, "LLM proxy initialized (provider: %s, model: %s)", s_provider, s_model);
+        llm_clear_last_error();
     } else {
         ESP_LOGW(TAG, "No API key. Use CLI: set_api_key <KEY>");
+        llm_set_last_errorf("LLM API key is empty; run set_api_key or update espagent_secrets.h");
     }
     return ESP_OK;
 }
@@ -278,13 +353,16 @@ esp_err_t llm_proxy_init(void)
 
 static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out_status)
 {
+    const bool tight_heap = llm_internal_heap_is_tight();
+    const int rx_buffer_size = tight_heap ? LLM_HTTP_BUFFER_SIZE_TIGHT_RX : LLM_HTTP_BUFFER_SIZE_RX;
+    const int tx_buffer_size = tight_heap ? LLM_HTTP_BUFFER_SIZE_TIGHT_TX : LLM_HTTP_BUFFER_SIZE_TX;
     esp_http_client_config_t config = {
         .url = llm_api_url(),
         .event_handler = http_event_handler,
         .user_data = rb,
         .timeout_ms = 120 * 1000,
-        .buffer_size = LLM_HTTP_BUFFER_SIZE,
-        .buffer_size_tx = LLM_HTTP_BUFFER_SIZE,
+        .buffer_size = rx_buffer_size,
+        .buffer_size_tx = tx_buffer_size,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
@@ -304,6 +382,12 @@ static esp_err_t llm_http_direct(const char *post_data, resp_buf_t *rb, int *out
         esp_http_client_set_header(client, "anthropic-version", ESPAGENT_LLM_API_VERSION);
     }
     esp_http_client_set_post_field(client, post_data, strlen(post_data));
+
+    ESP_LOGI(TAG,
+             "LLM direct HTTP config: tight_heap=%s rx_buf=%d tx_buf=%d",
+             tight_heap ? "true" : "false",
+             rx_buffer_size,
+             tx_buffer_size);
 
     esp_err_t err = esp_http_client_perform(client);
     *out_status = esp_http_client_get_status_code(client);
@@ -593,16 +677,22 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     // 初始化响应结构体
     memset(resp, 0, sizeof(*resp));
 
-    if (s_api_key[0] == '\0') return ESP_ERR_INVALID_STATE;
+    if (s_api_key[0] == '\0') {
+        llm_set_last_errorf("LLM API key is empty; run set_api_key or update espagent_secrets.h");
+        return ESP_ERR_INVALID_STATE;
+    }
 
     /* Build request body (non-streaming) */
     cJSON *body = cJSON_CreateObject();
     // 加入模型和提供商信息
     cJSON_AddStringToObject(body, "model", s_model);
+    const int max_tokens = llm_effective_max_tokens();
     if (provider_is_openai()) {
-        cJSON_AddNumberToObject(body, "max_completion_tokens", ESPAGENT_LLM_MAX_TOKENS);
+        cJSON_AddNumberToObject(body, "max_tokens", max_tokens);
+        cJSON_AddNumberToObject(body, "temperature", 0);
+        cJSON_AddNumberToObject(body, "top_p", 1);
     } else {
-        cJSON_AddNumberToObject(body, "max_tokens", ESPAGENT_LLM_MAX_TOKENS);
+        cJSON_AddNumberToObject(body, "max_tokens", max_tokens);
     }
 
     if (provider_is_openai()) {
@@ -634,16 +724,21 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
     char *post_data = cJSON_PrintUnformatted(body);
     cJSON_Delete(body);
-    if (!post_data) return ESP_ERR_NO_MEM;
+    if (!post_data) {
+        llm_set_last_errorf("Failed to allocate LLM request body");
+        return ESP_ERR_NO_MEM;
+    }
 
-    ESP_LOGI(TAG, "Calling LLM API with tools (provider: %s, model: %s, body: %d bytes)",
-             s_provider, s_model, (int)strlen(post_data));
+    ESP_LOGI(TAG,
+             "Calling LLM API with tools (provider: %s, model: %s, max_tokens: %d, body: %d bytes)",
+             s_provider, s_model, max_tokens, (int)strlen(post_data));
     llm_log_payload("LLM tools request", post_data);
 
     /* HTTP call */
     resp_buf_t rb;
     if (resp_buf_init(&rb, ESPAGENT_LLM_STREAM_BUF_SIZE) != ESP_OK) {
         free(post_data);
+        llm_set_last_errorf("Failed to allocate LLM response buffer");
         return ESP_ERR_NO_MEM;
     }
 
@@ -669,7 +764,10 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         llm_log_payload("LLM tools partial response", rb.data);
         if (err == ESP_FAIL && llm_internal_heap_is_tight()) {
             llm_log_heap_state("LLM HTTP failed with tight heap");
+            llm_set_last_errorf("LLM transport failed: low memory during TLS/HTTP setup");
             err = ESP_ERR_NO_MEM;
+        } else {
+            llm_set_last_errorf("LLM transport failed: %s", esp_err_to_name(err));
         }
         resp_buf_free(&rb);
         return err;
@@ -679,6 +777,16 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
     if (status != 200) {
         ESP_LOGE(TAG, "API error %d: %.500s", status, rb.data ? rb.data : "");
+        char preview[161] = {0};
+        if (rb.data && rb.data[0]) {
+            snprintf(preview, sizeof(preview), "%.160s", rb.data);
+            llm_sanitize_preview(preview);
+        }
+        if (preview[0]) {
+            llm_set_last_errorf("LLM upstream HTTP %d: %s", status, preview);
+        } else {
+            llm_set_last_errorf("LLM upstream HTTP %d with empty response body", status);
+        }
         resp_buf_free(&rb);
         if (status == 429) {
             return ESP_ERR_INVALID_STATE;
@@ -692,6 +800,7 @@ esp_err_t llm_chat_tools(const char *system_prompt,
 
     if (!root) {
         ESP_LOGE(TAG, "Failed to parse API response JSON");
+        llm_set_last_errorf("LLM returned non-JSON or truncated JSON response");
         return ESP_FAIL;
     }
 
@@ -825,6 +934,7 @@ esp_err_t llm_chat_tools(const char *system_prompt,
     ESP_LOGI(TAG, "Response: %d bytes text, %d tool calls, stop=%s",
              (int)resp->text_len, resp->call_count,
              resp->tool_use ? "tool_use" : "end_turn");
+    llm_clear_last_error();
 
     return ESP_OK;
 }
@@ -840,6 +950,7 @@ esp_err_t llm_set_api_key(const char *api_key)
     nvs_close(nvs);
 
     safe_copy(s_api_key, sizeof(s_api_key), api_key);
+    llm_clear_last_error();
     ESP_LOGI(TAG, "API key saved");
     return ESP_OK;
 }
@@ -853,6 +964,7 @@ esp_err_t llm_set_model(const char *model)
     nvs_close(nvs);
 
     safe_copy(s_model, sizeof(s_model), model);
+    llm_clear_last_error();
     ESP_LOGI(TAG, "Model set to: %s", s_model);
     return ESP_OK;
 }
@@ -866,6 +978,7 @@ esp_err_t llm_set_provider(const char *provider)
     nvs_close(nvs);
 
     safe_copy(s_provider, sizeof(s_provider), provider);
+    llm_clear_last_error();
     ESP_LOGI(TAG, "Provider set to: %s", s_provider);
     return ESP_OK;
 }

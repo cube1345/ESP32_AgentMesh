@@ -26,6 +26,7 @@ set(ESPAGENT_AGENT_SRCS
     "memory/memory_v2.c"
     "memory/session_mgr.c"
     "skills/skill_loader.c"
+    "skills/skill_runtime.c"
 )
 
 set(ESPAGENT_MESH_ROLE_SRCS
