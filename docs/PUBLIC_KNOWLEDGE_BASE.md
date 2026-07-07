@@ -1157,6 +1157,20 @@ OTA 状态：
 - 修复后已烧录并通过串口 `inject_msg system debug hello` 验证：LLM API 正常返回，最终回复成功进入 outbound。
 - 已修复飞书入口压测中的 `Tmr Svc` 栈溢出：heartbeat timer callback 不再直接读 SPIFFS/注入消息，而是启动 `heartbeat_worker`；FreeRTOS timer service task stack 提升到 4096。
 - 已完成飞书入口 2 轮压力测试：`tools/stress_feishu_usb0_3.py --rounds 2 --interval 30 --settle 220 --quiet`，飞书发送 4/4，sensor 2/2，control 2/2，0 崩溃，结果 `PASS`。
+- 2026-07-07 已继续修 coordinator 的普通问答 / 项目说明 / 内存压力路径，并完成 USB0 实机验证：
+  - 新增三层意图路由：`general_qa`、`project_explanation`、`hardware/orchestration`。普通问答不再默认走 coordinator 的重型设备编排 prompt；项目介绍/架构说明类问题使用单独 explanation prompt；真实硬件控制继续走原有 Mesh/tool 路线。
+  - 新增 deterministic 数值比较 fast-path，并已在 USB0 串口 `inject_msg system qa_test4 "Which is larger, 13.8 or 13.11?"` 上验证：日志显示 `smalltalk=0 general_qa=1 project_explain=0`，最终回复 `13.8 is larger.`。
+  - 修正英文 smalltalk 误判：原先 `Which` 中的 `hi` 会误触发 smalltalk；现已改为 ASCII 单词边界匹配，避免普通英文问句被错判为寒暄。
+  - 已验证 explanation route：USB0 串口 `inject_msg system explain_test5 "Explain project architecture?"` 日志显示 `direct_reply=1 smalltalk=0 general_qa=0 project_explain=1`，最终回复以 `# ESPAgent Project Architecture` 开头。
+  - 已确认当前瓶颈不是“PSRAM 不够”，而是 coordinator 在 LLM TLS/HTTP 路径上的 internal RAM 过低且碎片化严重。真实日志中失败前常见状态约为 `internal_free≈21KB`、`largest_internal=7680`，而 `llm_proxy.c` 的 tight 阈值为 `96KB / 32KB`。因此问题本质是 coordinator 过重 + 长 prompt/history/tools body + internal heap 碎片化，而不是总 RAM 用尽。
+  - 已新增 tight-memory 首轮减载策略：当 `llm_transport_heap_is_tight()` 为真时，coordinator 首轮改用更短的 tight prompt，历史上限压到 3，并跳过 skills/memory/clarification 扩展；同时 `LLM_COORDINATOR_MAX_TOKENS_TIGHT` 从 `768` 下调到 `512`。
+  - 该减载策略已在 USB0 实机上验证有效：对之前容易触发 `LLM transport failed` 的长 explanation 问句 `Explain the project architecture and why normal QA should not use the device orchestration context.`，日志显示 `tight=1`、`skipping skill/memory context expansion`、`max_tokens: 512`、请求体约 `3586 bytes`，最终成功返回 `## ESPAgent Project Architecture`；在修复前，同类请求体约 `8786 bytes`，并多次在 transport 阶段失败。
+  - 本轮相关代码变更已推送到 GitHub `development` 分支，关键 commit 包括：
+    - `1262f14` `Improve coordinator direct replies and LLM diagnostics`
+    - `2075f8d` `Route general QA away from orchestration prompt`
+    - `b3539f3` `Split project explanation from general QA routing`
+    - `5569604` `Tighten QA and project explanation intent matching`
+    - `1981843` `Reduce coordinator LLM pressure under tight memory`
 - GitHub 远端：
   - HTTPS: `https://github.com/cube1345/ESP32_AgentMesh.git`
   - SSH: `git@github.com:cube1345/ESP32_AgentMesh.git`
@@ -1179,6 +1193,13 @@ OTA 状态：
 - Memory 写入依赖模型主动调用文件工具，没有固件侧强制 consolidation。
 - session 已新增 `trace_*.jsonl` 保存 tool_use/tool_result/final_reply/async_result_input；已有 `trace_index` 和 `task_tree` 串口查询，还缺跨节点长期关联查询、压缩归档和远程 API。
 - system prompt 仍集中在 C 字符串中，后续可以拆成 SPIFFS prompt fragments。
+- Coordinator 当前的主要内存瓶颈仍是 internal RAM，而不是 PSRAM：即使 PSRAM 仍约 8MB 可用，LLM 的 TLS/HTTP/AES 路径仍可能因为 internal heap 太小或连续块太碎而失败。当前已通过“短 prompt / 短 history / 跳过 skills-memory 扩展 / tighter max_tokens”把最容易炸的路径压下去，但这不等于 coordinator 已经拥有充裕 internal RAM。
+- 2026-07-07 已继续做一轮保守的 Wi-Fi/LWIP 内存收缩，并完成 build + USB0 实机验证：
+  - 配置侧已下调 `CONFIG_LWIP_MAX_SOCKETS=12`、`CONFIG_LWIP_MAX_ACTIVE_TCP=12`、`CONFIG_LWIP_MAX_LISTENING_TCP=12`、`CONFIG_LWIP_MAX_UDP_PCBS=12`、`CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=8`、`CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16`、`CONFIG_ESP_WIFI_MGMT_SBUF_NUM=16`。
+  - 这轮改动已通过完整 `idf.py build`，随后已烧录 `/dev/ttyUSB0` coordinator。
+  - 对同一条长 explanation 压力问句再次实测，日志仍显示 `tight=1`，说明 coordinator 的 internal RAM 依旧紧张；但请求继续稳定成功，`Calling LLM API ... body: 3714 bytes`，且 `Before LLM HTTP heap: internal_free=20331 largest_internal=8192 psram_free=8186724`。
+  - 与上一轮常见的 `largest_internal=7680` 相比，这轮至少把连续 internal block 稍微抬高到 `8192`，说明 Wi-Fi/LWIP 收缩对 TLS/HTTP 路径有一定帮助，但还没有把 coordinator 从 tight-memory 区间拉出来。
+- 后续如果继续优化 internal RAM，应优先压背景 MQTT state/telemetry/timeline 噪声和并发窗口，再评估是否需要进一步下调 socket/buffer 或动更高风险的 TLS 参数。
 - NVS 只有 24KB，后续如果存节点表、证书或更多运行时配置，建议扩容。
 - 本地工作区 `.git` 在当前工具环境里是只读 tmpfs 占位，普通 `git status` 不可用；当前私有仓库推送使用 `/tmp/ESP32_AgentMesh.git` 作为临时 Git 元数据目录完成。
 
