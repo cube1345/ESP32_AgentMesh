@@ -804,6 +804,11 @@ esp_err_t llm_chat_tools(const char *system_prompt,
         return ESP_FAIL;
     }
 
+    cJSON *response_model = cJSON_GetObjectItem(root, "model");
+    if (response_model && cJSON_IsString(response_model) && response_model->valuestring[0]) {
+        ESP_LOGI(TAG, "LLM upstream selected model: %s", response_model->valuestring);
+    }
+
     if (provider_is_openai()) {
         cJSON *choices = cJSON_GetObjectItem(root, "choices");
         cJSON *choice0 = choices && cJSON_IsArray(choices) ? cJSON_GetArrayItem(choices, 0) : NULL;

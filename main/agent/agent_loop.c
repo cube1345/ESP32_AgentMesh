@@ -32,6 +32,8 @@ static const char *TAG = "agent";
 #define TOOL_SUMMARY_SIZE 4096
 
 static bool message_prefers_direct_reply_no_tools(const char *message);
+static size_t append_prompt_format(char *prompt, size_t size, const char *fmt,
+                                   ...);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -107,6 +109,33 @@ static bool text_is_proactive_no_message(const char *text) {
 
   return len == strlen(ESPAGENT_PROACTIVE_NO_MESSAGE) &&
          strncmp(text, ESPAGENT_PROACTIVE_NO_MESSAGE, len) == 0;
+}
+
+static void build_lightweight_direct_reply_prompt(char *prompt,
+                                                  size_t size,
+                                                  const espagent_msg_t *msg) {
+  if (!prompt || size == 0) {
+    return;
+  }
+
+  snprintf(
+      prompt, size,
+      "# ESPAgent Direct Reply\n\n"
+      "You are ESPAgent, a careful and concise assistant.\n"
+      "This turn is a direct question-answer turn, not a device orchestration turn.\n"
+      "Prioritize correctness over speed.\n"
+      "For numbers, ordering, dates, units, and logic questions, reason carefully before answering.\n"
+      "Keep the final reply concise, but do not sacrifice correctness.\n"
+      "If the user asks for only the final answer, return only the final answer.\n"
+      "Do not mention tools, mesh, policy, skills, memory, or hardware unless the user explicitly asks about them.\n"
+      "If you are uncertain, say so plainly instead of guessing.\n");
+
+  if (msg && msg->channel[0]) {
+    append_prompt_format(prompt, size,
+                         "\nTurn channel: %s\n"
+                         "Respond naturally for this chat surface.\n",
+                         msg->channel);
+  }
 }
 
 static bool contains_substr_ci(const char *haystack, const char *needle) {
@@ -744,17 +773,24 @@ static bool try_execute_deterministic_number_compare(const espagent_msg_t *msg,
       contains_substr_ci(msg->content, "不要解释");
 
   if (lhs == rhs) {
-    snprintf(reply_buf, sizeof(reply_buf),
-             concise_only ? "%s" : "%s 和 %s 一样大。",
-             lhs_token, lhs_token, rhs_token);
+    if (concise_only) {
+      snprintf(reply_buf, sizeof(reply_buf), "%s", lhs_token);
+    } else {
+      snprintf(reply_buf, sizeof(reply_buf), "%s 和 %s 一样大。", lhs_token,
+               rhs_token);
+    }
   } else if (ask_smaller) {
-    snprintf(reply_buf, sizeof(reply_buf),
-             concise_only ? "%s" : "%s 更小。",
-             loser_token, loser_token);
+    if (concise_only) {
+      snprintf(reply_buf, sizeof(reply_buf), "%s", loser_token);
+    } else {
+      snprintf(reply_buf, sizeof(reply_buf), "%s 更小。", loser_token);
+    }
   } else {
-    snprintf(reply_buf, sizeof(reply_buf),
-             concise_only ? "%s" : "%s 更大。",
-             winner_token, winner_token);
+    if (concise_only) {
+      snprintf(reply_buf, sizeof(reply_buf), "%s", winner_token);
+    } else {
+      snprintf(reply_buf, sizeof(reply_buf), "%s 更大。", winner_token);
+    }
   }
 
   ESP_LOGI(TAG, "=== CONV === Deterministic number compare => %s", reply_buf);
@@ -1207,7 +1243,7 @@ static int history_limit_for_turn(bool smalltalk_turn, bool prefer_direct_reply)
       return 2;
     }
     if (prefer_direct_reply) {
-      return 4;
+      return 2;
     }
     return 6;
   }
@@ -1771,12 +1807,20 @@ static void agent_loop_task(void *arg) {
     bool smalltalk_turn = message_is_simple_greeting_or_smalltalk(msg.content);
     bool prefer_direct_reply =
         message_prefers_direct_reply_no_tools(msg.content) || smalltalk_turn;
+    bool use_lightweight_direct_prompt =
+        espagent_role_is_coordinator() && prefer_direct_reply;
     int history_limit =
         history_limit_for_turn(smalltalk_turn, prefer_direct_reply);
 
     /* 1. Build system prompt */
-    context_build_system_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE);
-    append_turn_context_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, &msg);
+    if (use_lightweight_direct_prompt) {
+      build_lightweight_direct_reply_prompt(system_prompt,
+                                           ESPAGENT_CONTEXT_BUF_SIZE,
+                                           &msg);
+    } else {
+      context_build_system_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE);
+      append_turn_context_prompt(system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, &msg);
+    }
     ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel,
              msg.chat_id);
 
@@ -1789,54 +1833,56 @@ static void agent_loop_task(void *arg) {
              (unsigned)strlen(history_json),
              prefer_direct_reply ? 1 : 0,
              smalltalk_turn ? 1 : 0);
-    memset(relevance_query, 0, 1024);
-    build_relevance_query(msg.content, relevance_query, 1024);
-    if (!espagent_role_is_coordinator()) {
-      memset(turn_buf, 0, 2048);
-      if (memory_v2_build_relevant_profile_summary(relevance_query,
+    if (!use_lightweight_direct_prompt) {
+      memset(relevance_query, 0, 1024);
+      build_relevance_query(msg.content, relevance_query, 1024);
+      if (!espagent_role_is_coordinator()) {
+        memset(turn_buf, 0, 2048);
+        if (memory_v2_build_relevant_profile_summary(relevance_query,
+                                                     turn_buf,
+                                                     2048) == ESP_OK &&
+            turn_buf[0]) {
+            append_prompt_format(system_prompt,
+                                 ESPAGENT_CONTEXT_BUF_SIZE,
+                                 "\n## Relevant User Profile For This Turn\n\n%s\n",
+                                 turn_buf);
+        }
+        memset(turn_buf, 0, 2048);
+        if (memory_v2_build_relevant_profile_conflict_summary(relevance_query,
+                                                              turn_buf,
+                                                              2048) == ESP_OK &&
+            turn_buf[0]) {
+            append_prompt_format(system_prompt,
+                                 ESPAGENT_CONTEXT_BUF_SIZE,
+                                 "\n## Relevant Profile Changes For This Turn\n\n%s\n",
+                                 turn_buf);
+        }
+        memset(turn_buf, 0, 2048);
+        if (memory_v2_build_relevant_skill_summary(relevance_query,
                                                    turn_buf,
                                                    2048) == ESP_OK &&
-          turn_buf[0]) {
-          append_prompt_format(system_prompt,
-                               ESPAGENT_CONTEXT_BUF_SIZE,
-                               "\n## Relevant User Profile For This Turn\n\n%s\n",
-                               turn_buf);
+            turn_buf[0]) {
+            append_prompt_format(system_prompt,
+                                 ESPAGENT_CONTEXT_BUF_SIZE,
+                                 "\n## Relevant Skill Notes For This Turn\n\n%s\n",
+                                 turn_buf);
+        }
       }
       memset(turn_buf, 0, 2048);
-      if (memory_v2_build_relevant_profile_conflict_summary(relevance_query,
-                                                            turn_buf,
-                                                            2048) == ESP_OK &&
+      if (skill_loader_build_relevant_details(relevance_query,
+                                              turn_buf,
+                                              2048,
+                                              2) == ESP_OK &&
           turn_buf[0]) {
-          append_prompt_format(system_prompt,
-                               ESPAGENT_CONTEXT_BUF_SIZE,
-                               "\n## Relevant Profile Changes For This Turn\n\n%s\n",
-                               turn_buf);
+        append_prompt_format(system_prompt,
+                             ESPAGENT_CONTEXT_BUF_SIZE,
+                             "\n## Relevant Skill Details For This Turn\n\n%s\n",
+                             turn_buf);
       }
-      memset(turn_buf, 0, 2048);
-      if (memory_v2_build_relevant_skill_summary(relevance_query,
-                                                 turn_buf,
-                                                 2048) == ESP_OK &&
-          turn_buf[0]) {
-          append_prompt_format(system_prompt,
-                               ESPAGENT_CONTEXT_BUF_SIZE,
-                               "\n## Relevant Skill Notes For This Turn\n\n%s\n",
-                               turn_buf);
-      }
+      append_pending_clarification_prompt(system_prompt,
+                                          ESPAGENT_CONTEXT_BUF_SIZE,
+                                          history_json);
     }
-    memset(turn_buf, 0, 2048);
-    if (skill_loader_build_relevant_details(relevance_query,
-                                            turn_buf,
-                                            2048,
-                                            2) == ESP_OK &&
-        turn_buf[0]) {
-      append_prompt_format(system_prompt,
-                           ESPAGENT_CONTEXT_BUF_SIZE,
-                           "\n## Relevant Skill Details For This Turn\n\n%s\n",
-                           turn_buf);
-    }
-    append_pending_clarification_prompt(system_prompt,
-                                        ESPAGENT_CONTEXT_BUF_SIZE,
-                                        history_json);
 
     cJSON *messages = cJSON_Parse(history_json);
     if (!messages)
