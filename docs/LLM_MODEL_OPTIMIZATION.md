@@ -2,6 +2,27 @@
 
 本文档基于当前仓库代码和当前 coordinator 板端配置，说明本项目的 AI 模型接入方式、已经确认的问题，以及建议的优化方向。
 
+## 0. 当前已落地的代码级优化
+
+截至当前仓库版本，已经实际落地的优化包括：
+
+- `main/agent/agent_loop.c`
+  - coordinator 对显式 `no tools`、简单寒暄、普通通用问答启用轻量直答 prompt
+  - 对 `13.8 和 13.11 谁大` 这类纯数值比较问题增加 deterministic fast-path
+  - 直答类问题默认缩短历史，减少旧上下文和 mesh 编排提示对普通问答的干扰
+- `main/llm/llm_proxy.c`
+  - OpenAI-compatible 请求显式设置 `temperature=0`
+  - 显式设置 `top_p=1`
+  - 记录上游实际返回的 `model`，便于确认真实命中的模型
+
+这意味着当前“模型回答质量低”的问题，已经不再只是 provider 参数问题，还和：
+
+- 当前实际模型能力
+- prompt 分流是否正确
+- 普通问答是否被误当成设备编排
+
+直接相关。
+
 ## 1. 当前实际运行模型
 
 已通过板端串口 CLI `config_show` 确认，当前 coordinator 实际运行配置为：
@@ -358,4 +379,3 @@ provider = openai
 - 记录模型调用失败和空响应的统计
 - 对短问答与硬件编排走不同的 prompt 或 tool 策略
 - 对“已知易错题型”建立 deterministic fallback
-
