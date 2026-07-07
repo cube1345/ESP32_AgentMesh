@@ -138,6 +138,37 @@ static void build_lightweight_direct_reply_prompt(char *prompt,
   }
 }
 
+static void build_project_explanation_prompt(char *prompt, size_t size,
+                                             const espagent_msg_t *msg) {
+  if (!prompt || size == 0) {
+    return;
+  }
+
+  snprintf(
+      prompt, size,
+      "# ESPAgent Project Explanation\n\n"
+      "You are ESPAgent, explaining the current project to a developer or operator.\n"
+      "This turn is a project explanation turn, not a live hardware orchestration turn.\n"
+      "Answer concretely and structurally, but keep the response concise.\n"
+      "Focus on architecture, node roles, data flow, runtime behavior, prompt routing, tools, memory, skills, gateway, and integration boundaries when relevant.\n"
+      "Do not pretend a hardware action, MQTT command, mesh dispatch, or tool execution already happened unless the current turn explicitly contains a real execution result.\n"
+      "If the question is about current implementation state, answer conservatively and distinguish code behavior from future design intent.\n"
+      "Do not mention policy, mesh, skills, or hardware unless they help answer the user's question.\n"
+      "If the user asks for comparison, reasoning, or explanation, prioritize correctness and clarity over speed.\n\n"
+      "## Current Node Identity\n"
+      "Node ID: " ESPAGENT_NODE_ID "\n"
+      "Node role: " ESPAGENT_NODE_ROLE "\n"
+      "Node capabilities: " ESPAGENT_NODE_CAPABILITIES "\n"
+      "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n");
+
+  if (msg && msg->channel[0]) {
+    append_prompt_format(prompt, size,
+                         "\nTurn channel: %s\n"
+                         "Respond naturally for this chat surface.\n",
+                         msg->channel);
+  }
+}
+
 static bool contains_substr_ci(const char *haystack, const char *needle) {
   if (!haystack || !needle || needle[0] == '\0') {
     return false;
@@ -1276,10 +1307,50 @@ static bool message_is_general_qa_turn(const char *message) {
   return true;
 }
 
-static int history_limit_for_turn(bool smalltalk_turn, bool prefer_direct_reply) {
+static bool message_is_project_explanation_turn(const char *message) {
+  static const char *const project_keywords[] = {
+      "项目",         "系统",          "架构",          "原理",
+      "流程",         "方案",          "设计",          "实现",
+      "prompt",       "路由",          "意图",          "多agent",
+      "multi-agent",  "agent",         "mesh",          "gateway",
+      "skills",       "memory",        "cache",         "mcp",
+      "feishu",       "websocket",     "mqtt",          "esp32",
+      "coordinator",  "guardian",      "sensor_agent",  "control_agent",
+      "为什么",       "什么意思",      "怎么做",        "如何修改",
+      "如何优化",     "介绍一下",      "解释一下",      "说一下",
+  };
+
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  if (!text_looks_like_question(message)) {
+    return false;
+  }
+
+  if (!message_has_any_keyword(message, project_keywords,
+                               sizeof(project_keywords) /
+                                   sizeof(project_keywords[0]))) {
+    return false;
+  }
+
+  if (message_should_have_used_mesh(message) ||
+      tool_guard_match_cron_request(message) ||
+      tool_guard_match_weather_request(message)) {
+    return false;
+  }
+
+  return true;
+}
+
+static int history_limit_for_turn(bool smalltalk_turn, bool prefer_direct_reply,
+                                  bool project_explanation_turn) {
   if (espagent_role_is_coordinator()) {
     if (smalltalk_turn) {
       return 2;
+    }
+    if (project_explanation_turn) {
+      return 3;
     }
     if (prefer_direct_reply) {
       return 2;
@@ -1844,19 +1915,29 @@ static void agent_loop_task(void *arg) {
     }
 
     bool smalltalk_turn = message_is_simple_greeting_or_smalltalk(msg.content);
+    bool project_explanation_turn =
+        espagent_role_is_coordinator() &&
+        message_is_project_explanation_turn(msg.content);
     bool general_qa_turn =
         espagent_role_is_coordinator() &&
+        !project_explanation_turn &&
         message_is_general_qa_turn(msg.content);
     bool prefer_direct_reply = message_prefers_direct_reply_no_tools(
                                    msg.content) ||
-                               smalltalk_turn || general_qa_turn;
+                               smalltalk_turn || general_qa_turn ||
+                               project_explanation_turn;
     bool use_lightweight_direct_prompt =
         espagent_role_is_coordinator() && prefer_direct_reply;
     int history_limit =
-        history_limit_for_turn(smalltalk_turn, prefer_direct_reply);
+        history_limit_for_turn(smalltalk_turn, prefer_direct_reply,
+                               project_explanation_turn);
 
     /* 1. Build system prompt */
-    if (use_lightweight_direct_prompt) {
+    if (project_explanation_turn) {
+      build_project_explanation_prompt(system_prompt,
+                                       ESPAGENT_CONTEXT_BUF_SIZE,
+                                       &msg);
+    } else if (use_lightweight_direct_prompt) {
       build_lightweight_direct_reply_prompt(system_prompt,
                                            ESPAGENT_CONTEXT_BUF_SIZE,
                                            &msg);
@@ -1871,12 +1952,13 @@ static void agent_loop_task(void *arg) {
     session_get_history_json(msg.chat_id, history_json,
                              ESPAGENT_LLM_STREAM_BUF_SIZE, history_limit);
     ESP_LOGI(TAG,
-             "History loaded: limit=%d bytes=%u direct_reply=%d smalltalk=%d general_qa=%d",
+             "History loaded: limit=%d bytes=%u direct_reply=%d smalltalk=%d general_qa=%d project_explain=%d",
              history_limit,
              (unsigned)strlen(history_json),
              prefer_direct_reply ? 1 : 0,
              smalltalk_turn ? 1 : 0,
-             general_qa_turn ? 1 : 0);
+             general_qa_turn ? 1 : 0,
+             project_explanation_turn ? 1 : 0);
     if (!use_lightweight_direct_prompt) {
       memset(relevance_query, 0, 1024);
       build_relevance_query(msg.content, relevance_query, 1024);
@@ -2008,8 +2090,9 @@ static void agent_loop_task(void *arg) {
       }
       if (prefer_direct_reply && iteration == 0) {
         ESP_LOGI(TAG,
-                 "Direct-reply heuristic enabled for this turn; first LLM call runs without tools (smalltalk=%d general_qa=%d)",
-                 smalltalk_turn ? 1 : 0, general_qa_turn ? 1 : 0);
+                 "Direct-reply heuristic enabled for this turn; first LLM call runs without tools (smalltalk=%d general_qa=%d project_explain=%d)",
+                 smalltalk_turn ? 1 : 0, general_qa_turn ? 1 : 0,
+                 project_explanation_turn ? 1 : 0);
       }
       err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
       if (compact_messages) {
