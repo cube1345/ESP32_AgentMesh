@@ -228,3 +228,77 @@ ESP32 端已有本地 WebSocket 网关：
 - 按 `trace_id` 或时间窗口进行归并
 
 这样这个前端就不只是“能聊天”，而是真正开始像一个多 Agent 调度终端。
+
+## 7. 当前 STT 新状态
+
+当前语音输入已经分成两条链路：
+
+### 7.1 浏览器麦克风链路
+
+```text
+浏览器 SpeechRecognition
+-> frontend WebSocket
+-> MQTT voice/stt/result
+-> coordinator agent_loop
+```
+
+这条链路已经可用，适合快速演示。
+
+### 7.2 ESP32 麦克风链路
+
+```text
+INMP441 / INA-class Mic
+-> control_agent I2S capture
+-> MQTT voice/stt/audio_chunk
+-> frontend/server 音频重组
+-> 上游云端 STT
+-> MQTT voice/stt/result
+-> coordinator agent_loop
+```
+
+这条链路已经完成了：
+
+- `control_agent` 收到 `voice/stt/request` 后启动本地麦克风录音
+- 录音以 `pcm_s16le` 分片方式通过 MQTT 发布
+- `frontend/server/index.mjs` 已能重组分片并调用上游 STT
+- 识别结果继续复用既有 `voice/stt/result` 回灌链
+
+## 8. 启用 ESP32 麦克风 STT 需要的网关配置
+
+当前 `frontend/server/index.mjs` 支持一个最小通用的 HTTP JSON STT 上游。
+
+启动前设置环境变量：
+
+```bash
+export ESPAGENT_STT_PROVIDER=http_json
+export ESPAGENT_STT_UPSTREAM_URL="https://your-stt-endpoint"
+export ESPAGENT_STT_UPSTREAM_APP_ID="your_app_id"
+export ESPAGENT_STT_UPSTREAM_TOKEN="your_token"
+export ESPAGENT_STT_UPSTREAM_APP_ID_HEADER="X-Appid"
+export ESPAGENT_STT_UPSTREAM_TOKEN_MODE="bearer"
+export ESPAGENT_STT_UPSTREAM_TOKEN_HEADER="Authorization"
+```
+
+当前网关发给上游的请求体格式是：
+
+```json
+{
+  "request_id": "stt-xxx",
+  "format": "pcm_s16le",
+  "channels": 1,
+  "sample_rate_hz": 16000,
+  "language": "zh-CN",
+  "audio_b64": "base64..."
+}
+```
+
+期望上游返回至少包含：
+
+```json
+{
+  "transcript": "识别结果",
+  "provider": "your_stt_provider"
+}
+```
+
+如果后续你确认豆包/火山语音的真实 STT HTTP 或 WebSocket 协议，我再把这个通用 `http_json` 适配改成你当前账号的专用 provider。

@@ -40,7 +40,7 @@
 | 3-wire PIR / 存在传感器 | `GPIO13` | `sensor_agent` | 已支持 | 工具：`read_presence` |
 | HC-SR05 | 默认未固定 | `sensor_agent` | 已支持但未默认配置 | 需单独设置 Trig / Echo |
 | MAX98357 I2S 功放 | `BCLK=GPIO1`, `WS=GPIO2`, `DIN=GPIO3`, `SD` 可选 | `control_agent` | 已支持 | 工具：`max98357_play_tone` |
-| INA I2S 麦克风 | `SCK=GPIO6`, `WS=GPIO7`, `LR=GND`, `SD=GPIO8` | `control_agent` | 硬件方案已确定，固件采集链未接入 | 规划中的 I2S 麦克风输入 |
+| INA I2S 麦克风 | `SCK=GPIO6`, `WS=GPIO7`, `LR=GND`, `SD=GPIO8` | `control_agent` | 硬件方案已确定，固件已接入 I2S 采样与 MQTT 音频上送，云端 STT 仍需网关配置 | I2S 麦克风输入 |
 | 格力空调 IR 发射 | `ESPAGENT_SECRET_GREE_IR_TX_GPIO`，默认 `-1` | `control_agent` | 已支持 | 工具：`gree_ac_control`，Gree-only，send-only |
 | 通用 GPIO | `1-18, 21, 38, 46` | `control_agent` | 已支持 | 工具：`gpio_write` / `gpio_read` |
 
@@ -189,7 +189,7 @@ INA GND      -> GND
 
 说明：
 
-- 当前确定的是硬件接线方案，不代表固件已经完成录音 / STT 采集链
+- 当前不仅接线方案已确定，固件也已补入 I2S 采样、音量检测和 MQTT 音频分片上送；但真正的云端 STT 识别仍依赖网关侧配置上游 provider
 - `LR` 接地表示固定使用单侧声道
 - 这一路是 I2S 数字麦克风输入，和 MAX98357 的 I2S 功放输出是两套独立链路
 - 按当前项目 GPIO 策略，ESP32-S3 侧不会因为 `GPIO6/7/8` 直接被策略拦截；当前明确保留的是 `GPIO19/20` USB Serial/JTAG
@@ -325,7 +325,7 @@ SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO
 |---|---|---|
 | 第二路舵机 | 未实现 | 增加第二路 servo tool 或支持 `index` |
 | ICM42688 | 未接入 | 优先 SPI 独立驱动 |
-| 麦克风输入 | 接线方案已确定，固件未接入 | 当前规划：`SCK=6, WS=7, LR=GND, SD=8`，后续补 I2S 采集/STT |
+| 麦克风输入 | 已接入固件采样链，待联通网关 STT | 当前规划：`SCK=6, WS=7, LR=GND, SD=8`，板端已支持 I2S 采样和 MQTT 音频上送 |
 | HC-05 蓝牙网关 | 未完整接入 | 作为 UART/蓝牙网关单独设计 |
 | 通用家电 IR | 未接入 | 不要和 Gree AC 专用控制混成一个大工具 |
 | ESP32-P4 / Android 终端联动 | 有数据通路 | 下一步重点做 UI 绑定和调度展示 |
