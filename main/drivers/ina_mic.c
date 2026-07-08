@@ -296,6 +296,108 @@ esp_err_t ina_mic_stream_read_level(ina_mic_stream_t *stream,
     return ESP_OK;
 }
 
+esp_err_t ina_mic_stream_capture_pcm16(ina_mic_stream_t *stream,
+                                       uint32_t duration_ms,
+                                       ina_mic_pcm16_writer_t writer,
+                                       void *ctx,
+                                       size_t *samples_written,
+                                       char *diag,
+                                       size_t diag_size)
+{
+    int32_t *raw_buf = NULL;
+    int16_t *pcm_buf = NULL;
+    uint32_t elapsed_ms = 0;
+    const uint32_t window_ms = 40;
+    size_t total_samples = 0;
+    esp_err_t err = ESP_OK;
+
+    if (!diag || diag_size == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    diag[0] = '\0';
+
+    if (!stream || !stream->active || !stream->rx_chan) {
+        snprintf(diag, diag_size, "Error: INA mic stream is not active");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!writer) {
+        snprintf(diag, diag_size, "Error: missing INA mic PCM writer");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (duration_ms < INA_MIC_MIN_DURATION_MS || duration_ms > INA_MIC_MAX_DURATION_MS) {
+        snprintf(diag, diag_size,
+                 "Error: duration_ms must be %d-%d, got %lu",
+                 INA_MIC_MIN_DURATION_MS,
+                 INA_MIC_MAX_DURATION_MS,
+                 (unsigned long)duration_ms);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    raw_buf = heap_caps_calloc(INA_MIC_CHUNK_SAMPLES * 2, sizeof(int32_t), MALLOC_CAP_SPIRAM);
+    pcm_buf = heap_caps_calloc(INA_MIC_CHUNK_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM);
+    if (!raw_buf || !pcm_buf) {
+        free(raw_buf);
+        free(pcm_buf);
+        snprintf(diag, diag_size, "Error: no memory for INA mic PCM capture");
+        return ESP_ERR_NO_MEM;
+    }
+
+    while (elapsed_ms < duration_ms) {
+        size_t bytes_read = 0;
+        size_t pcm_count = 0;
+        size_t sample_count = 0;
+
+        err = i2s_channel_read(stream->rx_chan,
+                               raw_buf,
+                               INA_MIC_CHUNK_SAMPLES * 2 * sizeof(int32_t),
+                               &bytes_read,
+                               pdMS_TO_TICKS(window_ms));
+        if (err == ESP_ERR_TIMEOUT) {
+            elapsed_ms += window_ms;
+            continue;
+        }
+        if (err != ESP_OK) {
+            snprintf(diag, diag_size, "Error: INA mic read failed (%s)", esp_err_to_name(err));
+            free(raw_buf);
+            free(pcm_buf);
+            return err;
+        }
+
+        stream->raw_bytes_in += bytes_read;
+        sample_count = bytes_read / sizeof(int32_t);
+        for (size_t i = stream->cfg.right_channel ? 1 : 0; i < sample_count; i += 2) {
+            int32_t sample24 = raw_buf[i] >> 8;
+            pcm_buf[pcm_count++] = (int16_t)(sample24 >> 8);
+        }
+
+        if (pcm_count > 0) {
+            err = writer(pcm_buf, pcm_count, ctx);
+            if (err != ESP_OK) {
+                snprintf(diag, diag_size, "Error: INA mic PCM writer failed (%s)",
+                         esp_err_to_name(err));
+                free(raw_buf);
+                free(pcm_buf);
+                return err;
+            }
+            total_samples += pcm_count;
+        }
+        elapsed_ms += window_ms;
+    }
+
+    if (samples_written) {
+        *samples_written = total_samples;
+    }
+    snprintf(diag, diag_size,
+             "OK: INA mic PCM captured samples=%u raw_bytes=%u sample_rate=%lu",
+             (unsigned)total_samples,
+             (unsigned)stream->raw_bytes_in,
+             (unsigned long)stream->cfg.sample_rate_hz);
+    ESP_LOGI(TAG, "%s", diag);
+    free(raw_buf);
+    free(pcm_buf);
+    return ESP_OK;
+}
+
 esp_err_t ina_mic_stream_close(ina_mic_stream_t *stream,
                                char *diag,
                                size_t diag_size)

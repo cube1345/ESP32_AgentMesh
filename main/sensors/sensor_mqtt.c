@@ -2518,6 +2518,7 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_REQUEST, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 6);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_REQUEST, 7);
         } else if (espagent_role_is_guardian()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);

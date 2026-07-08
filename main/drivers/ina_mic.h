@@ -33,6 +33,10 @@ typedef struct {
     size_t raw_bytes_in;
 } ina_mic_stream_t;
 
+typedef esp_err_t (*ina_mic_pcm16_writer_t)(const int16_t *samples,
+                                            size_t sample_count,
+                                            void *ctx);
+
 void ina_mic_default_config(ina_mic_config_t *cfg);
 
 esp_err_t ina_mic_stream_open(ina_mic_stream_t *stream,
@@ -45,6 +49,14 @@ esp_err_t ina_mic_stream_read_level(ina_mic_stream_t *stream,
                                     ina_mic_level_t *level,
                                     char *diag,
                                     size_t diag_size);
+
+esp_err_t ina_mic_stream_capture_pcm16(ina_mic_stream_t *stream,
+                                       uint32_t duration_ms,
+                                       ina_mic_pcm16_writer_t writer,
+                                       void *ctx,
+                                       size_t *samples_written,
+                                       char *diag,
+                                       size_t diag_size);
 
 esp_err_t ina_mic_stream_close(ina_mic_stream_t *stream,
                                char *diag,

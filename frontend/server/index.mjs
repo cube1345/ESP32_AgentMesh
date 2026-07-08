@@ -12,11 +12,21 @@ const CHAT_REQUEST_TOPIC = `${TOPIC_PREFIX}/web/chat/request`;
 const CHAT_REPLY_TOPIC = `${TOPIC_PREFIX}/web/chat/reply`;
 const VOICE_STT_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/stt/request`;
 const VOICE_STT_RESULT_TOPIC = `${TOPIC_PREFIX}/voice/stt/result`;
+const VOICE_STT_AUDIO_CHUNK_TOPIC = `${TOPIC_PREFIX}/voice/stt/audio_chunk`;
+const VOICE_STT_AUDIO_DONE_TOPIC = `${TOPIC_PREFIX}/voice/stt/audio_done`;
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
 const CHAT_GATEWAY_PATH = '/ws';
+const STT_PROVIDER = (process.env.ESPAGENT_STT_PROVIDER || 'disabled').trim();
+const STT_UPSTREAM_URL = (process.env.ESPAGENT_STT_UPSTREAM_URL || '').trim();
+const STT_UPSTREAM_APP_ID = (process.env.ESPAGENT_STT_UPSTREAM_APP_ID || '').trim();
+const STT_UPSTREAM_TOKEN = (process.env.ESPAGENT_STT_UPSTREAM_TOKEN || '').trim();
+const STT_UPSTREAM_APP_ID_HEADER = (process.env.ESPAGENT_STT_UPSTREAM_APP_ID_HEADER || 'X-Appid').trim();
+const STT_UPSTREAM_TOKEN_HEADER = (process.env.ESPAGENT_STT_UPSTREAM_TOKEN_HEADER || 'Authorization').trim();
+const STT_UPSTREAM_TOKEN_MODE = (process.env.ESPAGENT_STT_UPSTREAM_TOKEN_MODE || 'bearer').trim();
 const runtimeSkills = new Map();
 const chatSessions = new Map();
 const wsSessions = new Set();
+const sttAudioSessions = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -47,6 +57,182 @@ function safeJsonParse(input) {
     return JSON.parse(input);
   } catch {
     return null;
+  }
+}
+
+function noteVoiceTimeline(stage, source, target, payload, status = 'ok') {
+  pushTimeline({
+    time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+    stage,
+    source,
+    target,
+    payload,
+    status
+  });
+}
+
+function sttHeaders() {
+  const headers = { 'Content-Type': 'application/json' };
+  if (STT_UPSTREAM_APP_ID) {
+    headers[STT_UPSTREAM_APP_ID_HEADER] = STT_UPSTREAM_APP_ID;
+  }
+  if (STT_UPSTREAM_TOKEN) {
+    if (STT_UPSTREAM_TOKEN_MODE === 'bearer') {
+      headers.Authorization = `Bearer ${STT_UPSTREAM_TOKEN}`;
+    } else if (STT_UPSTREAM_TOKEN_MODE === 'raw') {
+      headers.Authorization = STT_UPSTREAM_TOKEN;
+    } else {
+      headers[STT_UPSTREAM_TOKEN_HEADER] = STT_UPSTREAM_TOKEN;
+    }
+  }
+  return headers;
+}
+
+async function transcribeUploadedAudio(session) {
+  if (!session || !Array.isArray(session.chunks) || session.chunks.length === 0) {
+    throw new Error('missing audio chunks');
+  }
+
+  const ordered = session.chunks
+    .filter((item) => item && Number.isInteger(item.index) && Buffer.isBuffer(item.audio))
+    .sort((a, b) => a.index - b.index)
+    .map((item) => item.audio);
+  const audioBuffer = Buffer.concat(ordered);
+  if (audioBuffer.length === 0) {
+    throw new Error('empty audio buffer');
+  }
+
+  if (STT_PROVIDER === 'http_json') {
+    if (!STT_UPSTREAM_URL) {
+      throw new Error('ESPAGENT_STT_UPSTREAM_URL is not configured');
+    }
+
+    const response = await fetch(STT_UPSTREAM_URL, {
+      method: 'POST',
+      headers: sttHeaders(),
+      body: JSON.stringify({
+        request_id: session.requestId,
+        format: session.format || 'pcm_s16le',
+        channels: session.channels || 1,
+        sample_rate_hz: session.sampleRateHz || 16000,
+        language: 'zh-CN',
+        audio_b64: audioBuffer.toString('base64')
+      })
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload?.ok === false) {
+      throw new Error(payload?.error || `HTTP ${response.status}`);
+    }
+
+    const transcript = typeof payload.transcript === 'string'
+      ? payload.transcript.trim()
+      : '';
+    if (!transcript) {
+      throw new Error('upstream transcript is empty');
+    }
+    return {
+      transcript,
+      provider: payload.provider || 'http_json'
+    };
+  }
+
+  throw new Error(`unsupported STT provider: ${STT_PROVIDER}`);
+}
+
+function publishSttTranscriptResult(session, transcript, provider) {
+  const sttPayload = JSON.stringify({
+    schema: 'espagent.voice.stt_result.v1',
+    event: 'stt_result',
+    request_id: session.requestId,
+    transcript,
+    status: 'ok',
+    provider: provider || 'esp32_mic',
+    reply_channel: session.replyChannel || 'voice',
+    reply_chat_id: session.replyChatId || 'voice-session',
+    ts_ms: Date.now()
+  });
+
+  client.publish(VOICE_STT_RESULT_TOPIC, sttPayload, { qos: 0 }, (error) => {
+    if (error) {
+      noteChatGatewayEvent(error.message);
+      noteVoiceTimeline('stt_result', 'voice_gateway', session.replyChatId || 'agent_loop', error.message, 'warn');
+      return;
+    }
+    noteChatGatewayEvent(null);
+  });
+}
+
+function handleSttAudioChunk(payload) {
+  const requestId = typeof payload.request_id === 'string' && payload.request_id.trim()
+    ? payload.request_id.trim()
+    : '';
+  const audioB64 = typeof payload.audio_b64 === 'string' ? payload.audio_b64.trim() : '';
+  if (!requestId || !audioB64) {
+    return;
+  }
+
+  let session = sttAudioSessions.get(requestId);
+  if (!session) {
+    session = {
+      requestId,
+      replyChannel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'voice',
+      replyChatId: typeof payload.reply_chat_id === 'string' ? payload.reply_chat_id : 'voice-session',
+      sampleRateHz: Number(payload.sample_rate_hz || 16000),
+      channels: Number(payload.channels || 1),
+      format: typeof payload.format === 'string' ? payload.format : 'pcm_s16le',
+      sourceNode: typeof payload.node_id === 'string' ? payload.node_id : 'control_agent',
+      chunks: [],
+      createdAt: Date.now()
+    };
+    sttAudioSessions.set(requestId, session);
+  }
+
+  session.chunks.push({
+    index: Number(payload.chunk_index || session.chunks.length),
+    audio: Buffer.from(audioB64, 'base64')
+  });
+}
+
+async function handleSttAudioDone(payload) {
+  const requestId = typeof payload.request_id === 'string' && payload.request_id.trim()
+    ? payload.request_id.trim()
+    : '';
+  if (!requestId) {
+    return;
+  }
+
+  const session = sttAudioSessions.get(requestId);
+  if (!session) {
+    return;
+  }
+
+  session.replyChannel = typeof payload.reply_channel === 'string' ? payload.reply_channel : session.replyChannel;
+  session.replyChatId = typeof payload.reply_chat_id === 'string' ? payload.reply_chat_id : session.replyChatId;
+  session.sampleRateHz = Number(payload.sample_rate_hz || session.sampleRateHz || 16000);
+  session.channels = Number(payload.channels || session.channels || 1);
+  session.format = typeof payload.format === 'string' ? payload.format : session.format;
+
+  if (payload.status === 'error') {
+    noteVoiceTimeline('stt_audio_done', session.sourceNode || 'esp32_mic', 'voice_gateway', payload.detail || 'capture error', 'warn');
+    sttAudioSessions.delete(requestId);
+    return;
+  }
+
+  noteVoiceTimeline('stt_audio_done', session.sourceNode || 'esp32_mic', 'voice_gateway', `chunks=${session.chunks.length}`, 'ok');
+
+  try {
+    const result = await transcribeUploadedAudio(session);
+    publishSttTranscriptResult(session, result.transcript, result.provider);
+  } catch (error) {
+    noteVoiceTimeline(
+      'stt_result',
+      'voice_gateway',
+      session.replyChatId || 'agent_loop',
+      error instanceof Error ? error.message : String(error),
+      'warn'
+    );
+  } finally {
+    sttAudioSessions.delete(requestId);
   }
 }
 
@@ -511,7 +697,9 @@ client.on('connect', () => {
     `${TOPIC_PREFIX}/guardian/stateboard`,
     CHAT_REPLY_TOPIC,
     VOICE_STT_REQUEST_TOPIC,
-    VOICE_STT_RESULT_TOPIC
+    VOICE_STT_RESULT_TOPIC,
+    VOICE_STT_AUDIO_CHUNK_TOPIC,
+    VOICE_STT_AUDIO_DONE_TOPIC
   ];
   client.subscribe(topics, (error) => {
     if (error) {
@@ -569,6 +757,7 @@ client.on('message', (topic, buffer) => {
     const request = {
       type: 'stt_request',
       request_id: typeof payload.request_id === 'string' ? payload.request_id : `stt-${Date.now()}`,
+      device_id: typeof payload.device_id === 'string' ? payload.device_id : '',
       reply_channel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'web',
       reply_chat_id: typeof payload.reply_chat_id === 'string' ? payload.reply_chat_id : 'web_console_01',
       hint_text: typeof payload.hint_text === 'string' ? payload.hint_text : '',
@@ -596,6 +785,14 @@ client.on('message', (topic, buffer) => {
       payload: payload.transcript || '(empty transcript)',
       status: payload.status === 'error' ? 'warn' : 'ok'
     });
+    return;
+  }
+  if (topic === VOICE_STT_AUDIO_CHUNK_TOPIC) {
+    handleSttAudioChunk(payload);
+    return;
+  }
+  if (topic === VOICE_STT_AUDIO_DONE_TOPIC) {
+    handleSttAudioDone(payload);
     return;
   }
   if (topic.endsWith('/stateboard')) {

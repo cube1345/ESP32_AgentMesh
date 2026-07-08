@@ -553,9 +553,13 @@ function App() {
       socket.onopen = () => { setWsConnected(true); appendChatMessage('system', `WebSocket 已连接：${wsUrl}`, 'success'); };
       socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(String(event.data)) as { type?: string; content?: string; request_id?: string; reply_channel?: string; reply_chat_id?: string; hint_text?: string };
+          const data = JSON.parse(String(event.data)) as { type?: string; content?: string; request_id?: string; device_id?: string; reply_channel?: string; reply_chat_id?: string; hint_text?: string };
           const content = data.content || String(event.data);
           if (data.type === 'stt_request') {
+            if (data.device_id && data.device_id !== 'dashboard_web' && data.device_id !== 'web_console_01' && data.device_id !== 'display_agent') {
+              appendChatMessage('system', `收到 STT 请求，但目标设备是 ${data.device_id}，浏览器端不接管。`, 'info');
+              return;
+            }
             appendChatMessage('system', data.hint_text ? `收到 STT 请求：${data.hint_text}` : '收到 STT 请求，开始录音转写。', 'info');
             startSpeechRecognition({
               requestId: data.request_id || `stt-${Date.now()}`,
