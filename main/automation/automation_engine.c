@@ -10,8 +10,10 @@
 
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "esp_heap_caps.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -23,6 +25,7 @@ static const char *TAG = "automation";
 #define AUTOMATION_MAX_WORKFLOWS ESPAGENT_AUTOMATION_MAX_WORKFLOWS
 #define AUTOMATION_MAX_RULES     ESPAGENT_AUTOMATION_MAX_RULES
 #define AUTOMATION_MAX_STEPS     ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS
+#define AUTOMATION_WORKFLOW_OUTPUT_SIZE 768
 
 typedef struct {
     char action[ESPAGENT_MESH_ACTION_MAX];
@@ -81,6 +84,42 @@ static void unlock(void)
     if (s_lock) {
         xSemaphoreGive(s_lock);
     }
+}
+
+static BaseType_t create_workflow_runtime_task(TaskFunction_t task_func,
+                                               const char *task_name,
+                                               uint32_t stack_bytes,
+                                               void *task_arg)
+{
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(task_func,
+                                                    task_name,
+                                                    stack_bytes,
+                                                    task_arg,
+                                                    4,
+                                                    NULL,
+                                                    0,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok == pdPASS) {
+        ESP_LOGI(TAG, "Workflow task %s created with PSRAM stack=%u", task_name, (unsigned)stack_bytes);
+        return ok;
+    }
+
+    ESP_LOGW(TAG,
+             "Workflow task %s PSRAM stack create failed (stack=%u, free_internal=%u, largest_internal=%u), retrying internal RAM",
+             task_name,
+             (unsigned)stack_bytes,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+#endif
+
+    return xTaskCreatePinnedToCore(task_func,
+                                   task_name,
+                                   stack_bytes,
+                                   task_arg,
+                                   4,
+                                   NULL,
+                                   0);
 }
 
 static void gen_id(char *buf, size_t size, const char *prefix)
@@ -222,7 +261,7 @@ static esp_err_t step_execute_mesh(const automation_step_t *step, char *output, 
     if (step->target_node[0]) {
         cJSON_AddStringToObject(payload, "target_node", step->target_node);
     }
-    cJSON_AddBoolToObject(payload, "async", false);
+    cJSON_AddBoolToObject(payload, "async", true);
     cJSON_AddNumberToObject(payload, "safety_level", 1);
     cJSON_AddNumberToObject(payload, "ttl_ms", 30000);
     cJSON_AddBoolToObject(payload, "require_ack", true);
@@ -506,6 +545,29 @@ static void workflow_task(void *arg)
     }
 
     char summary[192];
+    char *output = calloc(1, AUTOMATION_WORKFLOW_OUTPUT_SIZE);
+    if (!output) {
+        (void)sensor_mqtt_publish_timeline_event("workflow",
+                                                 "automation_workflow_error",
+                                                 "error",
+                                                 "workflow runtime out of memory",
+                                                 workflow->id,
+                                                 "control_agent",
+                                                 "",
+                                                 workflow->name);
+        lock();
+        for (int i = 0; i < AUTOMATION_MAX_WORKFLOWS; i++) {
+            if (s_workflows[i].used && strcmp(s_workflows[i].id, workflow->id) == 0) {
+                s_workflows[i].used = false;
+                break;
+            }
+        }
+        unlock();
+        free(workflow);
+        vTaskDelete(NULL);
+        return;
+    }
+
     for (int i = 0; i < workflow->step_count; i++) {
         if (!workflow_still_active(workflow->id)) {
             snprintf(summary, sizeof(summary), "workflow=%s canceled before step=%d", workflow->id, i + 1);
@@ -536,8 +598,8 @@ static void workflow_task(void *arg)
             break;
         }
 
-        char output[768] = {0};
-        esp_err_t err = step_execute_mesh(step, output, sizeof(output));
+        output[0] = '\0';
+        esp_err_t err = step_execute_mesh(step, output, AUTOMATION_WORKFLOW_OUTPUT_SIZE);
         snprintf(summary, sizeof(summary),
                  "workflow=%s step=%d action=%s status=%s",
                  workflow->id, i + 1, step->action, esp_err_to_name(err));
@@ -562,6 +624,7 @@ static void workflow_task(void *arg)
         }
     }
     unlock();
+    free(output);
     free(workflow);
     vTaskDelete(NULL);
 }
@@ -756,6 +819,15 @@ static esp_err_t add_workflow_locked(cJSON *root, char *output, size_t output_si
         return ESP_ERR_NO_MEM;
     }
     *runtime = *wf;
+    if (create_workflow_runtime_task(workflow_task,
+                                     "workflow",
+                                     ESPAGENT_AUTOMATION_WORKFLOW_STACK,
+                                     runtime) != pdPASS) {
+        free(runtime);
+        wf->used = false;
+        snprintf(output, output_size, "Error: failed to start workflow task");
+        return ESP_ERR_NO_MEM;
+    }
     snprintf(output, output_size, "OK: workflow %s created with %u steps", wf->id, (unsigned)wf->step_count);
     (void)sensor_mqtt_publish_timeline_event("workflow",
                                              "automation_workflow_created",
@@ -765,12 +837,6 @@ static esp_err_t add_workflow_locked(cJSON *root, char *output, size_t output_si
                                              "control_agent",
                                              "",
                                              wf->name);
-    if (xTaskCreate(workflow_task, "workflow", 6144, runtime, 4, NULL) != pdPASS) {
-        free(runtime);
-        wf->used = false;
-        snprintf(output, output_size, "Error: failed to start workflow task");
-        return ESP_ERR_NO_MEM;
-    }
     return ESP_OK;
 }
 

@@ -1,12 +1,10 @@
 import {
-  Alert,
   App as AntdApp,
   Badge,
   Button,
   Card,
   Col,
   ConfigProvider,
-  Divider,
   Empty,
   Form,
   Input,
@@ -57,7 +55,7 @@ import type {
 } from './types';
 
 const { Header, Content, Sider } = Layout;
-const { Title, Paragraph, Text } = Typography;
+const { Title, Text } = Typography;
 
 type ViewMode = '总览' | '协作链路' | 'Skills Studio' | '用户偏好';
 type TimelineFilter = '全部' | 'telemetry' | 'state' | 'policy' | 'reply' | 'error';
@@ -78,6 +76,51 @@ interface ChatMessage {
   tone?: 'info' | 'success' | 'warning' | 'error';
   text: string;
   time: string;
+}
+
+interface BrowserSpeechRecognitionResultItem {
+  transcript: string;
+}
+
+interface BrowserSpeechRecognitionResult {
+  isFinal: boolean;
+  0: BrowserSpeechRecognitionResultItem;
+  length: number;
+}
+
+interface BrowserSpeechRecognitionEvent extends Event {
+  resultIndex: number;
+  results: ArrayLike<BrowserSpeechRecognitionResult>;
+}
+
+interface BrowserSpeechRecognitionErrorEvent extends Event {
+  error: string;
+  message?: string;
+}
+
+interface BrowserSpeechRecognition extends EventTarget {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives: number;
+  onstart: ((this: BrowserSpeechRecognition, ev: Event) => void) | null;
+  onresult: ((this: BrowserSpeechRecognition, ev: BrowserSpeechRecognitionEvent) => void) | null;
+  onerror: ((this: BrowserSpeechRecognition, ev: BrowserSpeechRecognitionErrorEvent) => void) | null;
+  onend: ((this: BrowserSpeechRecognition, ev: Event) => void) | null;
+  start(): void;
+  stop(): void;
+  abort(): void;
+}
+
+interface BrowserSpeechRecognitionCtor {
+  new (): BrowserSpeechRecognition;
+}
+
+declare global {
+  interface Window {
+    SpeechRecognition?: BrowserSpeechRecognitionCtor;
+    webkitSpeechRecognition?: BrowserSpeechRecognitionCtor;
+  }
 }
 
 const demoAccounts: Array<UserSession & { password: string; description: string }> = [
@@ -220,11 +263,16 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('admin123');
   const [wsConnected, setWsConnected] = useState(false);
   const [wsInstance, setWsInstance] = useState<WebSocket | null>(null);
+  const [sttListening, setSttListening] = useState(false);
+  const [sttInterimText, setSttInterimText] = useState('');
+  const [sttStatusText, setSttStatusText] = useState('未启动');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { id: 'system-welcome', role: 'system' as const, tone: 'info', text: '这里模拟飞书式消息入口，消息经本地网关转发到 ESP32。', time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
   ]);
   const [messageApi, contextHolder] = message.useMessage();
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
+  const pendingSttRequestRef = useRef<{ requestId: string; replyChannel: string; replyChatId: string } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -318,9 +366,114 @@ function App() {
   }), [draftSkills.length, payload.capabilities.length, payload.nodes]);
 
   const chatRelatedTimeline = useMemo(() => payload.timeline.slice(0, 8), [payload.timeline]);
+  const sttSupported = typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
 
   function appendChatMessage(role: 'user' | 'assistant' | 'system', text: string, tone?: ChatMessage['tone']) {
     setChatMessages((current) => [...current, { id: `${role}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, role, tone, text, time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) }]);
+  }
+
+  function stopSpeechRecognition() {
+    speechRecognitionRef.current?.stop();
+  }
+
+  function sendTranscriptToGateway(transcript: string, request?: { requestId: string; replyChannel: string; replyChatId: string } | null) {
+    if (!wsInstance || wsInstance.readyState !== WebSocket.OPEN) {
+      appendChatMessage('system', '语音转写完成，但当前 WebSocket 未连接，无法发送。', 'error');
+      return;
+    }
+
+    const clean = transcript.trim();
+    if (!clean) {
+      return;
+    }
+
+    if (request) {
+      wsInstance.send(JSON.stringify({
+        type: 'stt_result',
+        request_id: request.requestId,
+        transcript: clean,
+        reply_channel: request.replyChannel,
+        reply_chat_id: request.replyChatId,
+        provider: 'browser_webspeech',
+        status: 'ok'
+      }));
+      appendChatMessage('system', `已完成语音转写并回传：${clean}`, 'success');
+      return;
+    }
+
+    wsInstance.send(JSON.stringify({ type: 'message', content: clean, chat_id: chatId.trim() || 'web_console_01' }));
+    appendChatMessage('user', clean);
+  }
+
+  function startSpeechRecognition(request?: { requestId: string; replyChannel: string; replyChatId: string } | null) {
+    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognitionCtor) {
+      setSttStatusText('当前浏览器不支持 SpeechRecognition');
+      appendChatMessage('system', '当前浏览器不支持 SpeechRecognition，无法启动 STT。', 'error');
+      return;
+    }
+    if (!wsInstance || wsInstance.readyState !== WebSocket.OPEN) {
+      appendChatMessage('system', '请先连接本地通信网关，再启动 STT。', 'warning');
+      return;
+    }
+    if (sttListening) {
+      appendChatMessage('system', 'STT 已在运行。', 'warning');
+      return;
+    }
+
+    pendingSttRequestRef.current = request ?? null;
+    setSttInterimText('');
+    setSttListening(true);
+    setSttStatusText(request ? '响应远端 STT 请求中...' : '正在采集语音...');
+
+    const recognition = new SpeechRecognitionCtor();
+    speechRecognitionRef.current = recognition;
+    recognition.lang = preferences.preferredLanguage || 'zh-CN';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      setSttStatusText(request ? '浏览器 STT 已启动，等待说话...' : '浏览器 STT 已启动');
+    };
+
+    recognition.onresult = (event) => {
+      let interim = '';
+      let finalText = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i += 1) {
+        const result = event.results[i];
+        const text = result[0]?.transcript || '';
+        if (result.isFinal) finalText += text;
+        else interim += text;
+      }
+
+      setSttInterimText(interim);
+      if (finalText.trim()) {
+        setSttStatusText('语音识别完成');
+        sendTranscriptToGateway(finalText, pendingSttRequestRef.current);
+        pendingSttRequestRef.current = null;
+        recognition.stop();
+      }
+    };
+
+    recognition.onerror = (event) => {
+      setSttStatusText(`语音识别错误: ${event.error}`);
+      appendChatMessage('system', `语音识别失败：${event.error}`, 'error');
+      pendingSttRequestRef.current = null;
+      setSttListening(false);
+      speechRecognitionRef.current = null;
+    };
+
+    recognition.onend = () => {
+      setSttListening(false);
+      speechRecognitionRef.current = null;
+      if (!pendingSttRequestRef.current) {
+        setSttStatusText((current) => current === '语音识别完成' ? current : '已停止');
+      }
+    };
+
+    recognition.start();
   }
 
   function patchSkill(patch: Partial<SkillDraft>) {
@@ -400,8 +553,17 @@ function App() {
       socket.onopen = () => { setWsConnected(true); appendChatMessage('system', `WebSocket 已连接：${wsUrl}`, 'success'); };
       socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(String(event.data)) as { type?: string; content?: string };
+          const data = JSON.parse(String(event.data)) as { type?: string; content?: string; request_id?: string; reply_channel?: string; reply_chat_id?: string; hint_text?: string };
           const content = data.content || String(event.data);
+          if (data.type === 'stt_request') {
+            appendChatMessage('system', data.hint_text ? `收到 STT 请求：${data.hint_text}` : '收到 STT 请求，开始录音转写。', 'info');
+            startSpeechRecognition({
+              requestId: data.request_id || `stt-${Date.now()}`,
+              replyChannel: data.reply_channel || 'web',
+              replyChatId: data.reply_chat_id || (chatId.trim() || 'web_console_01')
+            });
+            return;
+          }
           if (data.type === 'response' && data.content) {
             if (isAssistantFailureText(content)) {
               appendChatMessage('system', content, 'error');
@@ -441,17 +603,7 @@ function App() {
             <div className="grid w-full max-w-5xl gap-6 lg:grid-cols-[1.2fr_420px]">
               <Card bordered={false} className="glass-panel rounded-lg">
                 <Title level={2}>ESPAgent Console</Title>
-                <Paragraph className="!text-slate-500">
-                  面向四节点协同调度、环境展示、AI 通信与技能草稿管理的统一前端。
-                </Paragraph>
                 <div className="mt-6 grid gap-4 md:grid-cols-2">
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
-                    <div className="mb-2 font-semibold text-slate-800">当前能力</div>
-                    <div>真实 MQTT telemetry / state / timeline 聚合</div>
-                    <div>四节点固定通信面板</div>
-                    <div>AI 通信面板（Web 只连本地通信网关）</div>
-                    <div>Skills 草稿与 runtime skill 分离展示</div>
-                  </div>
                   <div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
                     <div className="mb-2 font-semibold text-slate-800">演示账号</div>
                     {demoAccounts.map((account) => (
@@ -463,7 +615,7 @@ function App() {
                   </div>
                 </div>
               </Card>
-              <Card bordered={false} className="glass-panel rounded-lg" title="登录系统">
+              <Card bordered={false} className="glass-panel rounded-lg" title="登录">
                 <Form layout="vertical" onFinish={handleLogin}>
                   <Form.Item label="用户名">
                     <Input value={loginUsername} onChange={(e) => setLoginUsername(e.target.value)} />
@@ -475,10 +627,6 @@ function App() {
                     登录
                   </Button>
                 </Form>
-                <Divider />
-                <Text type="secondary">
-                  当前是前端本地登录守卫。真实鉴权、Token 和 Guardian 身份联动仍需后端链路补齐。
-                </Text>
               </Card>
             </div>
           </div>
@@ -492,16 +640,15 @@ function App() {
       <AntdApp>
         {contextHolder}
         <Layout className="page-shell min-h-screen">
-          <Sider breakpoint="xl" collapsedWidth="0" width={372} className="border-r border-slate-200 !bg-white">
-            <div className="flex h-full flex-col px-5 py-5">
+          <Sider breakpoint="xl" collapsedWidth="0" width={360} className="border-r border-slate-200 !bg-white">
+            <div className="flex h-full flex-col overflow-hidden px-5 py-5">
               <div className="mb-6">
                 <div className="mb-3 flex items-center gap-3"><div className="flex h-11 w-11 items-center justify-center rounded-lg bg-cyan-500/12 text-cyan-300"><DeploymentUnitOutlined className="text-xl" /></div><div><div className="text-base font-semibold text-slate-900">ESPAgent Console</div><div className="text-xs text-slate-500">LingShu Agent Mesh Frontend</div></div></div>
-                <Paragraph className="!mb-0 !text-slate-500">面向四个 ESP32-S3 节点、ESP32-P4 / Android 终端的统一调度与展示界面。</Paragraph>
               </div>
               <Segmented block className="mb-5" value={viewMode} onChange={(value) => setViewMode(value as ViewMode)} options={viewItems.map((item) => ({ label: <span className="flex items-center gap-2">{item.icon}{item.label}</span>, value: item.label }))} />
               <Card bordered={false} className="glass-panel rounded-lg">
                 <div className="mb-3 flex items-center justify-between"><Text>节点健康</Text><Badge status="processing" text="live data" /></div>
-                <div className="grid gap-3">
+                <div className="panel-scroll grid max-h-[520px] gap-3 overflow-y-auto pr-1">
                   {fixedNodePanels.map(({ node, sentSummary, recvSummary, subagentLabel }) => (
                     <div key={node.role} className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-3">
                       <div className="mb-2 flex items-center justify-between gap-3">
@@ -522,13 +669,7 @@ function App() {
                 </div>
               </Card>
               <Card bordered={false} className="glass-panel mt-4 rounded-lg">
-                <div className="mb-2 flex items-center gap-2 text-slate-900"><ApiOutlined />通信面</div>
-                <div className="space-y-2 text-xs text-slate-500">
-                  <div>Feishu / WebSocket / Serial CLI</div>
-                  <div>MQTT Mesh / ESP-NOW / RMT / I2S</div>
-                  <div>ESP32-P4 / Android / Web Console</div>
-                </div>
-                <Divider className="!my-3" />
+                <div className="mb-3 flex items-center gap-2 text-slate-900"><ApiOutlined />链路状态</div>
                 <div className="grid gap-2 text-xs">
                   <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-3 py-2">
                     <span className="text-slate-500">MQTT</span>
@@ -547,7 +688,7 @@ function App() {
           <Layout>
             <Header className="border-b border-slate-200 px-6 !bg-transparent">
               <div className="flex h-full items-center justify-between gap-4">
-                <div><Title level={3} className="!mb-0">多 Agent 协同边缘可视化控制台</Title><Text className="!text-slate-500">展示调度链路、能力目录、环境状态、技能草稿与终端联动。</Text></div>
+                <div><Title level={3} className="!mb-0">多 Agent 控制台</Title></div>
                 <Space size="middle" wrap><Tag color={payload.mqtt?.connected ? 'green' : 'red'}>MQTT {payload.mqtt?.connected ? 'connected' : 'offline'}</Tag><Tag color={payload.chatGateway?.enabled ? (payload.chatGateway.connectedSessions > 0 ? 'green' : 'gold') : 'red'}>Chat Gateway {payload.chatGateway?.enabled ? (payload.chatGateway.connectedSessions > 0 ? 'linked' : 'idle') : 'disabled'}</Tag><Tag color="blue">{payload.mqtt?.topicPrefix || 'mock-prefix'}</Tag><Tag color="purple">{session.username} / {session.role}</Tag><Button onClick={handleLogout}>退出</Button><Button type="primary" onClick={() => setChatOpen(true)}>AI 通信</Button></Space>
               </div>
             </Header>
@@ -560,48 +701,46 @@ function App() {
               </Row>
 
               {viewMode === '总览' && <Row gutter={[16, 16]} className="mt-4">
-                <Col xs={24} xl={15}><Card title="四节点拓扑与主要链路" className="glass-panel rounded-lg"><div className="grid gap-4 xl:grid-cols-[1fr_320px]"><div className="grid gap-4 md:grid-cols-2">{fixedNodePanels.map(({ node }) => <div key={node.role} className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-2 flex items-center justify-between"><div><div className="text-sm font-semibold text-slate-900">{displayNodeName(node.role)}</div><div className="text-xs text-slate-500">{node.role}</div></div><Tag color={statusColor(node.status)}>{node.status}</Tag></div><div className="text-xs text-slate-500">{node.id}</div><div className="mt-3 flex flex-wrap gap-2">{node.transport.map((item) => <Tag key={item}>{item}</Tag>)}</div></div>)}</div><div className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-3 text-sm font-semibold text-slate-900">主要通信边</div><div className="space-y-3">{[{ id: '1', title: '用户入口', from: 'Feishu / Web / CLI', to: 'coordinator_agent', detail: '自然语言指令进入 Coordinator' }, { id: '2', title: '策略裁决', from: 'coordinator_agent', to: 'guardian_agent', detail: 'policy_check / decision' }, { id: '3', title: '环境采集', from: 'sensor_agent', to: 'coordinator_agent', detail: 'telemetry / threshold event' }, { id: '4', title: '控制执行', from: 'coordinator_agent', to: 'control_agent', detail: 'mesh_command / actuator result' }].map((edge) => <div key={edge.id} className="rounded-lg border border-slate-200 bg-white p-3"><div className="mb-1 text-sm font-medium text-slate-800">{edge.title}</div><div className="text-xs text-slate-500">{edge.from} → {edge.to}</div><div className="mt-1 text-sm text-slate-600">{edge.detail}</div></div>)}</div></div></div></Card></Col>
+                <Col xs={24} xl={15}><Card title="四节点拓扑与主要链路" className="glass-panel rounded-lg"><div className="grid gap-4 xl:grid-cols-[1fr_280px]"><div className="panel-scroll grid max-h-[420px] gap-4 overflow-y-auto pr-1 md:grid-cols-2">{fixedNodePanels.map(({ node }) => <div key={node.role} className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-2 flex items-center justify-between"><div><div className="text-sm font-semibold text-slate-900">{displayNodeName(node.role)}</div><div className="text-xs text-slate-500">{node.role}</div></div><Tag color={statusColor(node.status)}>{node.status}</Tag></div><div className="text-xs text-slate-500">{node.id}</div><div className="mt-3 flex flex-wrap gap-2">{node.transport.map((item) => <Tag key={item}>{item}</Tag>)}</div></div>)}</div><div className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-3 text-sm font-semibold text-slate-900">主要通信边</div><div className="panel-scroll max-h-[420px] space-y-3 overflow-y-auto pr-1">{[{ id: '1', title: '用户入口', from: 'Feishu / Web / CLI', to: 'coordinator_agent', detail: '自然语言指令进入 Coordinator' }, { id: '2', title: '策略裁决', from: 'coordinator_agent', to: 'guardian_agent', detail: 'policy_check / decision' }, { id: '3', title: '环境采集', from: 'sensor_agent', to: 'coordinator_agent', detail: 'telemetry / threshold event' }, { id: '4', title: '控制执行', from: 'coordinator_agent', to: 'control_agent', detail: 'mesh_command / actuator result' }].map((edge) => <div key={edge.id} className="rounded-lg border border-slate-200 bg-white p-3"><div className="mb-1 text-sm font-medium text-slate-800">{edge.title}</div><div className="text-xs text-slate-500">{edge.from} → {edge.to}</div><div className="mt-1 text-sm text-slate-600">{edge.detail}</div></div>)}</div></div></div></Card></Col>
                 <Col xs={24} xl={9}><Card title="调度摘要" className="glass-panel rounded-lg"><div className="grid gap-3">{[{ label: '上游 Chat Gateway', value: payload.chatGateway?.upstreamUrl || '未配置', tone: payload.chatGateway?.enabled ? 'blue' : 'red' }, { label: '最近通信事件', value: payload.chatGateway?.lastEventAt || '暂无' }, { label: '最近错误', value: payload.chatGateway?.lastError || '无' }, { label: '主题前缀', value: payload.mqtt?.topicPrefix || '-' }].map((item) => <div key={item.label} className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="text-xs text-slate-500">{item.label}</div><div className="mt-2 break-all text-sm font-medium text-slate-900">{item.value}</div></div>)}</div></Card></Col>
-                <Col xs={24}><Card title="四节点固定通信面板" className="glass-panel rounded-lg"><div className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">{fixedNodePanels.map(({ node, sentSummary, recvSummary, subagentLabel }) => <div key={node.role} className="rounded-lg border border-slate-200 p-4"><div className="mb-3 flex items-center justify-between"><div><div className="text-base font-semibold text-slate-900">{node.role}</div><div className="text-xs text-slate-500">{node.id}</div></div><Tag color={statusColor(node.status)}>{node.status}</Tag></div><div className="mb-4 rounded-lg bg-slate-50 p-3"><div className="mb-1 text-xs text-slate-500">发送数据</div>{sentSummary.map((item) => <div key={item} className="text-sm text-slate-700">{item}</div>)}</div><div className="mb-4 rounded-lg bg-slate-50 p-3"><div className="mb-1 text-xs text-slate-500">接收数据</div>{recvSummary.map((item) => <div key={item} className="text-sm text-slate-700">{item}</div>)}</div><div className="rounded-lg bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between"><div className="text-xs text-slate-500">Subagent</div><Tag color={nodeChannelHints[node.role].subagent ? 'blue' : 'default'}>{nodeChannelHints[node.role].subagent ? 'supported' : 'not supported'}</Tag></div><div className="text-sm text-slate-700">{subagentLabel}</div></div><div className="mt-3 rounded-lg bg-slate-50 p-3"><div className="mb-1 text-xs text-slate-500">本地任务模式</div><div className="text-sm text-slate-700">{node.role === 'coordinator_agent' ? '可本地发起 subagent，也可向远端角色下发 agent_task。' : '默认不开放 subagent，但可被 coordinator 以 agent_task 委托本地 AI 回合。'}</div></div></div>)}</div></Card></Col>
-                <Col xs={24}><Card title="真实数据接入状态" className="glass-panel rounded-lg"><div className="grid gap-4 md:grid-cols-5">{[{ label: 'MQTT Broker', value: payload.mqtt?.url || 'mock mode' }, { label: 'Topic Prefix', value: payload.mqtt?.topicPrefix || '-' }, { label: 'Chat Gateway', value: payload.chatGateway?.path || '/ws' }, { label: 'Last Event', value: payload.mqtt?.lastEventAt || payload.chatGateway?.lastEventAt || '暂无' }, { label: 'Guardian StateBoard', value: payload.guardian?.updatedAt || '暂无' }].map((item) => <div key={item.label} className="rounded-lg border border-slate-200 p-4"><div className="text-xs text-slate-500">{item.label}</div><div className="mt-2 text-sm font-medium text-slate-900">{item.value}</div></div>)}</div></Card></Col>
-                <Col xs={24} xl={15}><Card title="项目能力总览" className="glass-panel rounded-lg" extra={<Tag color="blue">React + TypeScript + Antd + Tailwind</Tag>}><Table rowKey="name" dataSource={payload.capabilities} columns={capabilityColumns} pagination={false} size="middle" /></Card></Col>
-                <Col xs={24} xl={9}><Card title="环境面板" className="glass-panel rounded-lg"><Space direction="vertical" size={16} className="w-full">{payload.environment.map((metric) => <div key={metric.label} className="rounded-lg border border-slate-200 px-4 py-3"><div className="mb-2 flex items-center justify-between"><Text>{metric.label}</Text><Tag color={metric.status === 'good' ? 'green' : metric.status === 'attention' ? 'gold' : 'red'}>{metric.status}</Tag></div><div className="mb-3 text-xl font-semibold text-slate-900">{metric.value} {metric.unit}</div><Progress percent={Math.round(metricPercent(metric))} showInfo={false} strokeColor={metric.status === 'good' ? '#22c55e' : metric.status === 'attention' ? '#f59e0b' : '#ef4444'} /><div className="mt-2 text-xs text-slate-500">趋势 {metric.trend > 0 ? '+' : ''}{metric.trend}</div></div>)}</Space></Card></Col>
-                <Col xs={24} xl={12}><Card title="多节点角色分工" className="glass-panel rounded-lg"><List itemLayout="vertical" dataSource={payload.nodes} renderItem={(node) => <List.Item key={node.id}><div className="flex flex-wrap items-start justify-between gap-3"><div><Space size={8}><Text strong>{node.role}</Text><Tag color={statusColor(node.status)}>{node.status}</Tag></Space><div className="mt-1 text-sm text-slate-500">{node.id}</div><div className="mt-2 flex flex-wrap gap-2">{node.transport.map((item) => <Tag key={item}>{item}</Tag>)}</div></div><div className="text-right text-sm text-slate-500">{node.location}</div></div><div className="mt-3 grid gap-2 md:grid-cols-2"><div><div className="mb-1 text-xs text-slate-500">职责</div><div className="flex flex-wrap gap-2">{node.responsibilities.map((item) => <Tag color="geekblue" key={item}>{item}</Tag>)}</div></div><div><div className="mb-1 text-xs text-slate-500">终端面</div><div className="flex flex-wrap gap-2">{node.surfaces.map((item) => <Tag color="purple" key={item}>{item}</Tag>)}</div></div></div></List.Item>} /></Card></Col>
-                <Col xs={24} xl={12}><Card title="前端已落地能力" className="glass-panel rounded-lg"><Timeline items={[{ color: 'green', children: '真实环境数据、真实节点状态、真实 timeline 已接入。' }, { color: 'blue', children: '前端草稿 skill、本地偏好、实时接入状态卡片已经可用。' }, { color: 'green', children: 'coordinator 已开放 /api/skills，前端可经聚合服务把 skill 写入 ESP32 Runtime。' }, { color: 'purple', children: `当前登录用户：${session.username} / ${session.role}` }]} /><Divider /><Alert type="info" showIcon message="前端优先使用真实 /api/dashboard" description="只有 dashboard 接口失效时才会回退到本地 mock。登录系统当前是前端本地守卫，不属于板端真实权限链路。" /></Card></Col>
+                <Col xs={24}><Card title="四节点固定通信面板" className="glass-panel rounded-lg"><div className="grid gap-4 xl:grid-cols-2 2xl:grid-cols-4">{fixedNodePanels.map(({ node, sentSummary, recvSummary, subagentLabel }) => <div key={node.role} className="rounded-lg border border-slate-200 p-4"><div className="mb-3 flex items-center justify-between"><div><div className="text-base font-semibold text-slate-900">{node.role}</div><div className="text-xs text-slate-500">{node.id}</div></div><Tag color={statusColor(node.status)}>{node.status}</Tag></div><div className="grid gap-3"><div className="panel-scroll rounded-lg bg-slate-50 p-3"><div className="mb-1 text-xs text-slate-500">发送</div><div className="max-h-[88px] space-y-1 overflow-y-auto pr-1">{sentSummary.map((item) => <div key={item} className="text-sm text-slate-700">{item}</div>)}</div></div><div className="panel-scroll rounded-lg bg-slate-50 p-3"><div className="mb-1 text-xs text-slate-500">接收</div><div className="max-h-[88px] space-y-1 overflow-y-auto pr-1">{recvSummary.map((item) => <div key={item} className="text-sm text-slate-700">{item}</div>)}</div></div><div className="rounded-lg bg-slate-50 p-3"><div className="mb-2 flex items-center justify-between"><div className="text-xs text-slate-500">Subagent</div><Tag color={nodeChannelHints[node.role].subagent ? 'blue' : 'default'}>{nodeChannelHints[node.role].subagent ? 'supported' : 'not supported'}</Tag></div><div className="max-h-[72px] overflow-y-auto pr-1 text-sm text-slate-700">{subagentLabel}</div></div></div></div>)}</div></Card></Col>
+                <Col xs={24} xl={15} className="flex"><Card title="项目能力总览" className="glass-panel h-full w-full rounded-lg" extra={<Tag color="blue">React + TypeScript + Antd + Tailwind</Tag>}><div className="panel-scroll h-[460px] overflow-auto"><Table rowKey="name" dataSource={payload.capabilities} columns={capabilityColumns} pagination={false} size="middle" scroll={{ x: 720 }} /></div></Card></Col>
+                <Col xs={24} xl={9} className="flex"><Card title="环境面板" className="glass-panel h-full w-full rounded-lg"><div className="panel-scroll h-[460px] overflow-y-auto pr-1"><Space direction="vertical" size={16} className="w-full">{payload.environment.map((metric) => <div key={metric.label} className="rounded-lg border border-slate-200 px-4 py-3"><div className="mb-2 flex items-center justify-between"><Text>{metric.label}</Text><Tag color={metric.status === 'good' ? 'green' : metric.status === 'attention' ? 'gold' : 'red'}>{metric.status}</Tag></div><div className="mb-3 text-xl font-semibold text-slate-900">{metric.value} {metric.unit}</div><Progress percent={Math.round(metricPercent(metric))} showInfo={false} strokeColor={metric.status === 'good' ? '#22c55e' : metric.status === 'attention' ? '#f59e0b' : '#ef4444'} /><div className="mt-2 text-xs text-slate-500">趋势 {metric.trend > 0 ? '+' : ''}{metric.trend}</div></div>)}</Space></div></Card></Col>
               </Row>}
 
               {viewMode === '协作链路' && <Row gutter={[16, 16]} className="mt-4">
-                <Col xs={24} xl={10}><Card title="通信流程图" className="glass-panel rounded-lg"><Space direction="vertical" size={14} className="w-full">{payload.flows.map((flow, index) => <div key={flow.id} className="rounded-lg border border-slate-200 p-4"><div className="mb-2 flex items-center justify-between"><Space><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/12 text-cyan-300">{index + 1}</div><Text strong>{flow.step}</Text></Space><Tag color="cyan">{flow.transport}</Tag></div><div className="text-sm text-slate-700">{flow.producer} → {flow.consumer}</div><div className="mt-2 text-xs text-slate-500">{flow.topic}</div><div className="mt-2 text-sm text-slate-600">{flow.detail}</div></div>)}</Space></Card></Col>
-                <Col xs={24} xl={14}><Card title="Timeline" className="glass-panel rounded-lg" extra={<Segmented value={timelineFilter} onChange={(value) => setTimelineFilter(value as TimelineFilter)} options={['全部', 'telemetry', 'state', 'policy', 'reply', 'error']} />}>{filteredTimeline.length ? <Timeline items={filteredTimeline.map((event) => ({ color: statusColor(event.status), children: <div><div className="flex flex-wrap items-center gap-2"><Text strong>{event.stage}</Text><Tag color={statusColor(event.status)}>{event.status}</Tag></div><div className="text-xs text-slate-500">{event.time} · {event.source} → {event.target}</div><div className="mt-1 text-sm text-slate-700">{event.payload}</div></div> }))} /> : <Empty description="当前筛选条件下没有事件" />}</Card></Col>
+                <Col xs={24} xl={10}><Card title="通信流程图" className="glass-panel rounded-lg"><div className="panel-scroll max-h-[620px] overflow-y-auto pr-1"><Space direction="vertical" size={14} className="w-full">{payload.flows.map((flow, index) => <div key={flow.id} className="rounded-lg border border-slate-200 p-4"><div className="mb-2 flex items-center justify-between"><Space><div className="flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/12 text-cyan-300">{index + 1}</div><Text strong>{flow.step}</Text></Space><Tag color="cyan">{flow.transport}</Tag></div><div className="text-sm text-slate-700">{flow.producer} → {flow.consumer}</div><div className="mt-2 text-xs text-slate-500">{flow.topic}</div><div className="mt-2 text-sm text-slate-600">{flow.detail}</div></div>)}</Space></div></Card></Col>
+                <Col xs={24} xl={14}><Card title="Timeline" className="glass-panel rounded-lg" extra={<Segmented value={timelineFilter} onChange={(value) => setTimelineFilter(value as TimelineFilter)} options={['全部', 'telemetry', 'state', 'policy', 'reply', 'error']} />}>{filteredTimeline.length ? <div className="panel-scroll max-h-[620px] overflow-y-auto pr-1"><Timeline items={filteredTimeline.map((event) => ({ color: statusColor(event.status), children: <div><div className="flex flex-wrap items-center gap-2"><Text strong>{event.stage}</Text><Tag color={statusColor(event.status)}>{event.status}</Tag></div><div className="text-xs text-slate-500">{event.time} · {event.source} → {event.target}</div><div className="mt-1 text-sm text-slate-700">{event.payload}</div></div> }))} /></div> : <Empty description="当前筛选条件下没有事件" />}</Card></Col>
               </Row>}
 
               {viewMode === 'Skills Studio' && <Row gutter={[16, 16]} className="mt-4">
-                <Col xs={24} xl={8}><Card title="Skill 草稿列表" className="glass-panel rounded-lg" extra={<Button type="primary" onClick={addSkill} disabled={!canEditSkills}>新增</Button>}><List dataSource={draftSkills} renderItem={(item) => <List.Item key={item.id} className={`cursor-pointer rounded-lg px-3 ${item.id === activeSkillId ? 'bg-slate-50' : ''}`} onClick={() => setActiveSkillId(item.id)}><div className="w-full"><div className="flex items-center justify-between gap-3"><Text strong>{item.name}</Text><Tag color={item.enabled ? 'green' : 'default'}>{item.enabled ? 'enabled' : 'disabled'}</Tag></div><div className="mt-1 text-xs text-slate-500">{item.scope}</div></div></List.Item>} /></Card></Col>
-                <Col xs={24} xl={16}><Card title="Skill 编辑器" className="glass-panel rounded-lg" extra={<Space><Tag color={canEditSkills ? 'green' : 'gold'}>{canEditSkills ? 'admin 可写' : '当前只读'}</Tag><Button type="primary" loading={savingSkills} onClick={handleSaveSkills} disabled={!canEditSkills}>保存草稿</Button><Button loading={installingSkillId === activeSkillId} onClick={handleInstallActiveSkill} disabled={!canEditSkills || !activeSkill}>安装到 Runtime</Button></Space>}>{activeSkill ? <Form layout="vertical"><Form.Item label="名称"><Input value={activeSkill.name} onChange={(e) => patchSkill({ name: e.target.value })} disabled={!canEditSkills} /></Form.Item><Row gutter={16}><Col xs={24} md={12}><Form.Item label="作用域"><Input value={activeSkill.scope} onChange={(e) => patchSkill({ scope: e.target.value })} disabled={!canEditSkills} /></Form.Item></Col><Col xs={24} md={12}><Form.Item label="启用"><Switch checked={activeSkill.enabled} onChange={(checked) => patchSkill({ enabled: checked })} disabled={!canEditSkills} /></Form.Item></Col></Row><Form.Item label="触发条件"><Input value={activeSkill.trigger} onChange={(e) => patchSkill({ trigger: e.target.value })} disabled={!canEditSkills} /></Form.Item><Form.Item label="策略要求"><Input value={activeSkill.policy} onChange={(e) => patchSkill({ policy: e.target.value })} disabled={!canEditSkills} /></Form.Item><Form.Item label="Prompt"><Input.TextArea rows={8} value={activeSkill.prompt} onChange={(e) => patchSkill({ prompt: e.target.value })} disabled={!canEditSkills} /></Form.Item><Alert type="info" showIcon message="这里编辑的是前端草稿层" description="保存草稿只会留在前端。点击“安装到 Runtime”后，会调用 /api/skills/install；只有当聚合服务接到真实板端接口时，才会真正写入 ESP32 的 /spiffs/skills。" /></Form> : <Empty description="没有可编辑的 skill" />}</Card></Col>
-                <Col xs={24}><Card title="Runtime Skill 安装状态" className="glass-panel rounded-lg" extra={<Space><Tag color={runtimeSkillSource === 'proxy' ? 'green' : 'gold'}>{runtimeSkillSource === 'proxy' ? '已接运行时网关' : '本地模拟 runtime'}</Tag><Button onClick={refreshRuntimeSkills}>刷新</Button></Space>}><div className="grid gap-4 xl:grid-cols-[1.2fr_0.8fr]"><div className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-2 text-sm font-semibold text-slate-900">当前安装链路</div><div className="space-y-2 text-sm text-slate-600"><div>Skills Studio 草稿 到 `/api/skills/install` 到 runtime 列表</div><div>当前 source: {runtimeSkillSource}</div><div>{runtimeSkillSource === 'proxy' ? '聚合服务已配置上游 runtime 网关；coordinator 默认走 `http://<ESP32_IP>/api/skills`。' : '当前只完成前端与聚合服务闭环，安装结果是本地模拟，不代表 ESP32 SPIFFS 已真实写入。'}</div></div></div><div className="rounded-lg border border-slate-200 bg-slate-50 p-4"><div className="mb-2 text-sm font-semibold text-slate-900">当前选中草稿</div>{activeSkill ? <div className="space-y-2 text-sm text-slate-600"><div>标题：{activeSkill.name}</div><div>Scope：{activeSkill.scope}</div><div>Trigger：{activeSkill.trigger}</div><div>Enabled：{activeSkill.enabled ? 'true' : 'false'}</div><div>Runtime 文件名：{activeSkill.name.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 48) || 'invalid'}.md</div></div> : <Empty description="未选中草稿" image={Empty.PRESENTED_IMAGE_SIMPLE} />}</div></div><Divider /><List locale={{ emptyText: '当前还没有安装过 runtime skill' }} dataSource={runtimeSkills} renderItem={(item) => <List.Item key={item.runtimeName}><div className="w-full"><div className="flex flex-wrap items-center justify-between gap-3"><div><Space size={8}><Text strong>{item.title}</Text><Tag color={item.status === 'installed' ? 'green' : item.status === 'pending' ? 'gold' : 'red'}>{item.status}</Tag><Tag>{item.source}</Tag></Space><div className="mt-1 text-xs text-slate-500">{item.path}</div></div><div className="text-right text-xs text-slate-500"><div>{item.installedAt}</div><div>cache: {item.cacheState}</div></div></div><div className="mt-2 grid gap-2 md:grid-cols-3 text-sm text-slate-600"><div>scope: {item.scope}</div><div>enabled: {item.enabled ? 'true' : 'false'}</div><div>runtimeName: {item.runtimeName}</div></div>{item.lastMessage ? <div className="mt-2 text-sm text-slate-600">{item.lastMessage}</div> : null}</div></List.Item>} /><Alert className="mt-4" type={runtimeSkillSource === 'proxy' ? 'success' : 'warning'} showIcon message={runtimeSkillSource === 'proxy' ? '前端安装请求已经接到运行时网关' : '当前仍然是前端侧闭环'} description={runtimeSkillSource === 'proxy' ? '当前已验证 coordinator 可真实写入 ESP32 /spiffs/skills，并返回板端运行时列表。' : '这一步已经把前端缺失的按钮、接口和状态展示补齐，但 MCU 真实识别还需要后端/板端接口配合。'} /></Card></Col>
+                <Col xs={24} xl={8}><Card title="Skill 草稿列表" className="glass-panel rounded-lg" extra={<Button type="primary" onClick={addSkill} disabled={!canEditSkills}>新增</Button>}><div className="panel-scroll max-h-[620px] overflow-y-auto pr-1"><List dataSource={draftSkills} renderItem={(item) => <List.Item key={item.id} className={`cursor-pointer rounded-lg px-3 ${item.id === activeSkillId ? 'bg-slate-50' : ''}`} onClick={() => setActiveSkillId(item.id)}><div className="w-full"><div className="flex items-center justify-between gap-3"><Text strong>{item.name}</Text><Tag color={item.enabled ? 'green' : 'default'}>{item.enabled ? 'enabled' : 'disabled'}</Tag></div><div className="mt-1 text-xs text-slate-500">{item.scope}</div></div></List.Item>} /></div></Card></Col>
+                <Col xs={24} xl={16}><Card title="Skill 编辑器" className="glass-panel rounded-lg" extra={<Space><Tag color={canEditSkills ? 'green' : 'gold'}>{canEditSkills ? 'admin 可写' : '当前只读'}</Tag><Button type="primary" loading={savingSkills} onClick={handleSaveSkills} disabled={!canEditSkills}>保存草稿</Button><Button loading={installingSkillId === activeSkillId} onClick={handleInstallActiveSkill} disabled={!canEditSkills || !activeSkill}>安装到 Runtime</Button></Space>}>{activeSkill ? <div className="panel-scroll max-h-[620px] overflow-y-auto pr-1"><Form layout="vertical"><Form.Item label="名称"><Input value={activeSkill.name} onChange={(e) => patchSkill({ name: e.target.value })} disabled={!canEditSkills} /></Form.Item><Row gutter={16}><Col xs={24} md={12}><Form.Item label="作用域"><Input value={activeSkill.scope} onChange={(e) => patchSkill({ scope: e.target.value })} disabled={!canEditSkills} /></Form.Item></Col><Col xs={24} md={12}><Form.Item label="启用"><Switch checked={activeSkill.enabled} onChange={(checked) => patchSkill({ enabled: checked })} disabled={!canEditSkills} /></Form.Item></Col></Row><Form.Item label="触发条件"><Input value={activeSkill.trigger} onChange={(e) => patchSkill({ trigger: e.target.value })} disabled={!canEditSkills} /></Form.Item><Form.Item label="策略要求"><Input value={activeSkill.policy} onChange={(e) => patchSkill({ policy: e.target.value })} disabled={!canEditSkills} /></Form.Item><Form.Item label="Skill 内容"><Input.TextArea rows={10} value={activeSkill.prompt} onChange={(e) => patchSkill({ prompt: e.target.value })} disabled={!canEditSkills} /></Form.Item></Form></div> : <Empty description="没有可编辑的 skill" />}</Card></Col>
+                <Col xs={24}><Card title="Runtime Skill" className="glass-panel rounded-lg" extra={<Space><Tag color={runtimeSkillSource === 'proxy' ? 'green' : 'gold'}>{runtimeSkillSource === 'proxy' ? 'runtime linked' : 'local mock'}</Tag><Button onClick={refreshRuntimeSkills}>刷新</Button></Space>}><div className="mb-4 grid gap-4 md:grid-cols-2"><div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">source: {runtimeSkillSource}</div><div className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">{activeSkill ? `选中：${activeSkill.name}` : '未选中草稿'}</div></div><div className="panel-scroll max-h-[360px] overflow-y-auto pr-1"><List locale={{ emptyText: '当前还没有安装过 runtime skill' }} dataSource={runtimeSkills} renderItem={(item) => <List.Item key={item.runtimeName}><div className="w-full"><div className="flex flex-wrap items-center justify-between gap-3"><div><Space size={8}><Text strong>{item.title}</Text><Tag color={item.status === 'installed' ? 'green' : item.status === 'pending' ? 'gold' : 'red'}>{item.status}</Tag><Tag>{item.source}</Tag></Space><div className="mt-1 text-xs text-slate-500">{item.path}</div></div><div className="text-right text-xs text-slate-500"><div>{item.installedAt}</div><div>cache: {item.cacheState}</div></div></div><div className="mt-2 grid gap-2 md:grid-cols-3 text-sm text-slate-600"><div>scope: {item.scope}</div><div>enabled: {item.enabled ? 'true' : 'false'}</div><div>runtimeName: {item.runtimeName}</div></div>{item.lastMessage ? <div className="mt-2 text-sm text-slate-600">{item.lastMessage}</div> : null}</div></List.Item>} /></div></Card></Col>
               </Row>}
 
               {viewMode === '用户偏好' && <Row gutter={[16, 16]} className="mt-4">
-                <Col xs={24} xl={14}><Card title="偏好配置" className="glass-panel rounded-lg" extra={<Button type="primary" loading={savingPrefs} onClick={handleSavePreferences}>保存偏好</Button>}><Form layout="vertical"><Form.Item label="首选通道"><Select value={preferences.preferredChannel} onChange={(value) => setPreferences((current) => ({ ...current, preferredChannel: value }))} options={[{ value: 'Web Console' }, { value: 'ESP32-P4' }, { value: 'Android' }, { value: 'Feishu' }]} /></Form.Item><Form.Item label="语音输出"><Switch checked={preferences.voiceOutput} onChange={(checked) => setPreferences((current) => ({ ...current, voiceOutput: checked }))} /></Form.Item><Form.Item label="隐私模式"><Select value={preferences.privacyMode} onChange={(value) => setPreferences((current) => ({ ...current, privacyMode: value }))} options={[{ value: 'metadata_only', label: 'metadata_only' }, { value: 'balanced', label: 'balanced' }, { value: 'full_context', label: 'full_context' }]} /></Form.Item><Form.Item label="自动化激进程度"><Slider value={preferences.automationAggressiveness} onChange={(value) => setPreferences((current) => ({ ...current, automationAggressiveness: value }))} /></Form.Item><Form.Item label="摘要风格"><Select value={preferences.summaryStyle} onChange={(value) => setPreferences((current) => ({ ...current, summaryStyle: value }))} options={[{ value: 'concise' }, { value: 'standard' }, { value: 'detailed' }]} /></Form.Item><Form.Item label="语言"><Input value={preferences.preferredLanguage} onChange={(e) => setPreferences((current) => ({ ...current, preferredLanguage: e.target.value }))} /></Form.Item></Form></Card></Col>
-                <Col xs={24} xl={10}><Card title="偏好生效说明" className="glass-panel rounded-lg"><Space direction="vertical" size={14} className="w-full"><Alert type="success" showIcon message="前端偏好已可持久化" description="会写入 localStorage，并通过 /api/preferences 回显保存结果。" /><div className="rounded-lg border border-slate-200 p-4 text-sm text-slate-600"><div>当前用户：{session.username}</div><div>Role：{session.role}</div><div>Channel：{preferences.preferredChannel}</div><div>Privacy：{preferences.privacyMode}</div><div>Auto level：{preferences.automationAggressiveness}%</div></div><Alert type="warning" showIcon message="板端尚未消费这些偏好" description="如果要让 ESP32 根据用户偏好改变调度策略，还需要扩展板端消息协议或聚合服务。" /></Space></Card></Col>
+                <Col xs={24} xl={14}><Card title="偏好配置" className="glass-panel rounded-lg" extra={<Button type="primary" loading={savingPrefs} onClick={handleSavePreferences}>保存偏好</Button>}><div className="panel-scroll max-h-[560px] overflow-y-auto pr-1"><Form layout="vertical"><Form.Item label="首选通道"><Select value={preferences.preferredChannel} onChange={(value) => setPreferences((current) => ({ ...current, preferredChannel: value }))} options={[{ value: 'Web Console' }, { value: 'ESP32-P4' }, { value: 'Android' }, { value: 'Feishu' }]} /></Form.Item><Form.Item label="语音输出"><Switch checked={preferences.voiceOutput} onChange={(checked) => setPreferences((current) => ({ ...current, voiceOutput: checked }))} /></Form.Item><Form.Item label="隐私模式"><Select value={preferences.privacyMode} onChange={(value) => setPreferences((current) => ({ ...current, privacyMode: value }))} options={[{ value: 'metadata_only', label: 'metadata_only' }, { value: 'balanced', label: 'balanced' }, { value: 'full_context', label: 'full_context' }]} /></Form.Item><Form.Item label="自动化激进程度"><Slider value={preferences.automationAggressiveness} onChange={(value) => setPreferences((current) => ({ ...current, automationAggressiveness: value }))} /></Form.Item><Form.Item label="摘要风格"><Select value={preferences.summaryStyle} onChange={(value) => setPreferences((current) => ({ ...current, summaryStyle: value }))} options={[{ value: 'concise' }, { value: 'standard' }, { value: 'detailed' }]} /></Form.Item><Form.Item label="语言"><Input value={preferences.preferredLanguage} onChange={(e) => setPreferences((current) => ({ ...current, preferredLanguage: e.target.value }))} /></Form.Item></Form></div></Card></Col>
+                <Col xs={24} xl={10}><Card title="当前偏好" className="glass-panel rounded-lg"><div className="rounded-lg border border-slate-200 p-4 text-sm text-slate-600"><div>当前用户：{session.username}</div><div>Role：{session.role}</div><div>Channel：{preferences.preferredChannel}</div><div>Privacy：{preferences.privacyMode}</div><div>Auto level：{preferences.automationAggressiveness}%</div><div>Summary：{preferences.summaryStyle}</div></div></Card></Col>
               </Row>}
             </Content>
           </Layout>
 
-          <Modal open={chatOpen} onCancel={() => setChatOpen(false)} footer={null} width={1040} title="AI 通信面板">
-            <div className="grid gap-4 lg:grid-cols-[320px_minmax(0,1fr)]">
+          <Modal open={chatOpen} onCancel={() => setChatOpen(false)} footer={null} width={1024} title="AI 通信面板">
+            <div className="grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
               <div className="space-y-4">
                 <Card size="small" title="连接参数" className="glass-panel rounded-lg"><Form layout="vertical"><Form.Item label="当前用户"><Input value={`${session.username} / ${session.role}`} disabled /></Form.Item><Form.Item label="Gateway WebSocket URL"><Input value={wsUrl} onChange={(e) => setWsUrl(e.target.value)} placeholder="ws://127.0.0.1:4173/ws" /></Form.Item><Form.Item label="Chat ID"><Input value={chatId} onChange={(e) => setChatId(e.target.value)} placeholder="web_console_01" /></Form.Item><Space><Button type="primary" onClick={connectWs} disabled={!canUseChat}>连接</Button><Button onClick={() => wsInstance?.close()}>断开</Button></Space></Form></Card>
                 <Card size="small" title="连接状态" className="glass-panel rounded-lg">
                   <div className="grid gap-3 text-sm">
                     <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-3 py-2"><span className="text-slate-500">会话状态</span><Tag color={wsConnected ? 'green' : 'red'}>{wsConnected ? '已连接' : '未连接'}</Tag></div>
+                    <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-3 py-2"><span className="text-slate-500">浏览器 STT</span><Tag color={sttSupported ? 'green' : 'red'}>{sttSupported ? 'supported' : 'unsupported'}</Tag></div>
                     <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2"><div className="text-xs text-slate-500">最近网关事件</div><div className="mt-1 break-all text-sm text-slate-800">{payload.chatGateway?.lastError || payload.chatGateway?.lastEventAt || '暂无'}</div></div>
-                    <Alert type={canUseChat ? 'info' : 'warning'} showIcon message={canUseChat ? '当前账号允许通信' : 'viewer 账号只读'} description={canUseChat ? '页面只连接本地 Gateway WebSocket；Gateway 再代理到 ESP32，板端返回的模型失败会标成系统错误。' : '如需按用户身份下发到板端，后续需要扩展协议。'} />
+                    <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2"><div className="text-xs text-slate-500">STT 状态</div><div className="mt-1 break-all text-sm text-slate-800">{sttStatusText}{sttInterimText ? ` / ${sttInterimText}` : ''}</div></div>
+                    <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">{canUseChat ? '当前账号允许通信' : 'viewer 账号只读'}</div>
                   </div>
                 </Card>
-                <Card size="small" title="协议说明" className="glass-panel rounded-lg"><div className="space-y-2 text-sm text-slate-500"><div>发送格式：</div><pre className="overflow-x-auto rounded bg-slate-50 p-3 text-xs text-slate-700">{`{"type":"message","content":"你好","chat_id":"web_console_01"}`}</pre><div>返回格式：</div><pre className="overflow-x-auto rounded bg-slate-50 p-3 text-xs text-slate-700">{`{"type":"response","content":"你好，我在。","chat_id":"web_console_01"}`}</pre></div></Card>
               </div>
-              <Card size="small" title="会话窗口" className="glass-panel rounded-lg" extra={<Text type="secondary">模拟飞书式消息入口</Text>}>
+              <Card size="small" title="会话窗口" className="glass-panel rounded-lg">
                 <div className="mb-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
                   <div>
                     <div ref={chatScrollRef} className="h-[480px] overflow-y-auto rounded border border-slate-200 bg-slate-50 p-4">
@@ -620,6 +759,9 @@ function App() {
                     </div>
                     <Space.Compact className="mt-4 w-full">
                       <Input value={chatInput} onChange={(e) => setChatInput(e.target.value)} onPressEnter={sendChatMessage} placeholder="输入一条要发给 ESP32 Agent 的消息" disabled={!canUseChat} />
+                      <Button onClick={() => (sttListening ? stopSpeechRecognition() : startSpeechRecognition(null))} disabled={!canUseChat || !sttSupported}>
+                        {sttListening ? '停止语音' : '语音输入'}
+                      </Button>
                       <Button type="primary" onClick={sendChatMessage} disabled={!canUseChat}>发送</Button>
                     </Space.Compact>
                   </div>

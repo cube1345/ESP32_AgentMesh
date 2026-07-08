@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static const char *TAG = "agent";
 
@@ -36,6 +37,7 @@ static const char *TAG = "agent";
 static bool message_prefers_direct_reply_no_tools(const char *message);
 static size_t append_prompt_format(char *prompt, size_t size, const char *fmt,
                                    ...);
+static bool message_requests_light_turn_on_without_color(const char *message);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -480,6 +482,152 @@ static bool tool_guard_match_weather_request(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+static bool tool_guard_match_current_time_request(const char *message) {
+  static const char *const keywords[] = {
+      "current time", "what time", "time now", "current date", "today date",
+      "date today",   "当前时间",   "现在时间",  "现在几点",     "几点了",
+      "当前日期",     "今天几号",   "今天日期",  "现在几号",     "当前几点",
+      "实时日期",     "实时时间",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_requests_today_schedule(const char *message) {
+  static const char *const keywords[] = {
+      "today", "this evening", "tonight", "今天", "今日", "今天晚上", "今晚",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_requests_daily_schedule(const char *message) {
+  static const char *const keywords[] = {
+      "daily", "every day", "每天", "每日",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_has_explicit_schedule_time(const char *message) {
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  const char *scan = message;
+  const char *prefix_sep = strstr(message, ": ");
+  if (prefix_sep && (prefix_sep - message) < 48) {
+    bool prefix_like = true;
+    for (const char *p = message; p < prefix_sep; p++) {
+      if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_')) {
+        prefix_like = false;
+        break;
+      }
+    }
+    if (prefix_like) {
+      scan = prefix_sep + 2;
+    }
+  }
+
+  bool has_digit = false;
+  for (const char *p = scan; *p; p++) {
+    if (isdigit((unsigned char)*p)) {
+      has_digit = true;
+      const char *q = p;
+      while (isdigit((unsigned char)*q)) {
+        q++;
+      }
+
+      if ((*q == ':' || *q == '.') && isdigit((unsigned char)q[1])) {
+        return true;
+      }
+
+      if (strncmp(q, "am", 2) == 0 || strncmp(q, "pm", 2) == 0 ||
+          strncmp(q, "AM", 2) == 0 || strncmp(q, "PM", 2) == 0 ||
+          strncmp(q, "秒", strlen("秒")) == 0 ||
+          strncmp(q, "分钟", strlen("分钟")) == 0 ||
+          strncmp(q, "分", strlen("分")) == 0 ||
+          strncmp(q, "小时", strlen("小时")) == 0 ||
+          strncmp(q, "时", strlen("时")) == 0 ||
+          strncmp(q, "点", strlen("点")) == 0 ||
+          strncmp(q, "天", strlen("天")) == 0 ||
+          strncmp(q, "周", strlen("周")) == 0 ||
+          strncmp(q, "月", strlen("月")) == 0) {
+        return true;
+      }
+    }
+  }
+
+  if (has_digit &&
+      (contains_substr_ci(scan, "every ") || contains_substr_ci(scan, "after ") ||
+       contains_substr_ci(scan, "later ") || contains_substr_ci(scan, "minutes") ||
+       contains_substr_ci(scan, "minute ") || contains_substr_ci(scan, "hours") ||
+       contains_substr_ci(scan, "hour "))) {
+    return true;
+  }
+
+  return false;
+}
+
+static bool parse_schedule_time_hhmm(const char *message, int *hour,
+                                     int *minute) {
+  if (!message || !hour || !minute) {
+    return false;
+  }
+
+  for (const char *p = message; *p; p++) {
+    if (!isdigit((unsigned char)*p)) {
+      continue;
+    }
+
+    int h = 0;
+    const char *q = p;
+    while (isdigit((unsigned char)*q)) {
+      h = h * 10 + (int)(*q - '0');
+      q++;
+      if (h > 999) {
+        break;
+      }
+    }
+
+    int m = 0;
+    bool matched = false;
+    if (*q == ':' && isdigit((unsigned char)q[1])) {
+      q++;
+      while (isdigit((unsigned char)*q)) {
+        m = m * 10 + (int)(*q - '0');
+        q++;
+      }
+      matched = true;
+    } else if (strncmp(q, "点", strlen("点")) == 0) {
+      q += strlen("点");
+      if (strncmp(q, "半", strlen("半")) == 0) {
+        m = 30;
+        matched = true;
+      } else if (isdigit((unsigned char)*q)) {
+        while (isdigit((unsigned char)*q)) {
+          m = m * 10 + (int)(*q - '0');
+          q++;
+        }
+        if (strncmp(q, "分", strlen("分")) == 0) {
+          matched = true;
+        }
+      } else {
+        m = 0;
+        matched = true;
+      }
+    }
+
+    if (matched && h >= 0 && h <= 23 && m >= 0 && m <= 59) {
+      *hour = h;
+      *minute = m;
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static bool tool_guard_match_servo_request(const char *message) {
   static const char *const keywords[] = {
       "servo",      "angle",       "rotate",      "rotation",   "turn servo",
@@ -586,7 +734,39 @@ static const char *detect_status_light_color(const char *message) {
       contains_substr_ci(message, "关灯") || contains_substr_ci(message, "熄灭")) {
     return "off";
   }
+  if (message_requests_light_turn_on_without_color(message)) {
+    return "white";
+  }
   return NULL;
+}
+
+static bool message_requests_light_turn_on_without_color(const char *message) {
+  static const char *const on_keywords[] = {
+      "turn on", "switch on", "power on", "open light", "点亮",
+      "亮起",    "打开灯",    "开灯",     "点灯",       "亮灯",
+  };
+  static const char *const color_keywords[] = {
+      "blue",  "green", "red",   "white", "yellow", "purple", "violet",
+      "cyan",  "orange","off",   "蓝",    "绿",     "红",
+      "白",    "黄",    "紫",    "青",    "橙",     "关闭",
+      "关灯",  "熄灭",
+  };
+
+  if (!message || !tool_guard_match_light_request(message)) {
+    return false;
+  }
+
+  if (!message_has_any_keyword(message, on_keywords,
+                               sizeof(on_keywords) / sizeof(on_keywords[0]))) {
+    return false;
+  }
+
+  if (message_has_any_keyword(message, color_keywords,
+                              sizeof(color_keywords) / sizeof(color_keywords[0]))) {
+    return false;
+  }
+
+  return true;
 }
 
 typedef struct {
@@ -963,6 +1143,168 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
     snprintf(reply_buf, sizeof(reply_buf), "灯光多步流程创建失败：%s", tool_output);
   }
   *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_time_weather_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !tool_guard_match_current_time_request(msg->content)) {
+    return false;
+  }
+
+  char time_output[192] = {0};
+  tool_registry_execute("get_current_time", "{}", time_output,
+                        sizeof(time_output));
+  if (strncmp(time_output, "Error:", 6) == 0 || time_output[0] == '\0') {
+    snprintf(tool_output, tool_output_size, "%s",
+             time_output[0] ? time_output : "Error: failed to get current time");
+    return false;
+  }
+
+  if (tool_guard_match_weather_request(msg->content)) {
+    char weather_output[512] = {0};
+    tool_registry_execute("get_weather", "{}", weather_output,
+                          sizeof(weather_output));
+    if (strncmp(weather_output, "Error:", 6) == 0 || weather_output[0] == '\0') {
+      snprintf(tool_output, tool_output_size, "%s",
+               weather_output[0] ? weather_output
+                                 : "Error: failed to get current weather");
+      return false;
+    }
+
+    char reply_buf[768] = {0};
+    snprintf(reply_buf, sizeof(reply_buf), "当前时间：%s\n%s", time_output,
+             weather_output);
+    *final_text = strdup(reply_buf);
+    return *final_text != NULL;
+  }
+
+  *final_text = strdup(time_output);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_scheduled_light_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !tool_guard_match_light_request(msg->content)) {
+    return false;
+  }
+
+  const bool today_schedule = message_requests_today_schedule(msg->content);
+  const bool daily_schedule = message_requests_daily_schedule(msg->content);
+  const bool has_time = message_has_explicit_schedule_time(msg->content);
+
+  if (!has_time) {
+    return false;
+  }
+
+  const char *color = detect_status_light_color(msg->content);
+  if (!color) {
+    *final_text = strdup(
+        "你希望 WS2812 亮成什么颜色？请补充颜色，并说明是今天一次执行，还是每天重复执行。");
+    return *final_text != NULL;
+  }
+
+  int hour = 0;
+  int minute = 0;
+  if (!parse_schedule_time_hhmm(msg->content, &hour, &minute)) {
+    *final_text = strdup(
+        "我识别到你想创建灯光定时任务，但没有读出明确时间。请用“今天 17:00”或“每天 17:00”这种格式再说一次。");
+    return *final_text != NULL;
+  }
+
+  if (today_schedule == daily_schedule) {
+    char reply_buf[256] = {0};
+    snprintf(reply_buf, sizeof(reply_buf),
+             "你是要“今天 %02d:%02d”执行一次，还是“每天 %02d:%02d”重复执行？另外我会把 WS2812 设置为 %s。",
+             hour, minute, hour, minute, color);
+    *final_text = strdup(reply_buf);
+    return *final_text != NULL;
+  }
+
+  char trigger_message[192] = {0};
+  snprintf(trigger_message, sizeof(trigger_message),
+           "请把远程控制板的 WS2812 状态灯设置为%s。", color);
+
+  cJSON *root = cJSON_CreateObject();
+  if (!root) {
+    return false;
+  }
+  cJSON_AddStringToObject(root, "name", "scheduled_ws2812");
+  cJSON_AddStringToObject(root, "message", trigger_message);
+  cJSON_AddStringToObject(root, "channel", msg->channel);
+  cJSON_AddStringToObject(root, "chat_id", msg->chat_id);
+
+  if (daily_schedule) {
+    cJSON_AddStringToObject(root, "schedule_type", "daily");
+    cJSON_AddNumberToObject(root, "hour", hour);
+    cJSON_AddNumberToObject(root, "minute", minute);
+  } else {
+    time_t now = time(NULL);
+    struct tm local_tm;
+    localtime_r(&now, &local_tm);
+    local_tm.tm_hour = hour;
+    local_tm.tm_min = minute;
+    local_tm.tm_sec = 0;
+    time_t at_epoch = mktime(&local_tm);
+    if (at_epoch <= now) {
+      char reply_buf[256] = {0};
+      snprintf(reply_buf, sizeof(reply_buf),
+               "今天 %02d:%02d 已经过了。请改成稍后的今天时间，或者明确说明“明天 %02d:%02d”/“每天 %02d:%02d”。",
+               hour, minute, hour, minute, hour, minute);
+      cJSON_Delete(root);
+      *final_text = strdup(reply_buf);
+      return *final_text != NULL;
+    }
+    cJSON_AddStringToObject(root, "schedule_type", "at");
+    cJSON_AddNumberToObject(root, "at_epoch", (double)at_epoch);
+    cJSON_AddBoolToObject(root, "delete_after_run", true);
+  }
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("cron_add", payload, tool_output, tool_output_size);
+  cJSON_free(payload);
+
+  char reply_buf[512] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             daily_schedule
+                 ? "已创建每日定时任务：每天 %02d:%02d 自动通知你，并点亮 WS2812 为 %s。%s"
+                 : "已创建一次性定时任务：今天 %02d:%02d 自动通知你，并点亮 WS2812 为 %s。%s",
+             hour, minute, color, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "创建 WS2812 定时任务失败：%s",
+             tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_cron_clarification(
+    const espagent_msg_t *msg, char **final_text) {
+  if (!msg || !msg->content || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !tool_guard_match_cron_request(msg->content) ||
+      message_has_explicit_schedule_time(msg->content)) {
+    return false;
+  }
+
+  *final_text = strdup(
+      "要创建定时任务，请先给出明确触发时间，例如“10分钟后提醒我浇花”、“今天18:30提醒我关灯”或“每天08:00播报天气”。");
   return *final_text != NULL;
 }
 
@@ -2131,6 +2473,12 @@ static void agent_loop_task(void *arg) {
     tool_fallback[0] = '\0';
 
     if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
+        !try_execute_deterministic_scheduled_light_request(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_cron_clarification(&msg, &final_text) &&
+        !try_execute_deterministic_time_weather_request(&msg, tool_output,
+                                                        TOOL_OUTPUT_SIZE,
+                                                        &final_text) &&
         !try_execute_deterministic_light_workflow(&msg, tool_output,
                                                   TOOL_OUTPUT_SIZE,
                                                   &final_text)) {

@@ -35,3 +35,6 @@ esp_err_t sensor_mqtt_publish_timeline_event(const char *phase,
                                              const char *target_role,
                                              const char *target_node,
                                              const char *action);
+esp_err_t sensor_mqtt_publish_web_chat_reply(const char *chat_id,
+                                             const char *text,
+                                             const char *type);

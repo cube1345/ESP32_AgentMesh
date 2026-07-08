@@ -1280,6 +1280,33 @@ esp_err_t sensor_mqtt_publish_output_message(const char *event,
     return err == ESP_OK ? timeline_err : err;
 }
 
+esp_err_t sensor_mqtt_publish_web_chat_reply(const char *chat_id,
+                                             const char *text,
+                                             const char *type)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", type && type[0] ? type : "response");
+    cJSON_AddStringToObject(root, "chat_id", chat_id ? chat_id : "");
+    cJSON_AddStringToObject(root, "content", text ? text : "");
+    cJSON_AddStringToObject(root, "node_id", espagent_node_id());
+    cJSON_AddStringToObject(root, "role", espagent_node_role());
+    cJSON_AddNumberToObject(root, "ts_ms", (double)(esp_timer_get_time() / 1000));
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t err = mqtt_queue_publish(ESPAGENT_MESH_TOPIC_WEB_CHAT_REPLY, json);
+    cJSON_free(json);
+    return err;
+}
+
 esp_err_t sensor_mqtt_publish_timeline_event(const char *phase,
                                              const char *event_type,
                                              const char *status,
@@ -1764,6 +1791,49 @@ static bool handle_agent_task_mesh_command(const espagent_mesh_command_t *cmd)
     return true;
 }
 
+static void handle_web_chat_request(const char *payload, size_t payload_len)
+{
+    if (!espagent_role_is_coordinator() || !payload || payload_len == 0) {
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(payload, payload_len);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Web chat request malformed: %.*s", (int)payload_len, payload);
+        return;
+    }
+
+    const char *chat_id = json_optional_string(root, "chat_id");
+    const char *content = json_optional_string(root, "content");
+    const char *type = json_optional_string(root, "type");
+    if ((type[0] && strcmp(type, "message") != 0) || !chat_id[0] || !content[0]) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Web chat request missing fields: %.*s", (int)payload_len, payload);
+        return;
+    }
+
+    espagent_msg_t msg = {0};
+    snprintf(msg.channel, sizeof(msg.channel), "%s", ESPAGENT_CHAN_WEBSOCKET);
+    snprintf(msg.chat_id, sizeof(msg.chat_id), "%s", chat_id);
+    msg.content = strdup(content);
+    cJSON_Delete(root);
+    if (!msg.content) {
+        ESP_LOGW(TAG, "Web chat request OOM for chat_id=%s", chat_id);
+        return;
+    }
+
+    esp_err_t err = message_bus_push_inbound(&msg);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Web chat request queue failed for %s: %s",
+                 chat_id, esp_err_to_name(err));
+        free(msg.content);
+        return;
+    }
+
+    ESP_LOGI(TAG, "Web chat request injected: chat_id=%s text=%.64s", chat_id, content);
+}
+
 static esp_err_t read_temperature_humidity_result(char *result, size_t result_size)
 {
     tool_environment_values_t values = {0};
@@ -2140,6 +2210,9 @@ static void mqtt_poll_inbound(int fd)
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_POLICY_DECISION)) {
                 policy_cache_maybe_store_payload(msg, msg_len);
                 ESP_LOGI(TAG, "Policy decision received: %.*s", (int)msg_len, msg);
+            } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST)) {
+                ESP_LOGI(TAG, "Web chat request received: %.*s", (int)msg_len, msg);
+                handle_web_chat_request(msg, msg_len);
             } else if (espagent_voice_handle_mqtt_message((const char *)topic,
                                                           topic_len,
                                                           msg,
@@ -2439,6 +2512,7 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT, 7);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 8);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_EVENTS, 9);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST, 10);
         } else if (espagent_role_is_control()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
@@ -2466,8 +2540,8 @@ static void sensor_mqtt_task(void *arg)
                      "%s/nodes/+/state", ESPAGENT_MESH_TOPIC_PREFIX);
             snprintf(nodes_telemetry_filter, sizeof(nodes_telemetry_filter),
                      "%s/nodes/+/telemetry", ESPAGENT_MESH_TOPIC_PREFIX);
-            mqtt_subscribe(fd, nodes_state_filter, 10);
-            mqtt_subscribe(fd, nodes_telemetry_filter, 11);
+            mqtt_subscribe(fd, nodes_state_filter, 11);
+            mqtt_subscribe(fd, nodes_telemetry_filter, 12);
         }
         mqtt_set_connected(true);
         publish_node_state(fd, "online");

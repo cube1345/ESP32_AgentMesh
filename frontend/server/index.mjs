@@ -1,5 +1,4 @@
 import http from 'node:http';
-import { URL } from 'node:url';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -9,22 +8,15 @@ const MQTT_PORT = Number(process.env.ESPAGENT_MQTT_PORT || 1883);
 const MQTT_PROTOCOL = process.env.ESPAGENT_MQTT_PROTOCOL || 'mqtt';
 const TOPIC_PREFIX = (process.env.ESPAGENT_TOPIC_PREFIX || 'espagent/cube1345').replace(/\/+$/, '');
 const MQTT_URL = `${MQTT_PROTOCOL}://${MQTT_HOST}:${MQTT_PORT}`;
+const CHAT_REQUEST_TOPIC = `${TOPIC_PREFIX}/web/chat/request`;
+const CHAT_REPLY_TOPIC = `${TOPIC_PREFIX}/web/chat/reply`;
+const VOICE_STT_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/stt/request`;
+const VOICE_STT_RESULT_TOPIC = `${TOPIC_PREFIX}/voice/stt/result`;
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
 const CHAT_GATEWAY_PATH = '/ws';
 const runtimeSkills = new Map();
-
-function deriveDefaultAgentWsUrl() {
-  if (!SKILLS_API_BASE) return '';
-  try {
-    const upstream = new URL(SKILLS_API_BASE);
-    const protocol = upstream.protocol === 'https:' ? 'wss:' : 'ws:';
-    return `${protocol}//${upstream.hostname}:18789/`;
-  } catch {
-    return '';
-  }
-}
-
-const AGENT_WS_URL = (process.env.ESPAGENT_AGENT_WS_URL || deriveDefaultAgentWsUrl()).trim();
+const chatSessions = new Map();
+const wsSessions = new Set();
 
 function nowIso() {
   return new Date().toISOString();
@@ -149,9 +141,9 @@ function createStore() {
       lastEventAt: null
     },
     chatGateway: {
-      enabled: Boolean(AGENT_WS_URL),
+      enabled: true,
       path: CHAT_GATEWAY_PATH,
-      upstreamUrl: AGENT_WS_URL || null,
+      upstreamUrl: `${MQTT_URL} -> ${CHAT_REQUEST_TOPIC}`,
       activeSessions: 0,
       connectedSessions: 0,
       lastEventAt: null,
@@ -306,133 +298,139 @@ function sendWsJson(socket, payload) {
 function createChatSession(downstream) {
   const session = {
     downstream,
-    upstream: null,
-    pendingMessages: [],
-    upstreamConnected: false
+    chatId: null
   };
-
-  function ensureUpstream() {
-    if (!AGENT_WS_URL) {
-      noteChatGatewayEvent('ESPAGENT_AGENT_WS_URL is empty');
-      sendWsJson(downstream, {
-        type: 'system',
-        content: '聊天网关未配置上游 ESP32 WebSocket 地址。'
-      });
-      return null;
-    }
-
-    if (session.upstream &&
-        (session.upstream.readyState === WebSocket.OPEN ||
-         session.upstream.readyState === WebSocket.CONNECTING)) {
-      return session.upstream;
-    }
-
-    const upstream = new WebSocket(AGENT_WS_URL);
-    session.upstream = upstream;
-    noteChatGatewayEvent(null);
-
-    upstream.on('open', () => {
-      session.upstreamConnected = true;
-      store.chatGateway.connectedSessions += 1;
-      noteChatGatewayEvent(null);
-      sendWsJson(downstream, {
-        type: 'system',
-        content: `已连接到上游 ESP32 网关：${AGENT_WS_URL}`
-      });
-      while (session.pendingMessages.length > 0 && upstream.readyState === WebSocket.OPEN) {
-        upstream.send(session.pendingMessages.shift());
-      }
-    });
-
-    upstream.on('message', (data) => {
-      noteChatGatewayEvent(null);
-      if (downstream.readyState === WebSocket.OPEN) {
-        downstream.send(typeof data === 'string' ? data : data.toString());
-      }
-    });
-
-    upstream.on('close', () => {
-      if (session.upstreamConnected) {
-        store.chatGateway.connectedSessions = Math.max(0, store.chatGateway.connectedSessions - 1);
-      }
-      session.upstreamConnected = false;
-      session.upstream = null;
-      noteChatGatewayEvent('upstream websocket closed');
-      sendWsJson(downstream, {
-        type: 'system',
-        content: '上游 ESP32 WebSocket 已断开。下一次发送时会自动重连。'
-      });
-    });
-
-    upstream.on('error', (error) => {
-      noteChatGatewayEvent(error instanceof Error ? error.message : 'upstream websocket error');
-      sendWsJson(downstream, {
-        type: 'system',
-        content: `上游 ESP32 WebSocket 异常：${error instanceof Error ? error.message : 'unknown error'}`
-      });
-    });
-
-    return upstream;
-  }
+  wsSessions.add(session);
 
   store.chatGateway.activeSessions += 1;
+  store.chatGateway.connectedSessions += 1;
   noteChatGatewayEvent(null);
-  ensureUpstream();
+  sendWsJson(downstream, {
+    type: 'system',
+    content: `已连接到本地 MQTT Chat Gateway：${CHAT_REQUEST_TOPIC}`
+  });
 
   downstream.on('message', (raw) => {
     const text = typeof raw === 'string' ? raw : raw.toString();
     const payload = safeJsonParse(text);
-    if (!payload || payload.type !== 'message' || typeof payload.content !== 'string') {
+    if (!payload || typeof payload.type !== 'string') {
       sendWsJson(downstream, {
         type: 'system',
-        content: '网关只接受 {"type":"message","content":"...","chat_id":"..."} 格式。'
+        content: '网关只接受已定义的 JSON 消息类型。'
+      });
+      return;
+    }
+    if (!store.mqtt.connected) {
+      noteChatGatewayEvent('mqtt offline');
+      sendWsJson(downstream, {
+        type: 'system',
+        content: 'MQTT 网关当前不可用，请稍后重试。'
       });
       return;
     }
 
-    const upstream = ensureUpstream();
-    if (!upstream) {
-      return;
-    }
-
-    if (upstream.readyState === WebSocket.OPEN) {
-      upstream.send(text);
-      noteChatGatewayEvent(null);
-      return;
-    }
-
-    if (upstream.readyState === WebSocket.CONNECTING) {
-      if (session.pendingMessages.length >= 16) {
-        session.pendingMessages.shift();
+    if (payload.type === 'message') {
+      if (typeof payload.content !== 'string') {
+        sendWsJson(downstream, {
+          type: 'system',
+          content: 'message 类型必须包含字符串 content。'
+        });
+        return;
       }
-      session.pendingMessages.push(text);
-      sendWsJson(downstream, {
-        type: 'system',
-        content: '上游网关正在连接，消息已进入本地等待队列。'
+
+      const chatId = typeof payload.chat_id === 'string' && payload.chat_id.trim()
+        ? payload.chat_id.trim()
+        : 'web_console_01';
+      if (session.chatId && chatSessions.get(session.chatId) === session) {
+        chatSessions.delete(session.chatId);
+      }
+      session.chatId = chatId;
+      chatSessions.set(chatId, session);
+
+      const requestPayload = JSON.stringify({
+        type: 'message',
+        chat_id: chatId,
+        content: payload.content
+      });
+      client.publish(CHAT_REQUEST_TOPIC, requestPayload, { qos: 0 }, (error) => {
+        if (error) {
+          noteChatGatewayEvent(error.message);
+          sendWsJson(downstream, {
+            type: 'system',
+            content: `MQTT 聊天请求发送失败：${error.message}`
+          });
+          return;
+        }
+        noteChatGatewayEvent(null);
+      });
+      return;
+    }
+
+    if (payload.type === 'stt_result') {
+      const transcript = typeof payload.transcript === 'string' ? payload.transcript.trim() : '';
+      if (!transcript) {
+        sendWsJson(downstream, {
+          type: 'system',
+          content: 'stt_result 缺少 transcript。'
+        });
+        return;
+      }
+
+      const sttPayload = JSON.stringify({
+        schema: 'espagent.voice.stt_result.v1',
+        event: 'stt_result',
+        request_id: typeof payload.request_id === 'string' && payload.request_id.trim()
+          ? payload.request_id.trim()
+          : `web-stt-${Date.now()}`,
+        transcript,
+        status: typeof payload.status === 'string' ? payload.status : 'ok',
+        provider: typeof payload.provider === 'string' ? payload.provider : 'browser_webspeech',
+        reply_channel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'web',
+        reply_chat_id: typeof payload.reply_chat_id === 'string' && payload.reply_chat_id.trim()
+          ? payload.reply_chat_id.trim()
+          : (session.chatId || 'web_console_01'),
+        ts_ms: Date.now()
+      });
+      client.publish(VOICE_STT_RESULT_TOPIC, sttPayload, { qos: 0 }, (error) => {
+        if (error) {
+          noteChatGatewayEvent(error.message);
+          sendWsJson(downstream, {
+            type: 'system',
+            content: `STT 结果回传失败：${error.message}`
+          });
+          return;
+        }
+        noteChatGatewayEvent(null);
+        pushTimeline({
+          time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+          stage: 'stt_result',
+          source: 'dashboard_web',
+          target: 'coordinator_agent',
+          payload: transcript,
+          status: 'ok'
+        });
+        sendWsJson(downstream, {
+          type: 'system',
+          content: `STT 转写已回传：${transcript}`
+        });
       });
       return;
     }
 
     sendWsJson(downstream, {
       type: 'system',
-      content: '上游网关当前不可用，请重试。'
+      content: `未知消息类型：${payload.type}`
     });
   });
 
   downstream.on('close', () => {
     store.chatGateway.activeSessions = Math.max(0, store.chatGateway.activeSessions - 1);
-    if (session.upstreamConnected) {
-      store.chatGateway.connectedSessions = Math.max(0, store.chatGateway.connectedSessions - 1);
-    }
-    session.upstreamConnected = false;
+    store.chatGateway.connectedSessions = Math.max(0, store.chatGateway.connectedSessions - 1);
     noteChatGatewayEvent(null);
-    if (session.upstream &&
-        (session.upstream.readyState === WebSocket.OPEN ||
-         session.upstream.readyState === WebSocket.CONNECTING)) {
-      session.upstream.close();
+    if (session.chatId && chatSessions.get(session.chatId) === session) {
+      chatSessions.delete(session.chatId);
     }
-    session.upstream = null;
-    session.pendingMessages.length = 0;
+    wsSessions.delete(session);
   });
 }
 
@@ -510,7 +508,10 @@ client.on('connect', () => {
     `${TOPIC_PREFIX}/nodes/+/telemetry`,
     `${TOPIC_PREFIX}/nodes/+/state`,
     `${TOPIC_PREFIX}/agent/timeline`,
-    `${TOPIC_PREFIX}/guardian/stateboard`
+    `${TOPIC_PREFIX}/guardian/stateboard`,
+    CHAT_REPLY_TOPIC,
+    VOICE_STT_REQUEST_TOPIC,
+    VOICE_STT_RESULT_TOPIC
   ];
   client.subscribe(topics, (error) => {
     if (error) {
@@ -553,6 +554,48 @@ client.on('message', (topic, buffer) => {
   }
   if (topic.endsWith('/timeline')) {
     handleTimeline(payload);
+    return;
+  }
+  if (topic === CHAT_REPLY_TOPIC) {
+    const chatId = typeof payload.chat_id === 'string' ? payload.chat_id : '';
+    const session = chatId ? chatSessions.get(chatId) : null;
+    noteChatGatewayEvent(null);
+    if (session?.downstream?.readyState === WebSocket.OPEN) {
+      session.downstream.send(JSON.stringify(payload));
+    }
+    return;
+  }
+  if (topic === VOICE_STT_REQUEST_TOPIC) {
+    const request = {
+      type: 'stt_request',
+      request_id: typeof payload.request_id === 'string' ? payload.request_id : `stt-${Date.now()}`,
+      reply_channel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'web',
+      reply_chat_id: typeof payload.reply_chat_id === 'string' ? payload.reply_chat_id : 'web_console_01',
+      hint_text: typeof payload.hint_text === 'string' ? payload.hint_text : '',
+      auto_route_reply: payload.auto_route_reply !== false
+    };
+    for (const session of wsSessions) {
+      sendWsJson(session.downstream, request);
+    }
+    pushTimeline({
+      time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
+      stage: 'stt_request',
+      source: payload.node_id || payload.role || 'coordinator_agent',
+      target: 'dashboard_web',
+      payload: request.hint_text || '语音转写请求',
+      status: 'queued'
+    });
+    return;
+  }
+  if (topic === VOICE_STT_RESULT_TOPIC) {
+    pushTimeline({
+      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
+      stage: 'stt_result',
+      source: payload.provider || 'voice_frontend',
+      target: payload.reply_chat_id || 'agent_loop',
+      payload: payload.transcript || '(empty transcript)',
+      status: payload.status === 'error' ? 'warn' : 'ok'
+    });
     return;
   }
   if (topic.endsWith('/stateboard')) {
@@ -776,5 +819,5 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`[dashboard] http://127.0.0.1:${PORT}`);
   console.log(`[dashboard] mqtt=${MQTT_URL} prefix=${TOPIC_PREFIX}`);
-  console.log(`[dashboard] chat-gateway=${CHAT_GATEWAY_PATH} upstream=${AGENT_WS_URL || 'disabled'}`);
+  console.log(`[dashboard] chat-gateway=${CHAT_GATEWAY_PATH} request=${CHAT_REQUEST_TOPIC} reply=${CHAT_REPLY_TOPIC}`);
 });

@@ -91,6 +91,7 @@ set(ESPAGENT_TOOL_SRCS
 
 set(ESPAGENT_DRIVER_SRCS
     "drivers/aht10.c"
+    "drivers/ina_mic.c"
     "drivers/max98357.c"
     "drivers/sgp30.c"
     "drivers/bh1750.c"

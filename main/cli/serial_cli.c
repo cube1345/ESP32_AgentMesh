@@ -11,6 +11,7 @@
 #include "tools/tool_registry.h"
 #include "tools/tool_web_search.h"
 #include "tools/tool_amap_weather.h"
+#include "drivers/ina_mic.h"
 #include "drivers/max98357.h"
 #include "voice/local_tts.h"
 #include "cron/cron_service.h"
@@ -38,6 +39,23 @@
 #include "freertos/semphr.h"
 
 static const char *TAG = "cli";
+
+typedef struct {
+    TaskHandle_t task;
+    volatile bool stop_requested;
+    ina_mic_config_t cfg;
+    uint32_t window_ms;
+} ina_mic_watch_state_t;
+
+static ina_mic_watch_state_t s_ina_mic_watch = {0};
+
+static bool parse_ina_mic_capture_args(int argc,
+                                       char **argv,
+                                       ina_mic_config_t *cfg,
+                                       uint32_t *duration_ms);
+static void print_ina_mic_level_usage(void);
+static void print_ina_mic_watch_usage(void);
+static void ina_mic_watch_task(void *arg);
 
 static int cli_base64_value(char ch)
 {
@@ -390,6 +408,81 @@ static int cmd_max98357_test(int argc, char **argv)
     printf("max98357_test status: %s\n", esp_err_to_name(err));
     printf("%s\n", result[0] ? result : "(empty)");
     return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_ina_mic_level(int argc, char **argv)
+{
+    ina_mic_config_t cfg;
+    uint32_t duration_ms = 1000;
+
+    if (!parse_ina_mic_capture_args(argc, argv, &cfg, &duration_ms)) {
+        print_ina_mic_level_usage();
+        return 1;
+    }
+
+    ina_mic_level_t level;
+    char result[256];
+    esp_err_t err = ina_mic_capture_level(&cfg, duration_ms, &level, result, sizeof(result));
+    printf("ina_mic_level status: %s\n", esp_err_to_name(err));
+    printf("%s\n", result[0] ? result : "(empty)");
+    if (err == ESP_OK) {
+        printf("samples=%u nonzero=%u rms=%lu peak=%ld mean=%ld clipped=%u channel=%s sample_rate=%lu\n",
+               (unsigned)level.samples,
+               (unsigned)level.nonzero_samples,
+               (unsigned long)level.rms,
+               (long)level.peak_abs,
+               (long)level.mean,
+               (unsigned)level.clipped_samples,
+               cfg.right_channel ? "right" : "left",
+               (unsigned long)cfg.sample_rate_hz);
+    }
+    return (err == ESP_OK) ? 0 : 1;
+}
+
+static int cmd_ina_mic_watch(int argc, char **argv)
+{
+    ina_mic_config_t cfg;
+    uint32_t window_ms = 1000;
+
+    if (!parse_ina_mic_capture_args(argc, argv, &cfg, &window_ms)) {
+        print_ina_mic_watch_usage();
+        return 1;
+    }
+
+    if (s_ina_mic_watch.task) {
+        printf("ina_mic_watch status: already running\n");
+        printf("Use: ina_mic_watch_stop\n");
+        return 1;
+    }
+
+    s_ina_mic_watch.cfg = cfg;
+    s_ina_mic_watch.window_ms = window_ms;
+    s_ina_mic_watch.stop_requested = false;
+
+    if (xTaskCreate(ina_mic_watch_task, "ina_mic_watch", 8 * 1024, NULL, 5, &s_ina_mic_watch.task) != pdPASS) {
+        s_ina_mic_watch.task = NULL;
+        printf("ina_mic_watch status: failed to start task\n");
+        return 1;
+    }
+
+    printf("ina_mic_watch status: ESP_OK\n");
+    printf("Run 'ina_mic_watch_stop' to stop continuous sampling.\n");
+    return 0;
+}
+
+static int cmd_ina_mic_watch_stop(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    if (!s_ina_mic_watch.task) {
+        printf("ina_mic_watch_stop status: not running\n");
+        return 0;
+    }
+
+    s_ina_mic_watch.stop_requested = true;
+    printf("ina_mic_watch_stop status: stopping\n");
+    return 0;
 }
 
 static int cmd_local_tts_speak(int argc, char **argv)
@@ -1161,6 +1254,117 @@ static bool json_escape_string(const char *in, char *out, size_t out_size)
     return true;
 }
 
+static bool parse_ina_mic_capture_args(int argc,
+                                       char **argv,
+                                       ina_mic_config_t *cfg,
+                                       uint32_t *duration_ms)
+{
+    if (!cfg || !duration_ms) {
+        return false;
+    }
+
+    ina_mic_default_config(cfg);
+    *duration_ms = 1000;
+
+    if (argc == 1) {
+        return true;
+    }
+    if (argc == 2) {
+        *duration_ms = (uint32_t)strtoul(argv[1], NULL, 10);
+        return true;
+    }
+    if (argc == 5) {
+        cfg->bclk_gpio = (gpio_num_t)strtol(argv[1], NULL, 10);
+        cfg->ws_gpio = (gpio_num_t)strtol(argv[2], NULL, 10);
+        cfg->sd_gpio = (gpio_num_t)strtol(argv[3], NULL, 10);
+        *duration_ms = (uint32_t)strtoul(argv[4], NULL, 10);
+        return true;
+    }
+    if (argc == 7) {
+        cfg->bclk_gpio = (gpio_num_t)strtol(argv[1], NULL, 10);
+        cfg->ws_gpio = (gpio_num_t)strtol(argv[2], NULL, 10);
+        cfg->sd_gpio = (gpio_num_t)strtol(argv[3], NULL, 10);
+        cfg->sample_rate_hz = (uint32_t)strtoul(argv[4], NULL, 10);
+        cfg->right_channel = strtol(argv[5], NULL, 10) != 0;
+        *duration_ms = (uint32_t)strtoul(argv[6], NULL, 10);
+        return true;
+    }
+
+    return false;
+}
+
+static void print_ina_mic_level_usage(void)
+{
+    printf("Usage:\n");
+    printf("  ina_mic_level\n");
+    printf("  ina_mic_level <duration_ms>\n");
+    printf("  ina_mic_level <bclk_gpio> <ws_gpio> <sd_gpio> <duration_ms>\n");
+    printf("  ina_mic_level <bclk_gpio> <ws_gpio> <sd_gpio> <sample_rate_hz> <right_channel:0|1> <duration_ms>\n");
+}
+
+static void print_ina_mic_watch_usage(void)
+{
+    printf("Usage:\n");
+    printf("  ina_mic_watch\n");
+    printf("  ina_mic_watch <window_ms>\n");
+    printf("  ina_mic_watch <bclk_gpio> <ws_gpio> <sd_gpio> <window_ms>\n");
+    printf("  ina_mic_watch <bclk_gpio> <ws_gpio> <sd_gpio> <sample_rate_hz> <right_channel:0|1> <window_ms>\n");
+    printf("  ina_mic_watch_stop\n");
+}
+
+static void ina_mic_watch_task(void *arg)
+{
+    (void)arg;
+
+    ina_mic_stream_t stream;
+    ina_mic_level_t level;
+    char diag[256];
+    char close_diag[128];
+    esp_err_t err = ina_mic_stream_open(&stream, &s_ina_mic_watch.cfg, diag, sizeof(diag));
+    if (err != ESP_OK) {
+        printf("[ina_mic_watch] open failed: %s\n", diag[0] ? diag : esp_err_to_name(err));
+        s_ina_mic_watch.task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    printf("[ina_mic_watch] started window=%lums sample_rate=%luHz channel=%s BCLK=GPIO%d WS=GPIO%d SD=GPIO%d\n",
+           (unsigned long)s_ina_mic_watch.window_ms,
+           (unsigned long)s_ina_mic_watch.cfg.sample_rate_hz,
+           s_ina_mic_watch.cfg.right_channel ? "right" : "left",
+           (int)s_ina_mic_watch.cfg.bclk_gpio,
+           (int)s_ina_mic_watch.cfg.ws_gpio,
+           (int)s_ina_mic_watch.cfg.sd_gpio);
+
+    while (!s_ina_mic_watch.stop_requested) {
+        memset(&level, 0, sizeof(level));
+        stream.raw_bytes_in = 0;
+        err = ina_mic_stream_read_level(&stream, s_ina_mic_watch.window_ms, &level, diag, sizeof(diag));
+        if (err != ESP_OK) {
+            printf("[ina_mic_watch] read failed: %s\n", diag[0] ? diag : esp_err_to_name(err));
+            break;
+        }
+
+        printf("[ina_mic_watch] samples=%u nonzero=%u rms=%lu peak=%ld mean=%ld clipped=%u raw_bytes=%u channel=%s sample_rate=%lu\n",
+               (unsigned)level.samples,
+               (unsigned)level.nonzero_samples,
+               (unsigned long)level.rms,
+               (long)level.peak_abs,
+               (long)level.mean,
+               (unsigned)level.clipped_samples,
+               (unsigned)stream.raw_bytes_in,
+               s_ina_mic_watch.cfg.right_channel ? "right" : "left",
+               (unsigned long)s_ina_mic_watch.cfg.sample_rate_hz);
+        vTaskDelay(pdMS_TO_TICKS(80));
+    }
+
+    (void)ina_mic_stream_close(&stream, close_diag, sizeof(close_diag));
+    printf("[ina_mic_watch] stopped\n");
+    s_ina_mic_watch.stop_requested = false;
+    s_ina_mic_watch.task = NULL;
+    vTaskDelete(NULL);
+}
+
 static int cmd_web_search(int argc, char **argv)
 {
     int nerrors = arg_parse(argc, argv, (void **)&web_search_args);
@@ -1587,6 +1791,27 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_max98357_test,
     };
     esp_console_cmd_register(&max98357_cmd);
+
+    esp_console_cmd_t ina_mic_level_cmd = {
+        .command = "ina_mic_level",
+        .help = "Capture a short INA/INMP-style I2S microphone sample and print RMS/peak stats",
+        .func = &cmd_ina_mic_level,
+    };
+    esp_console_cmd_register(&ina_mic_level_cmd);
+
+    esp_console_cmd_t ina_mic_watch_cmd = {
+        .command = "ina_mic_watch",
+        .help = "Start a background INA/INMP-style I2S microphone watcher that prints RMS/peak stats continuously",
+        .func = &cmd_ina_mic_watch,
+    };
+    esp_console_cmd_register(&ina_mic_watch_cmd);
+
+    esp_console_cmd_t ina_mic_watch_stop_cmd = {
+        .command = "ina_mic_watch_stop",
+        .help = "Stop the background INA/INMP-style I2S microphone watcher",
+        .func = &cmd_ina_mic_watch_stop,
+    };
+    esp_console_cmd_register(&ina_mic_watch_stop_cmd);
 
     /* local_tts_speak */
     esp_console_cmd_t local_tts_cmd = {

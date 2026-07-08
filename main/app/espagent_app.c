@@ -363,17 +363,24 @@ static void outbound_dispatch_task(void *arg)
                 }
             }
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_WEBSOCKET) == 0) {
+            esp_err_t mqtt_reply_err =
+                sensor_mqtt_publish_web_chat_reply(msg.chat_id, msg.content, "response");
+            if (mqtt_reply_err != ESP_OK) {
+                ESP_LOGW(TAG, "MQTT web chat reply publish failed for %s: %s",
+                         msg.chat_id, esp_err_to_name(mqtt_reply_err));
+            }
             esp_err_t ws_err = ws_server_send(msg.chat_id, msg.content);
             if (ws_err != ESP_OK) {
                 ESP_LOGW(TAG, "WS send failed for %s: %s", msg.chat_id, esp_err_to_name(ws_err));
-            } else if (ESPAGENT_VOICE_AUTO_TTS) {
+            }
+            if (ESPAGENT_VOICE_AUTO_TTS) {
                 char diag[192];
                 esp_err_t tts_err = auto_route_reply_tts(&msg, diag, sizeof(diag));
-                ESP_LOGI(TAG, "Control-agent TTS after WS reply -> %s (%s)",
+                ESP_LOGI(TAG, "Control-agent TTS after web reply -> %s (%s)",
                          esp_err_to_name(tts_err), diag[0] ? diag : "no detail");
                 if (tts_err != ESP_OK && espagent_voice_local_tts_enabled()) {
                     esp_err_t local_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
-                    ESP_LOGI(TAG, "Fallback local S3 TTS after WS reply -> %s (%s)",
+                    ESP_LOGI(TAG, "Fallback local S3 TTS after web reply -> %s (%s)",
                              esp_err_to_name(local_err),
                              diag[0] ? diag : "no detail");
                 }

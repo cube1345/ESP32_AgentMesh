@@ -40,6 +40,7 @@
 | 3-wire PIR / 存在传感器 | `GPIO13` | `sensor_agent` | 已支持 | 工具：`read_presence` |
 | HC-SR05 | 默认未固定 | `sensor_agent` | 已支持但未默认配置 | 需单独设置 Trig / Echo |
 | MAX98357 I2S 功放 | `BCLK=GPIO1`, `WS=GPIO2`, `DIN=GPIO3`, `SD` 可选 | `control_agent` | 已支持 | 工具：`max98357_play_tone` |
+| INA I2S 麦克风 | `SCK=GPIO6`, `WS=GPIO7`, `LR=GND`, `SD=GPIO8` | `control_agent` | 硬件方案已确定，固件采集链未接入 | 规划中的 I2S 麦克风输入 |
 | 格力空调 IR 发射 | `ESPAGENT_SECRET_GREE_IR_TX_GPIO`，默认 `-1` | `control_agent` | 已支持 | 工具：`gree_ac_control`，Gree-only，send-only |
 | 通用 GPIO | `1-18, 21, 38, 46` | `control_agent` | 已支持 | 工具：`gpio_write` / `gpio_read` |
 
@@ -71,6 +72,7 @@
 | WS2812 | `DIN -> GPIO48`, `VCC/GND` 按灯带规格供电 |
 | 舵机 1 | `Signal -> GPIO5`, `VCC -> 外部 5V`, `GND -> 共地` |
 | MAX98357 | `BCLK -> GPIO1`, `WS/LRCLK -> GPIO2`, `DIN -> GPIO3`, `SD` 可选 |
+| INA 麦克风 | `SCK -> GPIO6`, `WS -> GPIO7`, `LR -> GND`, `SD -> GPIO8`, `VDD -> 3V3`, `GND -> GND` |
 | 格力空调 IR | `SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO`，建议经三极管驱动 |
 | 通用继电器 / MOSFET / 风扇 | 走 `gpio_write` 的允许引脚，按具体模块分配 |
 
@@ -172,9 +174,27 @@ MAX98357 GND       -> GND
 
 - 当前是播放测试音输出链路
 - 不是麦克风输入链路
-- 麦克风模块和录音链路目前还没有完整接入
+- 麦克风输入已单独规划为 `GPIO6/7/8`，不要与 MAX98357 的 `GPIO1/2/3` 并线
 
-### 4.7 WS2812
+### 4.7 INA I2S 麦克风
+
+```text
+INA SCK/BCLK -> GPIO6
+INA WS       -> GPIO7
+INA LR       -> GND
+INA SD/DOUT  -> GPIO8
+INA VDD      -> 3V3
+INA GND      -> GND
+```
+
+说明：
+
+- 当前确定的是硬件接线方案，不代表固件已经完成录音 / STT 采集链
+- `LR` 接地表示固定使用单侧声道
+- 这一路是 I2S 数字麦克风输入，和 MAX98357 的 I2S 功放输出是两套独立链路
+- 按当前项目 GPIO 策略，ESP32-S3 侧不会因为 `GPIO6/7/8` 直接被策略拦截；当前明确保留的是 `GPIO19/20` USB Serial/JTAG
+
+### 4.8 WS2812
 
 ```text
 WS2812 DIN -> GPIO48
@@ -187,7 +207,7 @@ WS2812 GND -> GND
 - 多颗 WS2812 串联时，供电不要只靠 ESP32 板载 5V/3V3
 - 建议单独 5V 供电并共地
 
-### 4.8 PIR / 3-wire 存在传感器
+### 4.9 PIR / 3-wire 存在传感器
 
 ```text
 PIR VCC -> 3V3 或 5V，按模块规格
@@ -195,7 +215,7 @@ PIR GND -> GND
 PIR OUT -> GPIO13
 ```
 
-### 4.9 HC-SR05
+### 4.10 HC-SR05
 
 ```text
 HC-SR05 VCC  -> 5V
@@ -214,7 +234,7 @@ HC-SR05 Echo -- 2kΩ --+-- ESP32 GPIO
                      GND
 ```
 
-### 4.10 格力空调 IR 发射
+### 4.11 格力空调 IR 发射
 
 建议不要让 GPIO 直接硬推红外 LED，推荐三极管驱动：
 
@@ -250,6 +270,7 @@ SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO
 | 双舵机已纳入当前方案 | 当前代码只支持 1 路舵机 |
 | 所有模块都尽量堆在一块 ESP32-S3 上 | 当前方案是四节点分工，不是单板满配 |
 | RMT/IR 仍只是规划能力 | 当前已接入专用 `gree_ac_control` 红外发送路径 |
+| `GPIO6/7/8` 不能用于当前 S3 麦克风规划 | 按当前项目 GPIO 策略，ESP32-S3 不会把 `GPIO6/7/8` 作为禁止引脚；当前麦克风规划就是 `SCK=6, WS=7, SD=8` |
 
 ## 6. 当前建议修改的配置项
 
@@ -286,6 +307,12 @@ SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO
 #define ESPAGENT_SECRET_MAX98357_WS_GPIO   2
 #define ESPAGENT_SECRET_MAX98357_DIN_GPIO  3
 #define ESPAGENT_SECRET_MAX98357_SD_GPIO   (-1)
+#define ESPAGENT_SECRET_INA_MIC_BCLK_GPIO  6
+#define ESPAGENT_SECRET_INA_MIC_WS_GPIO    7
+#define ESPAGENT_SECRET_INA_MIC_SD_GPIO    8
+#define ESPAGENT_SECRET_INA_MIC_I2S_PORT   1
+#define ESPAGENT_SECRET_INA_MIC_SAMPLE_RATE_HZ 16000
+#define ESPAGENT_SECRET_INA_MIC_RIGHT_CHANNEL 0
 
 #define ESPAGENT_SECRET_GREE_IR_TX_GPIO <你的实际红外发射GPIO>
 ```
@@ -298,7 +325,7 @@ SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO
 |---|---|---|
 | 第二路舵机 | 未实现 | 增加第二路 servo tool 或支持 `index` |
 | ICM42688 | 未接入 | 优先 SPI 独立驱动 |
-| 麦克风输入 | 未接入 | 单独规划 I2S/PDM 采集链 |
+| 麦克风输入 | 接线方案已确定，固件未接入 | 当前规划：`SCK=6, WS=7, LR=GND, SD=8`，后续补 I2S 采集/STT |
 | HC-05 蓝牙网关 | 未完整接入 | 作为 UART/蓝牙网关单独设计 |
 | 通用家电 IR | 未接入 | 不要和 Gree AC 专用控制混成一个大工具 |
 | ESP32-P4 / Android 终端联动 | 有数据通路 | 下一步重点做 UI 绑定和调度展示 |
@@ -320,6 +347,7 @@ SIG -> ESPAGENT_SECRET_GREE_IR_TX_GPIO
   - WS2812      GPIO48
   - Servo 1     GPIO5
   - MAX98357    GPIO1/2/3
+  - INA Mic     GPIO6/7/8 (LR->GND)
   - Gree IR TX  custom GPIO
 
 /dev/ttyUSB3  guardian_agent
