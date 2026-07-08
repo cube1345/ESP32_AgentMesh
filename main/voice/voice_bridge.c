@@ -152,6 +152,9 @@ static esp_err_t publish_stt_audio_chunk(stt_capture_publish_ctx_t *ctx,
     }
     esp_err_t err = sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_VOICE_STT_AUDIO_CHUNK, json);
     cJSON_free(json);
+    if (err == ESP_OK) {
+        vTaskDelay(pdMS_TO_TICKS(8));
+    }
     return err;
 }
 
