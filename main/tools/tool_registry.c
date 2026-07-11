@@ -11,7 +11,6 @@
 #include "tools/tool_sandbox.h"
 #include "tools/tool_subagent.h"
 #include "tools/tool_virtual_device.h"
-#include "tools/tool_voice.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_aht10.h"
 #include "tools/tool_environment.h"
@@ -384,9 +383,6 @@ static bool coordinator_compact_tool_allowed(const char *name)
         "web_search",
         "get_weather",
         "get_current_time",
-        "voice_status",
-        "voice_request_tts",
-        "voice_request_stt",
         "spawn_subagent",
         "mesh_send_command",
         "automation_create_workflow",
@@ -526,41 +522,6 @@ esp_err_t tool_registry_init(void)
         .input_schema_json =
             "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
         .execute = tool_get_time_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "voice_status",
-        .description = "Report the current voice bridge wiring between coordinator_agent and the display_agent front end, including MQTT topics and whether auto-TTS is enabled.",
-        .input_schema_json =
-            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
-        .execute = tool_voice_status_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "voice_request_tts",
-        .description = "Publish a structured text-to-speech request to the display_agent voice front end. Use this for explicit speak/read-aloud actions or for testing the MQTT voice chain.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"text\":{\"type\":\"string\",\"description\":\"Text that should be spoken on the display/front-end device\"},"
-            "\"source_channel\":{\"type\":\"string\",\"description\":\"Optional source channel label such as feishu or websocket\"},"
-            "\"chat_id\":{\"type\":\"string\",\"description\":\"Optional source chat/session id\"},"
-            "\"trace_id\":{\"type\":\"string\",\"description\":\"Optional trace id for timeline correlation\"}},"
-            "\"required\":[\"text\"],\"additionalProperties\":false}",
-        .execute = tool_voice_tts_request_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "voice_request_stt",
-        .description = "Publish a structured speech-to-text capture request to the display_agent voice front end. Use this to trigger a mic capture session from the agent side; transcript returns later on MQTT.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"session_id\":{\"type\":\"string\",\"description\":\"Optional client-generated session id\"},"
-            "\"reply_channel\":{\"type\":\"string\",\"description\":\"Optional reply channel to reuse when transcript returns, e.g. voice or feishu\"},"
-            "\"reply_chat_id\":{\"type\":\"string\",\"description\":\"Optional reply chat/session id\"},"
-            "\"hint_text\":{\"type\":\"string\",\"description\":\"Optional UI hint shown on the display device\"},"
-            "\"auto_route_reply\":{\"type\":\"boolean\",\"description\":\"Whether the front end should preserve reply routing metadata; defaults true\"}},"
-            "\"required\":[],\"additionalProperties\":false}",
-        .execute = tool_voice_stt_request_execute,
     });
 
     register_tool(&(espagent_tool_t){
@@ -704,7 +665,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"tts_speak\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"

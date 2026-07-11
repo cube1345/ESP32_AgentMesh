@@ -27,8 +27,7 @@ static bool starts_with(const char *s, const char *prefix)
 
 static const char *legacy_family_for_tool(const char *name)
 {
-    if (streq(name, "web_search") || streq(name, "get_weather") ||
-        starts_with(name, "voice_")) {
+    if (streq(name, "web_search") || streq(name, "get_weather")) {
         return "network";
     }
     if (streq(name, "get_current_time")) {

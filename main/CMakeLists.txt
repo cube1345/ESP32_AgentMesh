@@ -4,8 +4,6 @@ set(ESPAGENT_CORE_SRCS
     "app/espagent_app.c"
     "bus/message_bus.c"
     "time_sync/time_sync.c"
-    "voice/voice_bridge.c"
-    "voice/local_tts.c"
     "wifi/wifi_manager.c"
     "net/net_guard.c"
     "device/device_registry.c"
@@ -68,7 +66,6 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_automation.c"
     "tools/tool_cron.c"
     "tools/tool_amap_weather.c"
-    "tools/tool_voice.c"
     "tools/tool_web_search.c"
     "tools/tool_get_time.c"
     "tools/tool_lua.c"
@@ -91,7 +88,6 @@ set(ESPAGENT_TOOL_SRCS
 
 set(ESPAGENT_DRIVER_SRCS
     "drivers/aht10.c"
-    "drivers/ina_mic.c"
     "drivers/max98357.c"
     "drivers/sgp30.c"
     "drivers/bh1750.c"

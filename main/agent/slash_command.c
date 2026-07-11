@@ -114,8 +114,8 @@ static const slash_command_spec_t s_commands[] = {
         .name = "status",
         .usage = "/status <自然语言任务>",
         .template_text =
-            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、网关、语音桥、Guardian 或控制面状态。"
-            "优先考虑 gateway_status、voice_status、automation_list，"
+            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、网关、Guardian 或控制面状态。"
+            "优先考虑 gateway_status、automation_list，"
             "以及对 control_agent 使用 mesh_send_command(action=control_state)。用户原始请求：%s",
     },
     {

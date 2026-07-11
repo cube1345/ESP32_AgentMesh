@@ -38,8 +38,6 @@
 #include "memory/session_mgr.h"
 #include "onboard/wifi_onboard.h"
 #include "proactive/proactive_service.h"
-#include "voice/voice_bridge.h"
-#include "voice/local_tts.h"
 #include "proxy/http_proxy.h"
 #include "roles/control_node.h"
 #include "roles/coordinator_node.h"
@@ -117,35 +115,6 @@ static esp_err_t create_pinned_task(TaskFunction_t task_func,
         NULL,
         core_id);
     return ok == pdPASS ? ESP_OK : ESP_ERR_NO_MEM;
-}
-
-static esp_err_t auto_route_reply_tts(const espagent_msg_t *msg,
-                                      char *diag,
-                                      size_t diag_size)
-{
-    if (diag && diag_size > 0) {
-        diag[0] = '\0';
-    }
-    if (!msg || !msg->content || !msg->content[0]) {
-        if (diag && diag_size > 0) {
-            snprintf(diag, diag_size, "skip: empty reply");
-        }
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = espagent_voice_publish_tts_request_to_device(msg->content,
-                                                                 ESPAGENT_AUTO_TTS_TARGET_NODE,
-                                                                 msg->channel,
-                                                                 msg->chat_id,
-                                                                 NULL);
-    if (diag && diag_size > 0) {
-        snprintf(diag, diag_size,
-                 "%s",
-                 err == ESP_OK
-                     ? "OK: published auto TTS request on voice bridge"
-                     : esp_err_to_name(err));
-    }
-    return err;
 }
 
 static void publish_feishu_outbound_event(const char *chat_id,
@@ -349,18 +318,6 @@ static void outbound_dispatch_task(void *arg)
             } else {
                 ESP_LOGI(TAG, "Feishu send success for %s (%d bytes)", msg.chat_id, (int)strlen(msg.content));
                 publish_feishu_outbound_event(msg.chat_id, msg.content, "send_ok");
-                if (ESPAGENT_VOICE_AUTO_TTS) {
-                    char diag[192];
-                    esp_err_t tts_err = auto_route_reply_tts(&msg, diag, sizeof(diag));
-                    ESP_LOGI(TAG, "Control-agent TTS after Feishu reply -> %s (%s)",
-                             esp_err_to_name(tts_err), diag[0] ? diag : "no detail");
-                    if (tts_err != ESP_OK && espagent_voice_local_tts_enabled()) {
-                        esp_err_t local_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
-                        ESP_LOGI(TAG, "Fallback local S3 TTS after Feishu reply -> %s (%s)",
-                                 esp_err_to_name(local_err),
-                                 diag[0] ? diag : "no detail");
-                    }
-                }
             }
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_WEBSOCKET) == 0) {
             esp_err_t mqtt_reply_err =
@@ -372,33 +329,6 @@ static void outbound_dispatch_task(void *arg)
             esp_err_t ws_err = ws_server_send(msg.chat_id, msg.content);
             if (ws_err != ESP_OK) {
                 ESP_LOGW(TAG, "WS send failed for %s: %s", msg.chat_id, esp_err_to_name(ws_err));
-            }
-            if (ESPAGENT_VOICE_AUTO_TTS) {
-                char diag[192];
-                esp_err_t tts_err = auto_route_reply_tts(&msg, diag, sizeof(diag));
-                ESP_LOGI(TAG, "Control-agent TTS after web reply -> %s (%s)",
-                         esp_err_to_name(tts_err), diag[0] ? diag : "no detail");
-                if (tts_err != ESP_OK && espagent_voice_local_tts_enabled()) {
-                    esp_err_t local_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
-                    ESP_LOGI(TAG, "Fallback local S3 TTS after web reply -> %s (%s)",
-                             esp_err_to_name(local_err),
-                             diag[0] ? diag : "no detail");
-                }
-            }
-        } else if (strcmp(msg.channel, ESPAGENT_CHAN_VOICE) == 0) {
-            ESP_LOGI(TAG, "Voice outbound handled via MQTT TTS bridge [%s]: %.96s",
-                     msg.chat_id, msg.content);
-            if (ESPAGENT_VOICE_AUTO_TTS) {
-                char diag[192];
-                esp_err_t tts_err = auto_route_reply_tts(&msg, diag, sizeof(diag));
-                ESP_LOGI(TAG, "Control-agent TTS on voice channel -> %s (%s)",
-                         esp_err_to_name(tts_err), diag[0] ? diag : "no detail");
-                if (tts_err != ESP_OK && espagent_voice_local_tts_enabled()) {
-                    esp_err_t local_err = espagent_voice_local_tts_speak(msg.content, diag, sizeof(diag));
-                    ESP_LOGI(TAG, "Fallback local S3 TTS on voice channel -> %s (%s)",
-                             esp_err_to_name(local_err),
-                             diag[0] ? diag : "no detail");
-                }
             }
         } else if (strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) == 0) {
             ESP_LOGI(TAG, "System message [%s]: %.128s", msg.chat_id, msg.content);

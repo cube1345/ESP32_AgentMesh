@@ -431,7 +431,7 @@ Feishu WebSocket 稳定性状态：
 - 增加 `display/timeline_store.c/.h`。
 - 增加 state/telemetry 聚合缓存。
 - 用实时 S3 timeline/state/telemetry 流量验证 P4 收包日志、LVGL timeline 刷新和节点状态卡更新。
-- 后续再把摄像头、TTS、STT 接入 AgentMesh 展示/播报链路。
+- 后续再把摄像头等高带宽感知能力接入 AgentMesh 展示链路。
 
 ## 四节点资源压榨与代码设计
 
@@ -1017,7 +1017,7 @@ ESP32-S3 上不能实现 Linux/Docker 容器，但当前固件已经加入第一
 - HC-SR05：超声波距离/存在检测，Echo 必须做电平保护。
 - 3-wire presence/PIR：数字人体存在输入。
 - MAX98357：I2S 音频测试。
-- INA / INMP-class I2S Mic：当前硬件规划为 `BCLK=GPIO6`、`WS=GPIO7`、`LR=GND`、`SD=GPIO8`；接线方案已确定，录音/STT 采集链在持续补齐。
+- INA / INMP-class I2S Mic：原硬件规划为 `BCLK=GPIO6`、`WS=GPIO7`、`LR=GND`、`SD=GPIO8`；当前分支已暂缓该采集链，避免挤占 MCU 内存与 I2S 资源。
 - GPIO：仅允许安全 allowlist，避免破坏 USB/boot。
 
 ### 主动性

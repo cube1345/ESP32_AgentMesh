@@ -14,7 +14,6 @@
 #include "espagent_config.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_registry.h"
-#include "voice/voice_bridge.h"
 
 #include "cJSON.h"
 #include "esp_heap_caps.h"
@@ -309,7 +308,7 @@ static void build_relevance_query(const char *input, char *out,
     suffix =
         " guardian security policy privacy audit approval sandbox watchdog stateboard";
   } else if (espagent_role_is_coordinator()) {
-    suffix = " coordinator mesh dispatch timeline gateway voice status";
+    suffix = " coordinator mesh dispatch timeline gateway status";
   }
 
   size_t off = strnlen(out, out_size - 1);
@@ -2640,7 +2639,7 @@ static bool message_is_general_qa_turn(const char *message) {
       "feishu",      "websocket",     "bluetooth",    "ble",
       "wifi",        "红外",          "空调",         "灯",
       "温度",        "湿度",          "光照",         "传感器",
-      "舵机",        "麦克风",        "扬声器",       "喇叭",
+      "舵机",        "扬声器",       "喇叭",
       "屏幕",        "节点",          "开发板",       "设备",
       "联网",        "控制",          "状态灯",       "流水灯",
       "技能",        "记忆",          "网关",         "硬件",

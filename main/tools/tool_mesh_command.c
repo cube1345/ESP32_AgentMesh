@@ -224,7 +224,6 @@ static bool is_control_action(const char *action)
             strcmp(action, "set_device_led") == 0 ||
             strcmp(action, "copper_gpio_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
-            strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0 ||

@@ -17,7 +17,7 @@ export interface AgentNode {
 
 export interface Capability {
   name: string;
-  category: '感知' | '控制' | '协同' | '安全' | '语音' | '扩展';
+  category: '感知' | '控制' | '协同' | '安全' | '扩展';
   role: AgentNodeRole;
   maturity: '已验证' | '进行中' | '规划中';
   summary: string;
@@ -79,7 +79,6 @@ export interface RuntimeSkillInstallResponse {
 
 export interface UserPreferenceProfile {
   preferredChannel: string;
-  voiceOutput: boolean;
   privacyMode: 'metadata_only' | 'balanced' | 'full_context';
   automationAggressiveness: number;
   summaryStyle: 'concise' | 'standard' | 'detailed';

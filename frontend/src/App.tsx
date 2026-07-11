@@ -79,51 +79,6 @@ interface ChatMessage {
   time: string;
 }
 
-interface BrowserSpeechRecognitionResultItem {
-  transcript: string;
-}
-
-interface BrowserSpeechRecognitionResult {
-  isFinal: boolean;
-  0: BrowserSpeechRecognitionResultItem;
-  length: number;
-}
-
-interface BrowserSpeechRecognitionEvent extends Event {
-  resultIndex: number;
-  results: ArrayLike<BrowserSpeechRecognitionResult>;
-}
-
-interface BrowserSpeechRecognitionErrorEvent extends Event {
-  error: string;
-  message?: string;
-}
-
-interface BrowserSpeechRecognition extends EventTarget {
-  lang: string;
-  continuous: boolean;
-  interimResults: boolean;
-  maxAlternatives: number;
-  onstart: ((this: BrowserSpeechRecognition, ev: Event) => void) | null;
-  onresult: ((this: BrowserSpeechRecognition, ev: BrowserSpeechRecognitionEvent) => void) | null;
-  onerror: ((this: BrowserSpeechRecognition, ev: BrowserSpeechRecognitionErrorEvent) => void) | null;
-  onend: ((this: BrowserSpeechRecognition, ev: Event) => void) | null;
-  start(): void;
-  stop(): void;
-  abort(): void;
-}
-
-interface BrowserSpeechRecognitionCtor {
-  new (): BrowserSpeechRecognition;
-}
-
-declare global {
-  interface Window {
-    SpeechRecognition?: BrowserSpeechRecognitionCtor;
-    webkitSpeechRecognition?: BrowserSpeechRecognitionCtor;
-  }
-}
-
 const demoAccounts: Array<UserSession & { password: string; description: string }> = [
   { username: 'admin', password: 'admin123', role: 'admin', description: '全功能演示账号' },
   { username: 'operator', password: 'operator123', role: 'operator', description: '调度与监控账号' },
@@ -142,8 +97,8 @@ const fixedNodeOrder: AgentNode['role'][] = ['coordinator_agent', 'sensor_agent'
 
 const nodeChannelHints: Record<AgentNode['role'], { sends: string[]; receives: string[]; subagent: boolean }> = {
   coordinator_agent: {
-    sends: ['dispatch', 'timeline', 'mesh_command', 'voice_request'],
-    receives: ['feishu/websocket input', 'tool_result', 'mesh reply', 'stt_result'],
+    sends: ['dispatch', 'timeline', 'mesh_command'],
+    receives: ['feishu/websocket input', 'tool_result', 'mesh reply'],
     subagent: true
   },
   sensor_agent: {
@@ -153,7 +108,7 @@ const nodeChannelHints: Record<AgentNode['role'], { sends: string[]; receives: s
   },
   control_agent: {
     sends: ['control_state', 'tool_result', 'actuator result'],
-    receives: ['mesh_command', 'policy_decision', 'voice_tts_status'],
+    receives: ['mesh_command', 'policy_decision'],
     subagent: false
   },
   guardian_agent: {
@@ -162,8 +117,8 @@ const nodeChannelHints: Record<AgentNode['role'], { sends: string[]; receives: s
     subagent: false
   },
   display_terminal: {
-    sends: ['ui event', 'voice front-end event'],
-    receives: ['timeline', 'dashboard sync', 'tts request'],
+    sends: ['ui event'],
+    receives: ['timeline', 'dashboard sync'],
     subagent: false
   }
 };
@@ -228,35 +183,9 @@ function isAssistantFailureText(text: string): boolean {
   return /模型服务这次调用失败了|LLM transport failed|ESP_ERR_|HTTP_CONNECT/i.test(text);
 }
 
-function microphonePermissionHint(error: string): string {
-  if (error === 'not-allowed' || error === 'service-not-allowed') {
-    return '浏览器拒绝了麦克风权限。请确认地址栏左侧麦克风权限已允许；如果当前通过局域网 IP 的 http 页面访问，请改用 localhost 或 HTTPS。';
-  }
-  if (error === 'audio-capture') {
-    return '没有检测到可用麦克风，或麦克风正被其他应用占用。';
-  }
-  if (error === 'no-speech') {
-    return '没有检测到语音，请靠近麦克风后重试。';
-  }
-  if (error === 'network') {
-    return '浏览器语音识别服务网络不可用，请稍后重试。';
-  }
-  return `语音识别失败：${error}`;
-}
-
-function isLocalhost(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]' || hostname === '::1';
-}
-
 function isSandboxTimelineEvent(event: TimelineEvent): boolean {
   const text = `${event.stage} ${event.source} ${event.target} ${event.payload}`.toLowerCase();
   return text.includes('sandbox') || text.includes('沙箱') || text.includes('denied') || text.includes('blocked by sandbox');
-}
-
-function browserTtsSupported(): boolean {
-  return typeof window !== 'undefined' &&
-    typeof window.speechSynthesis !== 'undefined' &&
-    typeof SpeechSynthesisUtterance !== 'undefined';
 }
 
 const capabilityColumns = [
@@ -296,17 +225,11 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('admin123');
   const [wsConnected, setWsConnected] = useState(false);
   const [wsInstance, setWsInstance] = useState<WebSocket | null>(null);
-  const [sttListening, setSttListening] = useState(false);
-  const [sttInterimText, setSttInterimText] = useState('');
-  const [sttStatusText, setSttStatusText] = useState('未启动');
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     { id: 'system-welcome', role: 'system' as const, tone: 'info', text: '这里模拟飞书式消息入口，消息经本地网关转发到 ESP32。', time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) }
   ]);
   const [messageApi, contextHolder] = message.useMessage();
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
-  const speechRecognitionRef = useRef<BrowserSpeechRecognition | null>(null);
-  const pendingSttRequestRef = useRef<{ requestId: string; replyChannel: string; replyChatId: string } | null>(null);
-  const activeTtsUtteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -361,14 +284,6 @@ function App() {
   useEffect(() => () => wsInstance?.close(), [wsInstance]);
 
   useEffect(() => {
-    return () => {
-      if (typeof window !== 'undefined' && window.speechSynthesis) {
-        window.speechSynthesis.cancel();
-      }
-    };
-  }, []);
-
-  useEffect(() => {
     const viewport = chatScrollRef.current;
     if (!viewport) return;
     viewport.scrollTop = viewport.scrollHeight;
@@ -413,144 +328,9 @@ function App() {
   }), [draftSkills.length, payload.capabilities.length, payload.nodes]);
 
   const chatRelatedTimeline = useMemo(() => payload.timeline.slice(0, 8), [payload.timeline]);
-  const sttSupported = typeof window !== 'undefined' && Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
-  const sttSecureContext = typeof window !== 'undefined' && (window.isSecureContext || isLocalhost(window.location.hostname));
 
   function appendChatMessage(role: 'user' | 'assistant' | 'system', text: string, tone?: ChatMessage['tone']) {
     setChatMessages((current) => [...current, { id: `${role}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`, role, tone, text, time: new Date().toLocaleTimeString('zh-CN', { hour12: false }) }]);
-  }
-
-  function stopSpeechRecognition() {
-    speechRecognitionRef.current?.stop();
-  }
-
-  function speakBrowserTts(text: string) {
-    const clean = text.trim();
-    if (!clean || !preferences.voiceOutput) {
-      return false;
-    }
-    if (!browserTtsSupported()) {
-      return false;
-    }
-    if (typeof window === 'undefined' || !window.speechSynthesis) {
-      return false;
-    }
-
-    const utterance = new SpeechSynthesisUtterance(clean);
-    utterance.lang = 'zh-CN';
-    utterance.rate = 1;
-    utterance.pitch = 1;
-    activeTtsUtteranceRef.current = utterance;
-    window.speechSynthesis.cancel();
-    window.speechSynthesis.speak(utterance);
-    return true;
-  }
-
-  function sendTranscriptToGateway(transcript: string, request?: { requestId: string; replyChannel: string; replyChatId: string } | null) {
-    if (!wsInstance || wsInstance.readyState !== WebSocket.OPEN) {
-      appendChatMessage('system', '语音转写完成，但当前 WebSocket 未连接，无法发送。', 'error');
-      return;
-    }
-
-    const clean = transcript.trim();
-    if (!clean) {
-      return;
-    }
-
-    if (request) {
-      wsInstance.send(JSON.stringify({
-        type: 'stt_result',
-        request_id: request.requestId,
-        transcript: clean,
-        reply_channel: request.replyChannel,
-        reply_chat_id: request.replyChatId,
-        provider: 'browser_webspeech',
-        status: 'ok'
-      }));
-      appendChatMessage('system', `已完成语音转写并回传：${clean}`, 'success');
-      return;
-    }
-
-    wsInstance.send(JSON.stringify({ type: 'message', content: clean, chat_id: chatId.trim() || 'web_console_01' }));
-    appendChatMessage('user', clean);
-  }
-
-  function startSpeechRecognition(request?: { requestId: string; replyChannel: string; replyChatId: string } | null) {
-    const SpeechRecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognitionCtor) {
-      setSttStatusText('当前浏览器不支持 SpeechRecognition');
-      appendChatMessage('system', '当前浏览器不支持 SpeechRecognition，无法启动 STT。', 'error');
-      return;
-    }
-    if (!sttSecureContext) {
-      const hint = '浏览器语音输入需要安全来源。请用 localhost 打开本机前端，或给当前站点配置 HTTPS 后再点语音输入。';
-      setSttStatusText('麦克风不可用：当前页面不是安全来源');
-      appendChatMessage('system', hint, 'warning');
-      return;
-    }
-    if (!wsInstance || wsInstance.readyState !== WebSocket.OPEN) {
-      appendChatMessage('system', '请先连接本地通信网关，再启动 STT。', 'warning');
-      return;
-    }
-    if (sttListening) {
-      appendChatMessage('system', 'STT 已在运行。', 'warning');
-      return;
-    }
-
-    pendingSttRequestRef.current = request ?? null;
-    setSttInterimText('');
-    setSttListening(true);
-    setSttStatusText(request ? '响应远端 STT 请求中...' : '正在采集语音...');
-
-    const recognition = new SpeechRecognitionCtor();
-    speechRecognitionRef.current = recognition;
-    recognition.lang = preferences.preferredLanguage || 'zh-CN';
-    recognition.continuous = false;
-    recognition.interimResults = true;
-    recognition.maxAlternatives = 1;
-
-    recognition.onstart = () => {
-      setSttStatusText(request ? '浏览器 STT 已启动，等待说话...' : '浏览器 STT 已启动');
-    };
-
-    recognition.onresult = (event) => {
-      let interim = '';
-      let finalText = '';
-
-      for (let i = event.resultIndex; i < event.results.length; i += 1) {
-        const result = event.results[i];
-        const text = result[0]?.transcript || '';
-        if (result.isFinal) finalText += text;
-        else interim += text;
-      }
-
-      setSttInterimText(interim);
-      if (finalText.trim()) {
-        setSttStatusText('语音识别完成');
-        sendTranscriptToGateway(finalText, pendingSttRequestRef.current);
-        pendingSttRequestRef.current = null;
-        recognition.stop();
-      }
-    };
-
-    recognition.onerror = (event) => {
-      const hint = microphonePermissionHint(event.error);
-      setSttStatusText(hint);
-      appendChatMessage('system', hint, event.error === 'not-allowed' || event.error === 'service-not-allowed' ? 'warning' : 'error');
-      pendingSttRequestRef.current = null;
-      setSttListening(false);
-      speechRecognitionRef.current = null;
-    };
-
-    recognition.onend = () => {
-      setSttListening(false);
-      speechRecognitionRef.current = null;
-      if (!pendingSttRequestRef.current) {
-        setSttStatusText((current) => current === '语音识别完成' ? current : '已停止');
-      }
-    };
-
-    recognition.start();
   }
 
   function patchSkill(patch: Partial<SkillDraft>) {
@@ -630,29 +410,8 @@ function App() {
       socket.onopen = () => { setWsConnected(true); appendChatMessage('system', `WebSocket 已连接：${wsUrl}`, 'success'); };
       socket.onmessage = (event) => {
         try {
-          const data = JSON.parse(String(event.data)) as { type?: string; content?: string; request_id?: string; reply_channel?: string; reply_chat_id?: string; hint_text?: string; text?: string; detail?: string };
+          const data = JSON.parse(String(event.data)) as { type?: string; content?: string };
           const content = data.content || String(event.data);
-          if (data.type === 'stt_request') {
-            appendChatMessage('system', data.hint_text ? `收到 STT 请求：${data.hint_text}` : '收到 STT 请求，开始录音转写。', 'info');
-            startSpeechRecognition({
-              requestId: data.request_id || `stt-${Date.now()}`,
-              replyChannel: data.reply_channel || 'web',
-              replyChatId: data.reply_chat_id || (chatId.trim() || 'web_console_01')
-            });
-            return;
-          }
-          if (data.type === 'tts_fallback') {
-            const text = typeof data.text === 'string' ? data.text.trim() : '';
-            const spoken = text ? speakBrowserTts(text) : false;
-            appendChatMessage(
-              'system',
-              spoken
-                ? `板端 TTS 失败，已回退到浏览器播报。${data.detail ? `原因：${data.detail}` : ''}`
-                : `板端 TTS 失败。${data.detail ? `原因：${data.detail}` : ''}${text ? ' 浏览器 TTS 当前不可用。' : ''}`,
-              spoken ? 'warning' : 'error'
-            );
-            return;
-          }
           if (data.type === 'response' && data.content) {
             if (isAssistantFailureText(content)) {
               appendChatMessage('system', content, 'error');
@@ -829,7 +588,7 @@ function App() {
               </Row>}
 
               {viewMode === '用户偏好' && <Row gutter={[16, 16]} className="mt-4">
-                <Col xs={24} xl={14}><Card title="偏好配置" className="glass-panel rounded-lg" extra={<Button type="primary" loading={savingPrefs} onClick={handleSavePreferences}>保存偏好</Button>}><div className="panel-scroll max-h-[560px] overflow-y-auto pr-1"><Form layout="vertical"><Form.Item label="首选通道"><Select value={preferences.preferredChannel} onChange={(value) => setPreferences((current) => ({ ...current, preferredChannel: value }))} options={[{ value: 'Web Console' }, { value: 'ESP32-P4' }, { value: 'Android' }, { value: 'Feishu' }]} /></Form.Item><Form.Item label="语音输出"><Switch checked={preferences.voiceOutput} onChange={(checked) => setPreferences((current) => ({ ...current, voiceOutput: checked }))} /></Form.Item><Form.Item label="隐私模式"><Select value={preferences.privacyMode} onChange={(value) => setPreferences((current) => ({ ...current, privacyMode: value }))} options={[{ value: 'metadata_only', label: 'metadata_only' }, { value: 'balanced', label: 'balanced' }, { value: 'full_context', label: 'full_context' }]} /></Form.Item><Form.Item label="自动化激进程度"><Slider value={preferences.automationAggressiveness} onChange={(value) => setPreferences((current) => ({ ...current, automationAggressiveness: value }))} /></Form.Item><Form.Item label="摘要风格"><Select value={preferences.summaryStyle} onChange={(value) => setPreferences((current) => ({ ...current, summaryStyle: value }))} options={[{ value: 'concise' }, { value: 'standard' }, { value: 'detailed' }]} /></Form.Item><Form.Item label="语言"><Input value={preferences.preferredLanguage} onChange={(e) => setPreferences((current) => ({ ...current, preferredLanguage: e.target.value }))} /></Form.Item></Form></div></Card></Col>
+                <Col xs={24} xl={14}><Card title="偏好配置" className="glass-panel rounded-lg" extra={<Button type="primary" loading={savingPrefs} onClick={handleSavePreferences}>保存偏好</Button>}><div className="panel-scroll max-h-[560px] overflow-y-auto pr-1"><Form layout="vertical"><Form.Item label="首选通道"><Select value={preferences.preferredChannel} onChange={(value) => setPreferences((current) => ({ ...current, preferredChannel: value }))} options={[{ value: 'Web Console' }, { value: 'ESP32-P4' }, { value: 'Android' }, { value: 'Feishu' }]} /></Form.Item><Form.Item label="隐私模式"><Select value={preferences.privacyMode} onChange={(value) => setPreferences((current) => ({ ...current, privacyMode: value }))} options={[{ value: 'metadata_only', label: 'metadata_only' }, { value: 'balanced', label: 'balanced' }, { value: 'full_context', label: 'full_context' }]} /></Form.Item><Form.Item label="自动化激进程度"><Slider value={preferences.automationAggressiveness} onChange={(value) => setPreferences((current) => ({ ...current, automationAggressiveness: value }))} /></Form.Item><Form.Item label="摘要风格"><Select value={preferences.summaryStyle} onChange={(value) => setPreferences((current) => ({ ...current, summaryStyle: value }))} options={[{ value: 'concise' }, { value: 'standard' }, { value: 'detailed' }]} /></Form.Item><Form.Item label="语言"><Input value={preferences.preferredLanguage} onChange={(e) => setPreferences((current) => ({ ...current, preferredLanguage: e.target.value }))} /></Form.Item></Form></div></Card></Col>
                 <Col xs={24} xl={10}><Card title="当前偏好" className="glass-panel rounded-lg"><div className="rounded-lg border border-slate-200 p-4 text-sm text-slate-600"><div>当前用户：{session.username}</div><div>Role：{session.role}</div><div>Channel：{preferences.preferredChannel}</div><div>Privacy：{preferences.privacyMode}</div><div>Auto level：{preferences.automationAggressiveness}%</div><div>Summary：{preferences.summaryStyle}</div></div></Card></Col>
               </Row>}
             </Content>
@@ -842,9 +601,7 @@ function App() {
                 <Card size="small" title="连接状态" className="glass-panel rounded-lg">
                   <div className="grid gap-3 text-sm">
                     <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-3 py-2"><span className="text-slate-500">会话状态</span><Tag color={wsConnected ? 'green' : 'red'}>{wsConnected ? '已连接' : '未连接'}</Tag></div>
-                    <div className="flex items-center justify-between rounded border border-slate-200 bg-slate-50 px-3 py-2"><span className="text-slate-500">浏览器 STT</span><Tag color={sttSupported && sttSecureContext ? 'green' : sttSupported ? 'gold' : 'red'}>{sttSupported ? (sttSecureContext ? 'supported' : 'needs secure origin') : 'unsupported'}</Tag></div>
                     <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2"><div className="text-xs text-slate-500">最近网关事件</div><div className="mt-1 break-all text-sm text-slate-800">{payload.chatGateway?.lastError || payload.chatGateway?.lastEventAt || '暂无'}</div></div>
-                    <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2"><div className="text-xs text-slate-500">STT 状态</div><div className="mt-1 break-all text-sm text-slate-800">{sttStatusText}{sttInterimText ? ` / ${sttInterimText}` : ''}</div></div>
                     <div className="rounded border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">{canUseChat ? '当前账号允许通信' : 'viewer 账号只读'}</div>
                   </div>
                 </Card>
@@ -868,9 +625,6 @@ function App() {
                     </div>
                     <Space.Compact className="mt-4 w-full">
                       <Input value={chatInput} onChange={(e) => setChatInput(e.target.value)} onPressEnter={sendChatMessage} placeholder="输入一条要发给 ESP32 Agent 的消息" disabled={!canUseChat} />
-                      <Button onClick={() => (sttListening ? stopSpeechRecognition() : startSpeechRecognition(null))} disabled={!canUseChat || !sttSupported}>
-                        {sttListening ? '停止语音' : '语音输入'}
-                      </Button>
                       <Button type="primary" onClick={sendChatMessage} disabled={!canUseChat}>发送</Button>
                     </Space.Compact>
                   </div>

@@ -14,8 +14,6 @@
 #include "tools/tool_servo.h"
 #include "tools/tool_virtual_device.h"
 #include "device/device_registry.h"
-#include "voice/voice_bridge.h"
-#include "voice/local_tts.h"
 
 #include "cJSON.h"
 #include "driver/gpio.h"
@@ -1377,7 +1375,6 @@ static bool policy_is_control_action(const char *action)
             strcmp(action, "set_device_led") == 0 ||
             strcmp(action, "copper_gpio_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
-            strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
             strcmp(action, "control_emergency_stop") == 0);
@@ -1468,19 +1465,6 @@ static bool guardian_control_args_allowed(const char *action,
             allowed = false;
             snprintf(reason, reason_size,
                      "persistent relay control requires confirmed=true or bounded duration_ms");
-        }
-    }
-
-    if (allowed && strcmp(action, "tts_speak") == 0) {
-        const char *text = json_optional_string(args, "text");
-        if (!text[0]) {
-            allowed = false;
-            snprintf(reason, reason_size, "tts_speak requires args.text");
-        } else if (strlen(text) > 320) {
-            allowed = false;
-            snprintf(reason, reason_size, "tts_speak text is too long");
-        } else {
-            snprintf(reason, reason_size, "allowed local TTS playback on control_agent");
         }
     }
 
@@ -1993,16 +1977,6 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = tool_copper_gpio_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "gpio_write") == 0) {
         err = tool_gpio_write_execute(args, result, result_size);
-    } else if (strcmp(cmd->action, "tts_speak") == 0) {
-        cJSON *root = cJSON_Parse(args);
-        const char *text = json_optional_string(root, "text");
-        if (!text[0]) {
-            snprintf(result, result_size, "Error: tts_speak requires args.text");
-            err = ESP_ERR_INVALID_ARG;
-        } else {
-            err = espagent_voice_local_tts_speak(text, result, result_size);
-        }
-        cJSON_Delete(root);
     } else if (strcmp(cmd->action, "gree_ac_control") == 0) {
         err = tool_gree_ac_control_execute(args, result, result_size);
     } else {
@@ -2044,7 +2018,6 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
         strcmp(cmd->action, "set_device_led") != 0 &&
         strcmp(cmd->action, "copper_gpio_write") != 0 &&
         strcmp(cmd->action, "gpio_write") != 0 &&
-        strcmp(cmd->action, "tts_speak") != 0 &&
         strcmp(cmd->action, "gree_ac_control") != 0 &&
         strcmp(cmd->action, "control_state") != 0 &&
         strcmp(cmd->action, "control_emergency_stop") != 0 &&
@@ -2229,10 +2202,6 @@ static void mqtt_poll_inbound(int fd)
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST)) {
                 ESP_LOGI(TAG, "Web chat request received: %.*s", (int)msg_len, msg);
                 handle_web_chat_request(msg, msg_len);
-            } else if (espagent_voice_handle_mqtt_message((const char *)topic,
-                                                          topic_len,
-                                                          msg,
-                                                          msg_len)) {
             } else {
                 char nodes_state_filter[160] = {0};
                 char nodes_telemetry_filter[160] = {0};
@@ -2525,15 +2494,10 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 6);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT, 7);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 8);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_EVENTS, 9);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST, 10);
         } else if (espagent_role_is_control()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_REQUEST, 5);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 6);
         } else if (espagent_role_is_guardian()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_DISPATCH, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 4);
@@ -2546,8 +2510,6 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_CHECK, 6);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 7);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_STT_RESULT, 8);
-            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_VOICE_TTS_STATUS, 9);
         }
         if (espagent_role_runs_guardian() || espagent_role_is_coordinator()) {
             char nodes_state_filter[160] = {0};

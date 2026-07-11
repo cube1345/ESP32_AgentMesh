@@ -16,10 +16,6 @@ const TOPIC_PREFIX = (process.env.ESPAGENT_TOPIC_PREFIX || 'espagent/cube1345').
 const MQTT_URL = `${MQTT_PROTOCOL}://${MQTT_HOST}:${MQTT_PORT}`;
 const CHAT_REQUEST_TOPIC = `${TOPIC_PREFIX}/web/chat/request`;
 const CHAT_REPLY_TOPIC = `${TOPIC_PREFIX}/web/chat/reply`;
-const VOICE_TTS_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/tts/request`;
-const VOICE_TTS_STATUS_TOPIC = `${TOPIC_PREFIX}/voice/tts/status`;
-const VOICE_STT_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/stt/request`;
-const VOICE_STT_RESULT_TOPIC = `${TOPIC_PREFIX}/voice/stt/result`;
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
 const SKILLS_SERIAL_ENABLED = process.env.ESPAGENT_SKILLS_SERIAL_ENABLED !== '0';
 const SKILLS_SERIAL_PORT = process.env.ESPAGENT_SKILLS_SERIAL_PORT || '/dev/ttyUSB0';
@@ -33,9 +29,7 @@ const runtimeSkills = new Map();
 let runtimeSkillsCacheAt = 0;
 const chatSessions = new Map();
 const wsSessions = new Set();
-const pendingTtsRequests = new Map();
 const MAX_TIMELINE_EVENTS = 120;
-const MAX_PENDING_TTS = 32;
 
 function isHighValueTimelineEntry(entry) {
   const text = `${entry?.stage || ''} ${entry?.source || ''} ${entry?.target || ''} ${entry?.payload || ''}`.toLowerCase();
@@ -49,19 +43,6 @@ function isHighValueTimelineEntry(entry) {
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function prunePendingTtsRequests() {
-  if (pendingTtsRequests.size <= MAX_PENDING_TTS) {
-    return;
-  }
-  const entries = Array.from(pendingTtsRequests.entries()).sort((a, b) => {
-    return Number(a[1]?.ts_ms || 0) - Number(b[1]?.ts_ms || 0);
-  });
-  while (entries.length > MAX_PENDING_TTS) {
-    const [requestId] = entries.shift();
-    pendingTtsRequests.delete(requestId);
-  }
 }
 
 function normalizeNode(role, nodeId) {
@@ -448,7 +429,6 @@ function toDashboardPayload() {
     { name: 'mesh_send_command', category: '协同', role: 'coordinator_agent', maturity: '已验证', summary: '通过 MQTT Mesh 进行跨节点调度。' },
     { name: 'policy_check', category: '安全', role: 'guardian_agent', maturity: '已验证', summary: 'Guardian 对远程执行进行裁决与审计。' },
     { name: 'set_status_light', category: '控制', role: 'control_agent', maturity: '已验证', summary: '控制执行器状态并回传控制结果。' },
-    { name: 'voice_request_stt', category: '语音', role: 'coordinator_agent', maturity: '进行中', summary: '语音前端通过 MQTT 参与协作。' },
     { name: 'virtual_device_control', category: '扩展', role: 'control_agent', maturity: '进行中', summary: '通过 manifest 扩展硬件控制面。' }
   ];
 
@@ -466,7 +446,6 @@ function toDashboardPayload() {
 
   const preferences = {
     preferredChannel: 'Web Console',
-    voiceOutput: true,
     privacyMode: 'metadata_only',
     automationAggressiveness: 60,
     summaryStyle: 'concise',
@@ -591,57 +570,6 @@ function createChatSession(downstream) {
       return;
     }
 
-    if (payload.type === 'stt_result') {
-      const transcript = typeof payload.transcript === 'string' ? payload.transcript.trim() : '';
-      if (!transcript) {
-        sendWsJson(downstream, {
-          type: 'system',
-          content: 'stt_result 缺少 transcript。'
-        });
-        return;
-      }
-
-      const sttPayload = JSON.stringify({
-        schema: 'espagent.voice.stt_result.v1',
-        event: 'stt_result',
-        request_id: typeof payload.request_id === 'string' && payload.request_id.trim()
-          ? payload.request_id.trim()
-          : `web-stt-${Date.now()}`,
-        transcript,
-        status: typeof payload.status === 'string' ? payload.status : 'ok',
-        provider: typeof payload.provider === 'string' ? payload.provider : 'browser_webspeech',
-        reply_channel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'web',
-        reply_chat_id: typeof payload.reply_chat_id === 'string' && payload.reply_chat_id.trim()
-          ? payload.reply_chat_id.trim()
-          : (session.chatId || 'web_console_01'),
-        ts_ms: Date.now()
-      });
-      client.publish(VOICE_STT_RESULT_TOPIC, sttPayload, { qos: 0 }, (error) => {
-        if (error) {
-          noteChatGatewayEvent(error.message);
-          sendWsJson(downstream, {
-            type: 'system',
-            content: `STT 结果回传失败：${error.message}`
-          });
-          return;
-        }
-        noteChatGatewayEvent(null);
-        pushTimeline({
-          time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-          stage: 'stt_result',
-          source: 'dashboard_web',
-          target: 'coordinator_agent',
-          payload: transcript,
-          status: 'ok'
-        });
-        sendWsJson(downstream, {
-          type: 'system',
-          content: `STT 转写已回传：${transcript}`
-        });
-      });
-      return;
-    }
-
     sendWsJson(downstream, {
       type: 'system',
       content: `未知消息类型：${payload.type}`
@@ -734,11 +662,7 @@ client.on('connect', () => {
     `${TOPIC_PREFIX}/nodes/+/state`,
     `${TOPIC_PREFIX}/agent/timeline`,
     `${TOPIC_PREFIX}/guardian/stateboard`,
-    CHAT_REPLY_TOPIC,
-    VOICE_TTS_REQUEST_TOPIC,
-    VOICE_TTS_STATUS_TOPIC,
-    VOICE_STT_REQUEST_TOPIC,
-    VOICE_STT_RESULT_TOPIC
+    CHAT_REPLY_TOPIC
   ];
   client.subscribe(topics, (error) => {
     if (error) {
@@ -790,99 +714,6 @@ client.on('message', (topic, buffer) => {
     if (session?.downstream?.readyState === WebSocket.OPEN) {
       session.downstream.send(JSON.stringify(payload));
     }
-    return;
-  }
-  if (topic === VOICE_TTS_REQUEST_TOPIC) {
-    const requestId = typeof payload.request_id === 'string' ? payload.request_id : `tts-${Date.now()}`;
-    const textValue = typeof payload.text === 'string' ? payload.text.trim() : '';
-    if (textValue) {
-      pendingTtsRequests.set(requestId, {
-        text: textValue,
-        chat_id: typeof payload.chat_id === 'string' ? payload.chat_id : '',
-        source_channel: typeof payload.source_channel === 'string' ? payload.source_channel : '',
-        device_id: typeof payload.device_id === 'string' ? payload.device_id : '',
-        ts_ms: Number(payload.ts_ms || Date.now())
-      });
-      prunePendingTtsRequests();
-    }
-    pushTimeline({
-      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
-      stage: 'tts_request',
-      source: payload.node_id || payload.role || 'coordinator_agent',
-      target: payload.device_id || 'voice_output',
-      payload: textValue || '(empty tts text)',
-      status: 'queued'
-    });
-    return;
-  }
-  if (topic === VOICE_TTS_STATUS_TOPIC) {
-    const status = typeof payload.status === 'string' ? payload.status : 'unknown';
-    const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
-    const detail = typeof payload.detail === 'string' ? payload.detail : '';
-    pushTimeline({
-      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
-      stage: 'tts_status',
-      source: payload.node_id || payload.role || 'control_agent',
-      target: payload.device_id || 'voice_output',
-      payload: detail || status,
-      status: status === 'error' ? 'warn' : 'ok'
-    });
-
-    const pending = requestId ? pendingTtsRequests.get(requestId) : null;
-    if (status === 'error' && pending?.text) {
-      const fallbackPayload = {
-        type: 'tts_fallback',
-        request_id: requestId,
-        text: pending.text,
-        detail,
-        source_channel: pending.source_channel || 'voice',
-        chat_id: pending.chat_id || ''
-      };
-      const targetSession = pending.chat_id ? chatSessions.get(pending.chat_id) : null;
-      if (targetSession?.downstream?.readyState === WebSocket.OPEN) {
-        sendWsJson(targetSession.downstream, fallbackPayload);
-      } else {
-        for (const session of wsSessions) {
-          sendWsJson(session.downstream, fallbackPayload);
-        }
-      }
-    }
-    if (requestId) {
-      pendingTtsRequests.delete(requestId);
-    }
-    return;
-  }
-  if (topic === VOICE_STT_REQUEST_TOPIC) {
-    const request = {
-      type: 'stt_request',
-      request_id: typeof payload.request_id === 'string' ? payload.request_id : `stt-${Date.now()}`,
-      reply_channel: typeof payload.reply_channel === 'string' ? payload.reply_channel : 'web',
-      reply_chat_id: typeof payload.reply_chat_id === 'string' ? payload.reply_chat_id : 'web_console_01',
-      hint_text: typeof payload.hint_text === 'string' ? payload.hint_text : '',
-      auto_route_reply: payload.auto_route_reply !== false
-    };
-    for (const session of wsSessions) {
-      sendWsJson(session.downstream, request);
-    }
-    pushTimeline({
-      time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
-      stage: 'stt_request',
-      source: payload.node_id || payload.role || 'coordinator_agent',
-      target: 'dashboard_web',
-      payload: request.hint_text || '语音转写请求',
-      status: 'queued'
-    });
-    return;
-  }
-  if (topic === VOICE_STT_RESULT_TOPIC) {
-    pushTimeline({
-      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
-      stage: 'stt_result',
-      source: payload.provider || 'voice_frontend',
-      target: payload.reply_chat_id || 'agent_loop',
-      payload: payload.transcript || '(empty transcript)',
-      status: payload.status === 'error' ? 'warn' : 'ok'
-    });
     return;
   }
   if (topic.endsWith('/stateboard')) {

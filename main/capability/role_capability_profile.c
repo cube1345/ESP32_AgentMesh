@@ -59,9 +59,6 @@ static bool is_coordinator_tool(const espagent_capability_descriptor_t *cap)
            is_name(cap, "web_search") ||
            is_name(cap, "get_weather") ||
            is_name(cap, "get_current_time") ||
-           is_name(cap, "voice_status") ||
-           is_name(cap, "voice_request_tts") ||
-           is_name(cap, "voice_request_stt") ||
            is_name(cap, "mesh_send_command") ||
            is_name(cap, "spawn_subagent") ||
            is_name(cap, "cron_add") ||

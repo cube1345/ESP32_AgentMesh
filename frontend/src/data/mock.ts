@@ -52,8 +52,8 @@ const nodes: AgentNode[] = [
     transport: ['Wi-Fi', 'MQTT', 'Touch UI'],
     status: 'online',
     location: 'display frontend',
-    responsibilities: ['调度可视化', '语音前端', '本地交互'],
-    surfaces: ['屏幕 UI', '语音输入输出', '状态大盘']
+    responsibilities: ['调度可视化', '本地交互', '状态展示'],
+    surfaces: ['屏幕 UI', '状态大盘']
   }
 ];
 
@@ -65,7 +65,6 @@ const capabilities: Capability[] = [
   { name: 'set_status_light', category: '控制', role: 'control_agent', maturity: '已验证', summary: '控制 WS2812 状态灯或 RGB 指示行为。' },
   { name: 'servo_write', category: '控制', role: 'control_agent', maturity: '已验证', summary: '通过 PWM 驱动舵机执行角度控制。' },
   { name: 'gree_ac_control', category: '控制', role: 'control_agent', maturity: '已验证', summary: '格力空调 IR 发射控制，支持常用模式和温度调整。' },
-  { name: 'voice_request_stt', category: '语音', role: 'coordinator_agent', maturity: '进行中', summary: '向 ESP32-P4 或 Android 前端发起录音与 STT 请求。' },
   { name: 'policy_check', category: '安全', role: 'guardian_agent', maturity: '已验证', summary: '对远程控制请求进行风险判定与审计。' },
   { name: 'lua_run_script', category: '扩展', role: 'coordinator_agent', maturity: '已验证', summary: '通过受限 Lua 运行时扩展板端能力。' },
   { name: 'virtual_device_control', category: '扩展', role: 'control_agent', maturity: '进行中', summary: '以 manifest 驱动受控设备，统一权限与 cooldown。' },
@@ -95,11 +94,11 @@ const environment: EnvironmentMetric[] = [
 const skills: SkillDraft[] = [
   {
     id: 'skill-1',
-    name: '环境告警播报',
+    name: '环境告警联动',
     scope: 'coordinator + display',
     trigger: '空气质量恶化或 Guardian 发出 warn',
-    policy: '仅播报摘要，不回放隐私原文',
-    prompt: '当 eCO2 超过 900ppm 或 TVOC 超过 120ppb 时，向 display 发送 TTS 摘要，并要求 control 节点闪烁黄色状态灯 5 秒。',
+    policy: '仅发送结构化事件，不暴露隐私原文',
+    prompt: '当 eCO2 超过 900ppm 或 TVOC 超过 120ppb 时，向 control 节点发送黄色状态灯闪烁 5 秒的控制请求，并在 Timeline 记录摘要。',
     enabled: true
   },
   {
@@ -124,7 +123,6 @@ const skills: SkillDraft[] = [
 
 const preferences: UserPreferenceProfile = {
   preferredChannel: 'Web Console',
-  voiceOutput: true,
   privacyMode: 'metadata_only',
   automationAggressiveness: 62,
   summaryStyle: 'concise',
@@ -148,7 +146,7 @@ const flows: MeshMessageFlow[] = [
     producer: 'coordinator_agent',
     consumer: 'tool_registry',
     topic: 'tool_use',
-    detail: '根据上下文与 skills 选择环境读取、Mesh 调度、自动化或语音工具。'
+    detail: '根据上下文与 skills 选择环境读取、Mesh 调度或自动化工具。'
   },
   {
     id: 'flow-3',

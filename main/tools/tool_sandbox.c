@@ -79,9 +79,6 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"servo_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gree_ac_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"max98357_play_tone", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL},
-    {"voice_status", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
-    {"voice_request_tts", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
-    {"voice_request_stt", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"mesh_send_command", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_MESH},
     {"automation_create_workflow", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_AUTOMATION | TOOL_CAP_MESH},
     {"automation_create_rule", ESPAGENT_TOOL_RISK_HIGH_CONTROL, TOOL_CAP_AUTOMATION | TOOL_CAP_MESH},
@@ -272,7 +269,6 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "servo_write") != 0 &&
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
-        strcmp(action, "tts_speak") != 0 &&
         strcmp(action, "virtual_device_control") != 0 &&
         strcmp(action, "gree_ac_control") != 0 &&
         strcmp(action, "control_state") != 0 &&

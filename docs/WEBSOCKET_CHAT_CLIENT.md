@@ -38,10 +38,9 @@
 2. 在电脑上直接打开 `assets/ws-chat-client/index.html`。
 3. 填入 ESP32 的 IP，默认端口 `18789`。
 4. 点击“连接 ESP32”。
-5. 输入文本并发送，或使用浏览器语音输入。
+5. 输入文本并发送。
 
 ## 说明
 
 - 这个页面是纯 HTML、CSS、JavaScript，不依赖任何前端框架。
-- 语音输入依赖浏览器的 Web Speech API；如果浏览器不支持，仍然可以正常使用文本输入。
 - 页面不会帮你配置 WiFi；WiFi 配置仍使用当前仓库已有的 onboarding / admin portal。

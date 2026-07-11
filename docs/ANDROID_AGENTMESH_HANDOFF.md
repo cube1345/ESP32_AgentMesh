@@ -441,8 +441,7 @@ Settings：
 - 加节点拓扑图：Coordinator -> Guardian -> Sensor/Control。
 - 加告警规则：传感器异常、节点长时间离线、命令超时。
 - 加 Android 端主动控制入口，但必须经过 Guardian 确认和权限分级。
-- 加语音入口：Android STT -> 发送给 Coordinator/WebSocket/Feishu-like channel。
-- 加 TTS 播报最终结果和重要告警。
+- Android 端保持文本、卡片和状态展示入口，暂不接入语音输入输出链路。
 
 ## 给实现 AI 的任务 Prompt
 
