@@ -27,6 +27,7 @@
 #include "events/espagent_event.h"
 #include "memory/memory_v2.h"
 #include "roles/role_config.h"
+#include "sensors/sensor_mqtt.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -42,6 +43,25 @@ static int s_tool_count = 0;
 static char *s_tools_json = NULL;
 static char *s_tools_json_compact_coordinator = NULL;
 static char *s_tools_json_mesh_only = NULL;
+
+static void publish_sandbox_denial_observability(const char *name,
+                                                 esp_err_t sandbox_err,
+                                                 const char *sandbox_reason)
+{
+    char summary[192] = {0};
+    snprintf(summary, sizeof(summary), "%s blocked by sandbox",
+             name && name[0] ? name : "tool");
+    (void)sensor_mqtt_publish_output_message("sandbox_denied",
+                                             NULL,
+                                             NULL,
+                                             name,
+                                             "local_client",
+                                             sandbox_err,
+                                             summary,
+                                             sandbox_reason && sandbox_reason[0]
+                                                 ? sandbox_reason
+                                                 : "sandbox denied tool call");
+}
 
 static bool json_has_key(cJSON *root, const char *key)
 {
@@ -273,6 +293,38 @@ static esp_err_t tool_gpio_write_routed_execute(const char *input_json,
 {
     return coordinator_control_or_local("gpio_write", input_json, output, output_size,
                                         tool_gpio_write_execute);
+}
+
+static esp_err_t tool_copper_gpio_write_routed_execute(const char *input_json,
+                                                       char *output,
+                                                       size_t output_size)
+{
+    return coordinator_control_or_local("copper_gpio_write", input_json, output, output_size,
+                                        tool_copper_gpio_write_execute);
+}
+
+static esp_err_t tool_set_humidifier_routed_execute(const char *input_json,
+                                                    char *output,
+                                                    size_t output_size)
+{
+    return coordinator_control_or_local("set_humidifier", input_json, output, output_size,
+                                        tool_set_humidifier_execute);
+}
+
+static esp_err_t tool_set_fan_routed_execute(const char *input_json,
+                                             char *output,
+                                             size_t output_size)
+{
+    return coordinator_control_or_local("set_fan", input_json, output, output_size,
+                                        tool_set_fan_execute);
+}
+
+static esp_err_t tool_set_device_led_routed_execute(const char *input_json,
+                                                    char *output,
+                                                    size_t output_size)
+{
+    return coordinator_control_or_local("set_device_led", input_json, output, output_size,
+                                        tool_set_device_led_execute);
 }
 
 static esp_err_t tool_ws2812_set_routed_execute(const char *input_json,
@@ -652,7 +704,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\",\"tts_speak\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"tts_speak\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -705,7 +757,7 @@ esp_err_t tool_registry_init(void)
             "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
             "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh action\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
             "\"required\":[\"action\"]}}},"
@@ -727,9 +779,9 @@ esp_err_t tool_registry_init(void)
             "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this persistent automation rule\"},"
             "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
             "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
             "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"servo_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
             "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
         .execute = tool_automation_create_rule_execute,
     });
@@ -910,6 +962,59 @@ esp_err_t tool_registry_init(void)
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
             "\"required\":[\"pin\",\"state\"]}",
         .execute = tool_gpio_write_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "copper_gpio_write",
+        .description = "Set one of the dedicated copper-fill GPIO pads on the third/control role high or low. Use this when the user explicitly asks GPIO4, GPIO5, or GPIO6 to be pulled high or pulled low. This tool only accepts pins 4, 5, and 6; each pin may have a different external meaning in the hardware wiring. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"pin\":{\"type\":\"integer\",\"enum\":[4,5,6],\"description\":\"Dedicated copper GPIO pad number\"},"
+            "\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for LOW/pull down, 1 for HIGH/pull up\"},"
+            "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
+            "\"value\":{\"type\":\"string\",\"enum\":[\"high\",\"low\",\"on\",\"off\",\"拉高\",\"拉低\"],\"description\":\"Optional natural-language level alias\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[\"pin\"]}",
+        .execute = tool_copper_gpio_write_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "set_humidifier",
+        .description = "Turn the humidifier on or off. The humidifier is wired to GPIO4 on the third/control role; HIGH turns it on and LOW turns it off. Prefer this over generic GPIO tools when the user says humidifier, 加湿器, or humidification. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
+            "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
+            "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language on/off alias\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[]}",
+        .execute = tool_set_humidifier_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "set_fan",
+        .description = "Turn the fan on or off. The fan is wired to GPIO5 on the third/control role; HIGH turns it on and LOW turns it off. Prefer this over generic GPIO tools when the user says fan, 风扇, ventilation, or airflow. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
+            "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
+            "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language on/off alias\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[]}",
+        .execute = tool_set_fan_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "set_device_led",
+        .description = "Turn the discrete device LED on GPIO6 on or off. This is not the WS2812 status light; HIGH turns the GPIO6 LED on and LOW turns it off. Prefer this when the user asks for GPIO6 LED, ordinary LED, 单色LED, or 独立LED. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
+            "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
+            "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language on/off alias\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[]}",
+        .execute = tool_set_device_led_routed_execute,
     });
 
     register_tool(&(espagent_tool_t){
@@ -1136,6 +1241,14 @@ esp_err_t tool_registry_execute_as(const char *name,
                 ESP_LOGW(TAG, "Sandbox blocked tool %s: %s", name, sandbox_reason);
                 snprintf(output, output_size, "Error: %s",
                          sandbox_reason[0] ? sandbox_reason : "sandbox denied tool call");
+                publish_sandbox_denial_observability(name, sandbox_err,
+                                                     sandbox_reason);
+                espagent_event_emit_simple("capability.error",
+                                           "tool_registry",
+                                           "",
+                                           "",
+                                           name,
+                                           output ? output : "");
                 return sandbox_err;
             }
             ESP_LOGI(TAG, "Executing tool: %s", name);

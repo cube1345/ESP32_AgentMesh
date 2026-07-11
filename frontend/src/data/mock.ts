@@ -77,6 +77,7 @@ const timeline: TimelineEvent[] = [
   { time: '09:14:03', stage: 'reasoning', source: 'coordinator_agent', target: 'tool_registry', payload: '选择 read_environment + automation_create_rule', status: 'ok' },
   { time: '09:14:04', stage: 'policy_check', source: 'coordinator_agent', target: 'guardian_agent', payload: '请求执行规则: humidity > 60 -> set_status_light orange', status: 'queued' },
   { time: '09:14:04', stage: 'policy_decision', source: 'guardian_agent', target: 'control_agent', payload: 'allow, risk_score=0.32, privacy_mode=metadata_only', status: 'ok' },
+  { time: '09:14:04', stage: 'sandbox_denied', source: 'tool_registry', target: 'write_file', payload: 'sandbox denied write_file: skill changes require explicit confirmed=true', status: 'warn' },
   { time: '09:14:05', stage: 'telemetry_publish', source: 'sensor_agent', target: 'MQTT Mesh', payload: 'temp=27.4C humidity=64.2% tvoc=21ppb lux=185', status: 'ok' },
   { time: '09:14:06', stage: 'actuation', source: 'control_agent', target: 'WS2812', payload: 'set_status_light(color=orange)', status: 'ok' },
   { time: '09:14:06', stage: 'visual_sync', source: 'MQTT Mesh', target: 'ESP32-P4/Android', payload: 'timeline + control_state + telemetry update', status: 'ok' }

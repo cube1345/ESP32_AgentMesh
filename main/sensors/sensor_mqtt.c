@@ -1372,6 +1372,10 @@ static bool policy_is_control_action(const char *action)
             strcmp(action, "ws2812_set") == 0 ||
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
+            strcmp(action, "set_humidifier") == 0 ||
+            strcmp(action, "set_fan") == 0 ||
+            strcmp(action, "set_device_led") == 0 ||
+            strcmp(action, "copper_gpio_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
             strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
@@ -1979,6 +1983,14 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = tool_virtual_device_control_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "servo_write") == 0) {
         err = tool_servo_write_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "set_humidifier") == 0) {
+        err = tool_set_humidifier_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "set_fan") == 0) {
+        err = tool_set_fan_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "set_device_led") == 0) {
+        err = tool_set_device_led_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "copper_gpio_write") == 0) {
+        err = tool_copper_gpio_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "gpio_write") == 0) {
         err = tool_gpio_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "tts_speak") == 0) {
@@ -2027,6 +2039,10 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
         strcmp(cmd->action, "ws2812_set") != 0 &&
         strcmp(cmd->action, "virtual_device_control") != 0 &&
         strcmp(cmd->action, "servo_write") != 0 &&
+        strcmp(cmd->action, "set_humidifier") != 0 &&
+        strcmp(cmd->action, "set_fan") != 0 &&
+        strcmp(cmd->action, "set_device_led") != 0 &&
+        strcmp(cmd->action, "copper_gpio_write") != 0 &&
         strcmp(cmd->action, "gpio_write") != 0 &&
         strcmp(cmd->action, "tts_speak") != 0 &&
         strcmp(cmd->action, "gree_ac_control") != 0 &&

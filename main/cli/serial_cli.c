@@ -1095,6 +1095,36 @@ static int cmd_tool_exec(int argc, char **argv)
     return (err == ESP_OK) ? 0 : 1;
 }
 
+static int cmd_workflow_light_smoke(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+
+    static const char payload[] =
+        "{\"name\":\"blue_yellow_white_timer_test\","
+        "\"steps\":["
+        "{\"delay_ms\":0,\"target_role\":\"control_agent\",\"action\":\"set_status_light\",\"args\":{\"color\":\"blue\"}},"
+        "{\"delay_ms\":10000,\"target_role\":\"control_agent\",\"action\":\"set_status_light\",\"args\":{\"color\":\"yellow\"}},"
+        "{\"delay_ms\":5000,\"target_role\":\"control_agent\",\"action\":\"set_status_light\",\"args\":{\"color\":\"white\"}}"
+        "]}";
+
+    char *output = calloc(1, 4096);
+    if (!output) {
+        printf("Out of memory.\n");
+        return 1;
+    }
+
+    esp_err_t err = tool_registry_execute_as("automation_create_workflow",
+                                             payload,
+                                             ESPAGENT_CAP_CALLER_CLI,
+                                             output,
+                                             4096);
+    printf("workflow_light_smoke status: %s\n", esp_err_to_name(err));
+    printf("%s\n", output[0] ? output : "(empty)");
+    free(output);
+    return (err == ESP_OK) ? 0 : 1;
+}
+
 static int cmd_inject_msg(int argc, char **argv)
 {
     if (argc < 4) {
@@ -1988,6 +2018,14 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_tool_exec,
     };
     esp_console_cmd_register(&tool_exec_cmd);
+
+    /* workflow_light_smoke */
+    esp_console_cmd_t workflow_light_smoke_cmd = {
+        .command = "workflow_light_smoke",
+        .help = "Smoke test automation workflow: blue, then yellow after 10s, then white after 5s",
+        .func = &cmd_workflow_light_smoke,
+    };
+    esp_console_cmd_register(&workflow_light_smoke_cmd);
 
     /* inject_msg */
     esp_console_cmd_t inject_msg_cmd = {

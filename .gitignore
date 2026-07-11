@@ -35,6 +35,12 @@ espagent_secrets.h
 # Environment
 .env
 main/espagent_secrets.h
+frontend/.cert/
+frontend/certs/*.crt
+frontend/certs/*.key
+frontend/certs/*.pem
+frontend/certs/*.csr
+frontend/certs/*.srl
 
 # Cache / Compiled
 .cache

@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:https": "ESPAGENT_HTTPS_KEY=./certs/espagent-lan.key ESPAGENT_HTTPS_CERT=./certs/espagent-lan.crt vite",
     "server": "node server/index.mjs",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "preview:https": "ESPAGENT_HTTPS_KEY=./certs/espagent-lan.key ESPAGENT_HTTPS_CERT=./certs/espagent-lan.crt vite preview"
   },
   "dependencies": {
     "@ant-design/icons": "^5.6.1",

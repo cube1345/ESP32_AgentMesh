@@ -191,6 +191,10 @@ static void build_mesh_async_user_reply(const mesh_wait_task_ctx_t *ctx,
          strcmp(action, "ws2812_set") == 0 ||
          strcmp(action, "virtual_device_control") == 0 ||
          strcmp(action, "servo_write") == 0 ||
+         strcmp(action, "set_humidifier") == 0 ||
+         strcmp(action, "set_fan") == 0 ||
+         strcmp(action, "set_device_led") == 0 ||
+         strcmp(action, "copper_gpio_write") == 0 ||
          strcmp(action, "gpio_write") == 0)) {
         verb = "已执行";
     }
@@ -215,6 +219,10 @@ static bool is_control_action(const char *action)
             strcmp(action, "ws2812_set") == 0 ||
             strcmp(action, "virtual_device_control") == 0 ||
             strcmp(action, "servo_write") == 0 ||
+            strcmp(action, "set_humidifier") == 0 ||
+            strcmp(action, "set_fan") == 0 ||
+            strcmp(action, "set_device_led") == 0 ||
+            strcmp(action, "copper_gpio_write") == 0 ||
             strcmp(action, "gpio_write") == 0 ||
             strcmp(action, "tts_speak") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||

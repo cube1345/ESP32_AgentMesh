@@ -63,7 +63,10 @@ static const char *legacy_family_for_tool(const char *name)
         streq(name, "virtual_device_read") || streq(name, "hc_sr05_read_distance")) {
         return "sensor";
     }
-    if (streq(name, "gpio_write") || streq(name, "ws2812_set") ||
+    if (streq(name, "gpio_write") || streq(name, "copper_gpio_write") ||
+        streq(name, "set_humidifier") || streq(name, "set_fan") ||
+        streq(name, "set_device_led") ||
+        streq(name, "ws2812_set") ||
         streq(name, "set_status_light") || streq(name, "servo_write") ||
         streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
         streq(name, "virtual_device_control")) {
@@ -87,7 +90,10 @@ static espagent_capability_risk_t legacy_risk_for_tool(const char *name)
         streq(name, "lua_run_source") || streq(name, "lua_stop_job")) {
         return ESPAGENT_CAP_RISK_SYSTEM;
     }
-    if (streq(name, "gpio_write") || streq(name, "ws2812_set") ||
+    if (streq(name, "gpio_write") || streq(name, "copper_gpio_write") ||
+        streq(name, "set_humidifier") || streq(name, "set_fan") ||
+        streq(name, "set_device_led") ||
+        streq(name, "ws2812_set") ||
         streq(name, "set_status_light") || streq(name, "servo_write") ||
         streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
         streq(name, "virtual_device_control") ||

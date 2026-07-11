@@ -592,7 +592,11 @@ esp_err_t espagent_app_start_network_services(void)
 
     if (espagent_role_runs_scheduler()) {
         if (espagent_role_is_coordinator()) {
-            ESP_LOGI(TAG, "Coordinator background scheduler tasks deferred to preserve Feishu/LLM memory headroom");
+            esp_err_t automation_err = automation_engine_start();
+            if (automation_err != ESP_OK) {
+                ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
+            }
+            ESP_LOGI(TAG, "Coordinator cron/heartbeat/proactive tasks deferred to preserve Feishu/LLM memory headroom");
         } else {
             esp_err_t automation_err = automation_engine_start();
             if (automation_err != ESP_OK) {

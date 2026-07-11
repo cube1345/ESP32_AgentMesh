@@ -38,6 +38,13 @@ static bool message_prefers_direct_reply_no_tools(const char *message);
 static size_t append_prompt_format(char *prompt, size_t size, const char *fmt,
                                    ...);
 static bool message_requests_light_turn_on_without_color(const char *message);
+static bool message_explicitly_requests_subagent(const char *message);
+static bool extract_explicit_subagent_task(const char *message,
+                                           char *out,
+                                           size_t out_size);
+static const char *find_substr_ci_ascii(const char *haystack,
+                                        const char *needle);
+static bool starts_with_ci_ascii(const char *text, const char *prefix);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -450,6 +457,32 @@ static bool tool_guard_match_gpio_write_request(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+static bool tool_guard_match_copper_gpio_write_request(const char *message) {
+  return tool_guard_match_gpio_write_request(message) &&
+         (contains_substr_ci(message, "gpio4") ||
+          contains_substr_ci(message, "gpio 4") ||
+          contains_substr_ci(message, "io4") ||
+          contains_substr_ci(message, "io 4") ||
+          contains_substr_ci(message, "gpio5") ||
+          contains_substr_ci(message, "gpio 5") ||
+          contains_substr_ci(message, "io5") ||
+          contains_substr_ci(message, "io 5") ||
+          contains_substr_ci(message, "gpio6") ||
+          contains_substr_ci(message, "gpio 6") ||
+          contains_substr_ci(message, "io6") ||
+          contains_substr_ci(message, "io 6"));
+}
+
+static bool tool_guard_match_fixed_gpio_device_request(const char *message) {
+  static const char *const keywords[] = {
+      "humidifier", "fan", "device led", "gpio6 led", "加湿器",
+      "风扇",      "普通led", "单色led",    "独立led",   "gpio6灯",
+      "gpio 6灯",  "gpio6 led",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
 static bool tool_guard_match_gpio_read_request(const char *message) {
   static const char *const keywords[] = {
       "gpio",     "pin",   "io",    "read pin", "button", "switch",
@@ -467,6 +500,19 @@ static bool tool_guard_match_cron_request(const char *message) {
       "定时任务", "稍后",     "每隔",      "到点",  "每天",     "每日",
       "早上",     "上午",     "中午",      "晚上",  "主动",     "关心",
       "问候",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_has_condition_rule_marker(const char *message) {
+  static const char *const keywords[] = {
+      "if",       "when",     "otherwise", "above", "below",
+      "greater",  "less",     "threshold", "rule",  "condition",
+      "monitor",  "条件",     "规则",      "如果",  "当",
+      "否则",     "反之",     "大于",      "小于",  "高于",  "低于",
+      "超过",     "不超过",   "阈值",      "监测",  "监听",
+      "持续",     "温度大于", "温度小于",
   };
   return message_has_any_keyword(message, keywords,
                                  sizeof(keywords) / sizeof(keywords[0]));
@@ -702,6 +748,130 @@ static bool message_has_local_marker(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+static bool message_explicitly_requests_subagent(const char *message) {
+  static const char *const intent_keywords[] = {
+      "spawn_subagent", "/subagent", "subagent", "子代理",
+  };
+  static const char *const action_keywords[] = {
+      "请调用", "调用", "使用", "启动", "运行", "交给", "委托", "让",
+      "call", "use", "spawn", "delegate", "run",
+  };
+
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  if (!message_has_any_keyword(message, intent_keywords,
+                               sizeof(intent_keywords) /
+                                   sizeof(intent_keywords[0]))) {
+    return false;
+  }
+
+  return message_has_any_keyword(message, action_keywords,
+                                 sizeof(action_keywords) /
+                                     sizeof(action_keywords[0]));
+}
+
+static const char *trim_inline_separators(const char *text) {
+  if (!text) {
+    return NULL;
+  }
+  while (*text) {
+    if (!isspace((unsigned char)*text) && *text != ':' && *text != ',' &&
+        *text != ';') {
+      break;
+    }
+    text++;
+  }
+  return text;
+}
+
+static bool extract_explicit_subagent_task(const char *message,
+                                           char *out,
+                                           size_t out_size) {
+  static const char *const prefixes[] = {
+      "让子代理",        "让 subagent",       "让 spawn_subagent",
+      "请让子代理",      "请让 subagent",     "请子代理",
+      "子代理",          "subagent",         "spawn_subagent",
+      "由子代理",        "由 subagent",      "通过子代理",
+      "通过 subagent",   "使用子代理",       "使用 subagent",
+      "调用子代理",      "调用 subagent",     "调用 spawn_subagent",
+  };
+
+  if (!message || !out || out_size == 0) {
+    return false;
+  }
+  out[0] = '\0';
+
+  const char *scan = message;
+  const char *prefix_sep = strstr(message, ": ");
+  if (prefix_sep && (prefix_sep - message) < 48) {
+    bool prefix_like = true;
+    for (const char *p = message; p < prefix_sep; p++) {
+      if (!(isalnum((unsigned char)*p) || *p == '-' || *p == '_')) {
+        prefix_like = false;
+        break;
+      }
+    }
+    if (prefix_like) {
+      scan = prefix_sep + 2;
+    }
+  }
+
+  const char *mentions[] = {
+      strstr(scan, "spawn_subagent"),
+      strstr(scan, "/subagent"),
+      strstr(scan, "subagent"),
+      strstr(scan, "子代理"),
+  };
+  const char *mention = NULL;
+  for (size_t i = 0; i < sizeof(mentions) / sizeof(mentions[0]); i++) {
+    if (mentions[i] && (!mention || mentions[i] < mention)) {
+      mention = mentions[i];
+    }
+  }
+
+  if (mention) {
+    const char *cursor = mention;
+    while (*cursor) {
+      if (*cursor == ',' || *cursor == ':' || *cursor == ';') {
+        scan = cursor + 1;
+        break;
+      }
+      if ((unsigned char)*cursor == 0xEF &&
+          (unsigned char)cursor[1] == 0xBC &&
+          ((unsigned char)cursor[2] == 0x8C ||
+           (unsigned char)cursor[2] == 0x9A ||
+           (unsigned char)cursor[2] == 0x9B)) {
+        scan = cursor + 3;
+        break;
+      }
+      cursor++;
+    }
+  }
+
+  scan = trim_inline_separators(scan);
+  if (!scan || scan[0] == '\0') {
+    scan = message;
+  }
+
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    size_t len = strlen(prefixes[i]);
+    if (contains_substr_ci(scan, prefixes[i]) && starts_with_ci_ascii(scan, prefixes[i])) {
+      scan += len;
+      scan = trim_inline_separators(scan);
+      break;
+    }
+  }
+
+  if (!scan || scan[0] == '\0') {
+    scan = message;
+  }
+
+  snprintf(out, out_size, "%s", scan);
+  return out[0] != '\0';
+}
+
 static const char *detect_status_light_color(const char *message) {
   if (!message) {
     return NULL;
@@ -895,6 +1065,224 @@ static bool message_has_sequence_marker(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+typedef enum {
+  FIXED_DEVICE_NONE = 0,
+  FIXED_DEVICE_HUMIDIFIER,
+  FIXED_DEVICE_FAN,
+  FIXED_DEVICE_LED,
+} fixed_gpio_device_t;
+
+static fixed_gpio_device_t detect_fixed_gpio_device(const char *message) {
+  if (!message) {
+    return FIXED_DEVICE_NONE;
+  }
+  if (contains_substr_ci(message, "humidifier") ||
+      contains_substr_ci(message, "加湿器")) {
+    return FIXED_DEVICE_HUMIDIFIER;
+  }
+  if (contains_substr_ci(message, "fan") ||
+      contains_substr_ci(message, "风扇")) {
+    return FIXED_DEVICE_FAN;
+  }
+  if (contains_substr_ci(message, "device led") ||
+      contains_substr_ci(message, "gpio6 led") ||
+      contains_substr_ci(message, "gpio6灯") ||
+      contains_substr_ci(message, "gpio 6灯") ||
+      contains_substr_ci(message, "普通led") ||
+      contains_substr_ci(message, "单色led") ||
+      contains_substr_ci(message, "独立led")) {
+    return FIXED_DEVICE_LED;
+  }
+  return FIXED_DEVICE_NONE;
+}
+
+static const char *fixed_gpio_device_action(fixed_gpio_device_t device) {
+  switch (device) {
+  case FIXED_DEVICE_HUMIDIFIER:
+    return "set_humidifier";
+  case FIXED_DEVICE_FAN:
+    return "set_fan";
+  case FIXED_DEVICE_LED:
+    return "set_device_led";
+  default:
+    return "";
+  }
+}
+
+static const char *fixed_gpio_device_label_zh(fixed_gpio_device_t device) {
+  switch (device) {
+  case FIXED_DEVICE_HUMIDIFIER:
+    return "加湿器";
+  case FIXED_DEVICE_FAN:
+    return "风扇";
+  case FIXED_DEVICE_LED:
+    return "GPIO6 独立 LED";
+  default:
+    return "设备";
+  }
+}
+
+static bool message_requests_on_then_off(const char *message) {
+  if (!message) {
+    return false;
+  }
+  const bool has_on =
+      contains_substr_ci(message, "turn on") ||
+      contains_substr_ci(message, "open") ||
+      contains_substr_ci(message, "enable") ||
+      contains_substr_ci(message, "打开") ||
+      contains_substr_ci(message, "开启") ||
+      contains_substr_ci(message, "拉高");
+  const bool has_off =
+      contains_substr_ci(message, "turn off") ||
+      contains_substr_ci(message, "close") ||
+      contains_substr_ci(message, "disable") ||
+      contains_substr_ci(message, "关闭") ||
+      contains_substr_ci(message, "关掉") ||
+      contains_substr_ci(message, "拉低");
+  return has_on && has_off && message_has_sequence_marker(message);
+}
+
+static bool message_requests_task_removal(const char *message) {
+  static const char *const keywords[] = {
+      "remove",       "delete",       "cancel",      "disable",
+      "stop",         "clear",        "invalidate",  "invalid",
+      "失效",         "取消",         "删除",        "清除",
+      "移除",         "停止",         "停用",        "禁用",
+      "不要执行",     "不再执行",     "作废",        "关闭任务",
+      "删掉",         "去掉",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_requests_task_list(const char *message) {
+  static const char *const keywords[] = {
+      "list", "show", "inspect", "current", "列出", "查看", "当前",
+      "有哪些", "任务列表", "规则列表", "定时列表",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_mentions_managed_task(const char *message) {
+  static const char *const keywords[] = {
+      "task",       "job-",      "cron",      "schedule",
+      "rule-",      "wf-",       "workflow",  "rule",
+      "任务",       "定时任务",  "计划任务",  "规则任务",
+      "规则",       "条件规则",  "工作流",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool is_hex_ascii_token(const char *text, size_t len) {
+  if (!text || len == 0) {
+    return false;
+  }
+  for (size_t i = 0; i < len; i++) {
+    unsigned char c = (unsigned char)text[i];
+    if (!((c >= '0' && c <= '9') ||
+          (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool extract_task_id_token(const char *message,
+                                  char *out,
+                                  size_t out_size,
+                                  bool *looks_cron,
+                                  bool *looks_automation) {
+  static const char *const prefixes[] = {
+      "job-", "cron-", "rule-", "wf-", "workflow-",
+  };
+
+  if (!message || !out || out_size < 2) {
+    return false;
+  }
+  out[0] = '\0';
+  if (looks_cron) {
+    *looks_cron = false;
+  }
+  if (looks_automation) {
+    *looks_automation = false;
+  }
+
+  const char *best = NULL;
+  const char *best_prefix = NULL;
+  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    const char *pos = find_substr_ci_ascii(message, prefixes[i]);
+    if (pos && (!best || pos < best)) {
+      best = pos;
+      best_prefix = prefixes[i];
+    }
+  }
+  if (!best || !best_prefix) {
+    const bool cron_context =
+        contains_substr_ci(message, "job") ||
+        contains_substr_ci(message, "cron") ||
+        contains_substr_ci(message, "schedule") ||
+        contains_substr_ci(message, "定时") ||
+        contains_substr_ci(message, "计划任务") ||
+        contains_substr_ci(message, "提醒");
+    if (!cron_context) {
+      return false;
+    }
+
+    for (const char *p = message; *p;) {
+      while (*p && !isalnum((unsigned char)*p)) {
+        p++;
+      }
+      const char *start = p;
+      while (*p && isalnum((unsigned char)*p)) {
+        p++;
+      }
+      size_t len = (size_t)(p - start);
+      if ((len == 8 || len == 16) && is_hex_ascii_token(start, len)) {
+        if (len >= out_size) {
+          len = out_size - 1;
+        }
+        memcpy(out, start, len);
+        out[len] = '\0';
+        if (looks_cron) {
+          *looks_cron = true;
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  size_t len = 0;
+  while (best[len] &&
+         (isalnum((unsigned char)best[len]) || best[len] == '-' ||
+          best[len] == '_')) {
+    len++;
+  }
+  if (len == 0) {
+    return false;
+  }
+  if (len >= out_size) {
+    len = out_size - 1;
+  }
+  memcpy(out, best, len);
+  out[len] = '\0';
+
+  if (looks_cron) {
+    *looks_cron = starts_with_ci_ascii(best_prefix, "job-") ||
+                  starts_with_ci_ascii(best_prefix, "cron-");
+  }
+  if (looks_automation) {
+    *looks_automation = starts_with_ci_ascii(best_prefix, "rule-") ||
+                        starts_with_ci_ascii(best_prefix, "wf-") ||
+                        starts_with_ci_ascii(best_prefix, "workflow-");
+  }
+  return true;
+}
+
 static uint32_t parse_light_sequence_delay_ms(const char *message) {
   if (!message) {
     return 1000;
@@ -1076,6 +1464,465 @@ static bool try_execute_deterministic_number_compare(const espagent_msg_t *msg,
   return *final_text != NULL;
 }
 
+static bool try_execute_deterministic_task_list_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  (void)tool_output;
+  (void)tool_output_size;
+
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !message_requests_task_list(msg->content) ||
+      !message_mentions_managed_task(msg->content)) {
+    return false;
+  }
+
+  const bool cron_marker =
+      tool_guard_match_cron_request(msg->content) ||
+      contains_substr_ci(msg->content, "job") ||
+      contains_substr_ci(msg->content, "cron") ||
+      contains_substr_ci(msg->content, "定时") ||
+      contains_substr_ci(msg->content, "计划任务") ||
+      contains_substr_ci(msg->content, "提醒");
+  const bool automation_marker =
+      contains_substr_ci(msg->content, "rule-") ||
+      contains_substr_ci(msg->content, "wf-") ||
+      contains_substr_ci(msg->content, "workflow") ||
+      contains_substr_ci(msg->content, "规则") ||
+      contains_substr_ci(msg->content, "条件") ||
+      contains_substr_ci(msg->content, "工作流");
+  const bool general_task =
+      contains_substr_ci(msg->content, "任务") ||
+      contains_substr_ci(msg->content, "task");
+
+  const bool include_cron = cron_marker || general_task;
+  const bool include_automation = automation_marker || general_task;
+  if (!include_cron && !include_automation) {
+    return false;
+  }
+
+  char cron_output[2048] = {0};
+  char automation_output[2048] = {0};
+  if (include_cron) {
+    tool_registry_execute("cron_list", "{}", cron_output,
+                          sizeof(cron_output));
+  }
+  if (include_automation) {
+    tool_registry_execute("automation_list", "{}", automation_output,
+                          sizeof(automation_output));
+  }
+
+  ESP_LOGI(TAG, "=== CONV === Deterministic task list route");
+  char reply_buf[4096] = {0};
+  if (include_cron && include_automation) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "当前定时任务：\n%.1800s\n\n当前规则/工作流任务：\n%.1800s",
+             cron_output[0] ? cron_output : "(cron_list returned empty)",
+             automation_output[0] ? automation_output
+                                  : "(automation_list returned empty)");
+  } else if (include_cron) {
+    snprintf(reply_buf, sizeof(reply_buf), "当前定时任务：\n%.3600s",
+             cron_output[0] ? cron_output : "(cron_list returned empty)");
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "当前规则/工作流任务：\n%.3600s",
+             automation_output[0] ? automation_output
+                                  : "(automation_list returned empty)");
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_task_remove_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !message_requests_task_removal(msg->content)) {
+    return false;
+  }
+
+  bool looks_cron = false;
+  bool looks_automation = false;
+  char task_id[48] = {0};
+  const bool has_id = extract_task_id_token(msg->content, task_id,
+                                            sizeof(task_id), &looks_cron,
+                                            &looks_automation);
+
+  const bool cron_marker =
+      looks_cron || tool_guard_match_cron_request(msg->content) ||
+      contains_substr_ci(msg->content, "job-") ||
+      contains_substr_ci(msg->content, "定时") ||
+      contains_substr_ci(msg->content, "提醒");
+  const bool automation_marker =
+      looks_automation || message_has_condition_rule_marker(msg->content) ||
+      contains_substr_ci(msg->content, "rule-") ||
+      contains_substr_ci(msg->content, "wf-") ||
+      contains_substr_ci(msg->content, "workflow") ||
+      contains_substr_ci(msg->content, "规则") ||
+      contains_substr_ci(msg->content, "条件") ||
+      contains_substr_ci(msg->content, "工作流");
+
+  if (!has_id) {
+    if (!cron_marker && !automation_marker &&
+        !message_mentions_managed_task(msg->content)) {
+      return false;
+    }
+    *final_text = strdup(
+        "请告诉我要清除的任务 ID。定时任务 ID 通常是 cron_list 中括号里的 8 位 ID，规则/工作流任务 ID 通常是 rule-... 或 wf-...。如果不确定，请先让我列出当前定时任务或规则任务。");
+    return *final_text != NULL;
+  }
+
+  const bool remove_cron = looks_cron || (!looks_automation && cron_marker &&
+                                         !automation_marker);
+  const char *tool_name = remove_cron ? "cron_remove" : "automation_remove";
+  char payload[96] = {0};
+  if (remove_cron) {
+    snprintf(payload, sizeof(payload), "{\"job_id\":\"%s\"}", task_id);
+  } else {
+    snprintf(payload, sizeof(payload), "{\"id\":\"%s\"}", task_id);
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute(tool_name, payload, tool_output, tool_output_size);
+  ESP_LOGI(TAG, "=== CONV === Deterministic task remove route %s => %s",
+           task_id, tool_output);
+
+  char reply_buf[512] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf), "已清除%s %s：%s",
+             remove_cron ? "定时任务" : "规则/工作流任务", task_id,
+             tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "清除%s %s 失败：%s",
+             remove_cron ? "定时任务" : "规则/工作流任务", task_id,
+             tool_output[0] ? tool_output : "unknown error");
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_condition_rule_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !message_has_condition_rule_marker(msg->content)) {
+    return false;
+  }
+
+  const bool is_humidity =
+      contains_substr_ci(msg->content, "humidity") ||
+      contains_substr_ci(msg->content, "湿度");
+  const bool is_temperature =
+      contains_substr_ci(msg->content, "temperature") ||
+      contains_substr_ci(msg->content, "temp") ||
+      contains_substr_ci(msg->content, "温度") ||
+      contains_substr_ci(msg->content, "气温") ||
+      contains_substr_ci(msg->content, "室温");
+  if (!is_temperature && !is_humidity) {
+    return false;
+  }
+
+  const bool has_above =
+      contains_substr_ci(msg->content, "above") ||
+      contains_substr_ci(msg->content, "greater") ||
+      contains_substr_ci(msg->content, "over") ||
+      contains_substr_ci(msg->content, "大于") ||
+      contains_substr_ci(msg->content, "高于") ||
+      contains_substr_ci(msg->content, "超过");
+  const bool has_below =
+      contains_substr_ci(msg->content, "below") ||
+      contains_substr_ci(msg->content, "less") ||
+      contains_substr_ci(msg->content, "otherwise") ||
+      contains_substr_ci(msg->content, "else") ||
+      contains_substr_ci(msg->content, "否则") ||
+      contains_substr_ci(msg->content, "反之") ||
+      contains_substr_ci(msg->content, "小于") ||
+      contains_substr_ci(msg->content, "低于") ||
+      contains_substr_ci(msg->content, "不超过");
+  if (!has_above || !has_below) {
+    return false;
+  }
+
+  const char *cursor = msg->content;
+  char threshold_token[32] = {0};
+  double threshold = 0.0;
+  if (!extract_next_number_token(&cursor, &threshold, threshold_token,
+                                 sizeof(threshold_token))) {
+    return false;
+  }
+
+  const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
+  int color_count = extract_status_light_color_sequence(
+      msg->content, colors, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS);
+  if (color_count < 2) {
+    return false;
+  }
+
+  const char *above_color = colors[0];
+  const char *below_color = colors[1];
+  if (contains_substr_ci(msg->content, "小于") ||
+      contains_substr_ci(msg->content, "低于") ||
+      contains_substr_ci(msg->content, "below") ||
+      contains_substr_ci(msg->content, "less")) {
+    below_color = colors[0];
+    above_color = colors[1];
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *above = cJSON_CreateObject();
+  cJSON *below = cJSON_CreateObject();
+  cJSON *above_args = cJSON_CreateObject();
+  cJSON *below_args = cJSON_CreateObject();
+  if (!root || !above || !below || !above_args || !below_args) {
+    cJSON_Delete(root);
+    cJSON_Delete(above);
+    cJSON_Delete(below);
+    cJSON_Delete(above_args);
+    cJSON_Delete(below_args);
+    return false;
+  }
+
+  cJSON_AddStringToObject(root, "name",
+                          is_humidity ? "humidity_light_rule"
+                                      : "temperature_light_rule");
+  cJSON_AddStringToObject(root, "metric",
+                          is_humidity ? "humidity_percent" : "temperature_c");
+  cJSON_AddNumberToObject(root, "threshold", threshold);
+  cJSON_AddNumberToObject(root, "interval_s", 10);
+  cJSON_AddNumberToObject(root, "cooldown_s", 30);
+  cJSON_AddNumberToObject(root, "hysteresis_c", is_humidity ? 2.0 : 0.5);
+  cJSON_AddBoolToObject(root, "confirmed", true);
+
+  cJSON_AddStringToObject(above, "target_role", "control_agent");
+  cJSON_AddStringToObject(above, "action", "set_status_light");
+  cJSON_AddStringToObject(above_args, "color", above_color);
+  cJSON_AddItemToObject(above, "args", above_args);
+
+  cJSON_AddStringToObject(below, "target_role", "control_agent");
+  cJSON_AddStringToObject(below, "action", "set_status_light");
+  cJSON_AddStringToObject(below_args, "color", below_color);
+  cJSON_AddItemToObject(below, "args", below_args);
+
+  cJSON_AddItemToObject(root, "above", above);
+  cJSON_AddItemToObject(root, "below", below);
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_rule", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic rule route => %s", tool_output);
+
+  char reply_buf[640] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建条件规则：%s大于%s时设置为%s，否则设置为%s。%s",
+             is_humidity ? "湿度" : "温度", threshold_token, above_color,
+             below_color, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "条件规则创建失败：%s",
+             tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_fixed_device_duration_workflow(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !message_requests_on_then_off(msg->content)) {
+    return false;
+  }
+
+  fixed_gpio_device_t device = detect_fixed_gpio_device(msg->content);
+  const char *action = fixed_gpio_device_action(device);
+  if (!action[0]) {
+    return false;
+  }
+
+  uint32_t delay_ms = parse_light_sequence_delay_ms(msg->content);
+  cJSON *root = cJSON_CreateObject();
+  cJSON *steps = cJSON_CreateArray();
+  if (!root || !steps) {
+    cJSON_Delete(root);
+    cJSON_Delete(steps);
+    return false;
+  }
+
+  cJSON_AddStringToObject(root, "name",
+                          device == FIXED_DEVICE_HUMIDIFIER
+                              ? "humidifier_duration"
+                              : (device == FIXED_DEVICE_FAN ? "fan_duration"
+                                                            : "device_led_duration"));
+  cJSON_AddItemToObject(root, "steps", steps);
+
+  for (int i = 0; i < 2; i++) {
+    cJSON *step = cJSON_CreateObject();
+    cJSON *args = cJSON_CreateObject();
+    if (!step || !args) {
+      cJSON_Delete(step);
+      cJSON_Delete(args);
+      cJSON_Delete(root);
+      return false;
+    }
+    cJSON_AddNumberToObject(step, "delay_ms", i == 0 ? 0 : (double)delay_ms);
+    cJSON_AddStringToObject(step, "target_role", "control_agent");
+    cJSON_AddStringToObject(step, "action", action);
+    cJSON_AddNumberToObject(args, "state", i == 0 ? 1 : 0);
+    cJSON_AddItemToObject(step, "args", args);
+    cJSON_AddItemToArray(steps, step);
+  }
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_workflow", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic fixed device workflow => %s",
+           tool_output);
+
+  char reply_buf[560] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建%s限时流程：立即打开，%.1f秒后自动关闭。%s",
+             fixed_gpio_device_label_zh(device), (double)delay_ms / 1000.0,
+             tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "%s限时流程创建失败：%s",
+             fixed_gpio_device_label_zh(device), tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_temperature_fan_rule(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      detect_fixed_gpio_device(msg->content) != FIXED_DEVICE_FAN ||
+      !message_has_condition_rule_marker(msg->content)) {
+    return false;
+  }
+
+  const bool is_temperature =
+      contains_substr_ci(msg->content, "temperature") ||
+      contains_substr_ci(msg->content, "temp") ||
+      contains_substr_ci(msg->content, "温度") ||
+      contains_substr_ci(msg->content, "气温") ||
+      contains_substr_ci(msg->content, "室温");
+  if (!is_temperature) {
+    return false;
+  }
+
+  const bool has_above =
+      contains_substr_ci(msg->content, "above") ||
+      contains_substr_ci(msg->content, "greater") ||
+      contains_substr_ci(msg->content, "over") ||
+      contains_substr_ci(msg->content, "大于") ||
+      contains_substr_ci(msg->content, "高于") ||
+      contains_substr_ci(msg->content, "超过");
+  const bool has_below =
+      contains_substr_ci(msg->content, "below") ||
+      contains_substr_ci(msg->content, "less") ||
+      contains_substr_ci(msg->content, "otherwise") ||
+      contains_substr_ci(msg->content, "else") ||
+      contains_substr_ci(msg->content, "否则") ||
+      contains_substr_ci(msg->content, "反之") ||
+      contains_substr_ci(msg->content, "小于") ||
+      contains_substr_ci(msg->content, "低于") ||
+      contains_substr_ci(msg->content, "不超过");
+  if (!has_above || !has_below) {
+    return false;
+  }
+
+  const char *cursor = msg->content;
+  char threshold_token[32] = {0};
+  double threshold = 0.0;
+  if (!extract_next_number_token(&cursor, &threshold, threshold_token,
+                                 sizeof(threshold_token))) {
+    return false;
+  }
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *above = cJSON_CreateObject();
+  cJSON *below = cJSON_CreateObject();
+  cJSON *above_args = cJSON_CreateObject();
+  cJSON *below_args = cJSON_CreateObject();
+  if (!root || !above || !below || !above_args || !below_args) {
+    cJSON_Delete(root);
+    cJSON_Delete(above);
+    cJSON_Delete(below);
+    cJSON_Delete(above_args);
+    cJSON_Delete(below_args);
+    return false;
+  }
+
+  cJSON_AddStringToObject(root, "name", "temperature_fan_rule");
+  cJSON_AddStringToObject(root, "metric", "temperature_c");
+  cJSON_AddNumberToObject(root, "threshold", threshold);
+  cJSON_AddNumberToObject(root, "interval_s", 10);
+  cJSON_AddNumberToObject(root, "cooldown_s", 15);
+  cJSON_AddNumberToObject(root, "hysteresis_c", 0.5);
+  cJSON_AddBoolToObject(root, "confirmed", true);
+
+  cJSON_AddStringToObject(above, "target_role", "control_agent");
+  cJSON_AddStringToObject(above, "action", "set_fan");
+  cJSON_AddNumberToObject(above_args, "state", 1);
+  cJSON_AddItemToObject(above, "args", above_args);
+
+  cJSON_AddStringToObject(below, "target_role", "control_agent");
+  cJSON_AddStringToObject(below, "action", "set_fan");
+  cJSON_AddNumberToObject(below_args, "state", 0);
+  cJSON_AddItemToObject(below, "args", below_args);
+
+  cJSON_AddItemToObject(root, "above", above);
+  cJSON_AddItemToObject(root, "below", below);
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_rule", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic temperature fan rule => %s",
+           tool_output);
+
+  char reply_buf[640] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建温度风扇规则：温度大于%s°C时打开风扇，否则关闭风扇。%s",
+             threshold_token, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "温度风扇规则创建失败：%s",
+             tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
                                                      char *tool_output,
                                                      size_t tool_output_size,
@@ -1083,6 +1930,7 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_has_condition_rule_marker(msg->content) ||
       !tool_guard_match_light_request(msg->content) ||
       !message_has_sequence_marker(msg->content)) {
     return false;
@@ -1146,6 +1994,53 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
   return *final_text != NULL;
 }
 
+static bool try_execute_deterministic_subagent_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      !espagent_role_is_coordinator() ||
+      !message_explicitly_requests_subagent(msg->content)) {
+    return false;
+  }
+
+  char task[384] = {0};
+  if (!extract_explicit_subagent_task(msg->content, task, sizeof(task))) {
+    return false;
+  }
+
+  cJSON *payload_root = cJSON_CreateObject();
+  if (!payload_root) {
+    return false;
+  }
+  cJSON_AddStringToObject(payload_root, "task", task);
+  cJSON_AddStringToObject(
+      payload_root, "context",
+      "The coordinator explicitly routed this request to spawn_subagent. "
+      "Complete only the focused subtask and return one concise final result.");
+
+  char *payload = cJSON_PrintUnformatted(payload_root);
+  cJSON_Delete(payload_root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("spawn_subagent", payload, tool_output, tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic subagent route => %s", tool_output);
+
+  char reply_buf[768] = {0};
+  if (strncmp(tool_output, "Error:", 6) == 0 || tool_output[0] == '\0') {
+    snprintf(reply_buf, sizeof(reply_buf), "子代理执行失败：%s",
+             tool_output[0] ? tool_output : "unknown error");
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "子代理结果：%s", tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_time_weather_request(
     const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
     char **final_text) {
@@ -1194,6 +2089,14 @@ static bool try_execute_deterministic_scheduled_light_request(
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
       !tool_guard_match_light_request(msg->content)) {
+    return false;
+  }
+
+  const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
+  if (message_has_sequence_marker(msg->content) &&
+      extract_status_light_color_sequence(msg->content,
+                                          colors,
+                                          ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS) >= 2) {
     return false;
   }
 
@@ -1303,6 +2206,15 @@ static bool try_execute_deterministic_cron_clarification(
     return false;
   }
 
+  const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
+  if (tool_guard_match_light_request(msg->content) &&
+      message_has_sequence_marker(msg->content) &&
+      extract_status_light_color_sequence(msg->content,
+                                          colors,
+                                          ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS) >= 2) {
+    return false;
+  }
+
   *final_text = strdup(
       "要创建定时任务，请先给出明确触发时间，例如“10分钟后提醒我浇花”、“今天18:30提醒我关灯”或“每天08:00播报天气”。");
   return *final_text != NULL;
@@ -1314,6 +2226,10 @@ static bool is_mesh_related_tool_name(const char *name) {
           strcmp(name, "read_temperature_humidity") == 0 ||
           strcmp(name, "set_status_light") == 0 ||
           strcmp(name, "ws2812_set") == 0 ||
+          strcmp(name, "set_humidifier") == 0 ||
+          strcmp(name, "set_fan") == 0 ||
+          strcmp(name, "set_device_led") == 0 ||
+          strcmp(name, "copper_gpio_write") == 0 ||
           strcmp(name, "gpio_write") == 0 ||
           strcmp(name, "servo_write") == 0);
 }
@@ -1339,7 +2255,8 @@ static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
       cJSON_AddStringToObject(payload_root, "action", "read_temperature_humidity");
       cJSON_AddItemToObject(payload_root, "args", cJSON_CreateObject());
     }
-  } else if (tool_guard_match_light_request(msg->content)) {
+  } else if (tool_guard_match_light_request(msg->content) &&
+             !tool_guard_match_fixed_gpio_device_request(msg->content)) {
     const char *color = detect_status_light_color(msg->content);
     if (!color) {
       return false;
@@ -1405,8 +2322,26 @@ static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *
         "ambient-light, illuminance, lux, or GY-30/BH1750 sensor reading";
   } else if (strcmp(tool_name, "set_status_light") == 0 ||
              strcmp(tool_name, "ws2812_set") == 0) {
-    allowed = tool_guard_match_light_request(message);
+    allowed = tool_guard_match_light_request(message) &&
+              !tool_guard_match_fixed_gpio_device_request(message);
     expected = "board light or LED control";
+  } else if (strcmp(tool_name, "set_humidifier") == 0) {
+    allowed = contains_substr_ci(message, "humidifier") ||
+              contains_substr_ci(message, "加湿器");
+    expected = "humidifier control on GPIO4";
+  } else if (strcmp(tool_name, "set_fan") == 0) {
+    allowed = contains_substr_ci(message, "fan") ||
+              contains_substr_ci(message, "风扇");
+    expected = "fan control on GPIO5";
+  } else if (strcmp(tool_name, "set_device_led") == 0) {
+    allowed = contains_substr_ci(message, "device led") ||
+              contains_substr_ci(message, "gpio6 led") ||
+              contains_substr_ci(message, "gpio6灯") ||
+              contains_substr_ci(message, "gpio 6灯") ||
+              contains_substr_ci(message, "普通led") ||
+              contains_substr_ci(message, "单色led") ||
+              contains_substr_ci(message, "独立led");
+    expected = "discrete GPIO6 LED control";
   } else if (strcmp(tool_name, "servo_write") == 0) {
     allowed = tool_guard_match_servo_request(message);
     expected = "servo angle or servo pulse-width control";
@@ -1418,6 +2353,8 @@ static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *
              strcmp(tool_name, "hc_sr05_read_distance") == 0) {
     allowed = tool_guard_match_presence_request(message);
     expected = "HC-SR05 presence, proximity, or distance reading";
+  } else if (strcmp(tool_name, "copper_gpio_write") == 0) {
+    allowed = tool_guard_match_copper_gpio_write_request(message);
   } else if (strcmp(tool_name, "gpio_write") == 0) {
     allowed = tool_guard_match_gpio_write_request(message);
     expected = "explicit GPIO or digital output control";
@@ -2473,15 +3410,28 @@ static void agent_loop_task(void *arg) {
     tool_fallback[0] = '\0';
 
     if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
+        !try_execute_deterministic_task_list_request(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_task_remove_request(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_fixed_device_duration_workflow(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_temperature_fan_rule(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_condition_rule_request(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_light_workflow(&msg, tool_output,
+                                                  TOOL_OUTPUT_SIZE,
+                                                  &final_text) &&
         !try_execute_deterministic_scheduled_light_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_cron_clarification(&msg, &final_text) &&
+        !try_execute_deterministic_subagent_request(&msg, tool_output,
+                                                    TOOL_OUTPUT_SIZE,
+                                                    &final_text) &&
         !try_execute_deterministic_time_weather_request(&msg, tool_output,
                                                         TOOL_OUTPUT_SIZE,
-                                                        &final_text) &&
-        !try_execute_deterministic_light_workflow(&msg, tool_output,
-                                                  TOOL_OUTPUT_SIZE,
-                                                  &final_text)) {
+                                                        &final_text)) {
       try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
                                              &final_text);
     }

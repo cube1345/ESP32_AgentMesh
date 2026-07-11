@@ -12,6 +12,19 @@ esp_err_t tool_gpio_init(void);
  * Also accepts {"level":<0|1>} for compatibility. */
 esp_err_t tool_gpio_write_execute(const char *input_json, char *output, size_t output_size);
 
+/* Write one dedicated copper-fill GPIO pad on the control agent.
+ * Input JSON: {"pin":4|5|6,"state":0|1}
+ * Also accepts {"level":0|1} and {"value":"high"|"low"}. */
+esp_err_t tool_copper_gpio_write_execute(const char *input_json, char *output, size_t output_size);
+
+/* High-level fixed device controls on the control agent.
+ * GPIO4 = humidifier, GPIO5 = fan, GPIO6 = device LED.
+ * Input JSON: {"state":0|1}; also accepts {"level":0|1} and
+ * {"value":"on"|"off"|"high"|"low"|"打开"|"关闭"}. */
+esp_err_t tool_set_humidifier_execute(const char *input_json, char *output, size_t output_size);
+esp_err_t tool_set_fan_execute(const char *input_json, char *output, size_t output_size);
+esp_err_t tool_set_device_led_execute(const char *input_json, char *output, size_t output_size);
+
 /* Read a single GPIO pin state.
  * Input JSON: {"pin":<int>} */
 esp_err_t tool_gpio_read_execute(const char *input_json, char *output, size_t output_size);

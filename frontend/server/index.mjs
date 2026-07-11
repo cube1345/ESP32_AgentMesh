@@ -1,7 +1,13 @@
 import http from 'node:http';
+import { spawn } from 'node:child_process';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const REPO_ROOT = path.resolve(__dirname, '../..');
 const PORT = Number(process.env.ESPAGENT_DASHBOARD_PORT || 4175);
 const MQTT_HOST = process.env.ESPAGENT_MQTT_HOST || 'broker.emqx.io';
 const MQTT_PORT = Number(process.env.ESPAGENT_MQTT_PORT || 1883);
@@ -10,16 +16,52 @@ const TOPIC_PREFIX = (process.env.ESPAGENT_TOPIC_PREFIX || 'espagent/cube1345').
 const MQTT_URL = `${MQTT_PROTOCOL}://${MQTT_HOST}:${MQTT_PORT}`;
 const CHAT_REQUEST_TOPIC = `${TOPIC_PREFIX}/web/chat/request`;
 const CHAT_REPLY_TOPIC = `${TOPIC_PREFIX}/web/chat/reply`;
+const VOICE_TTS_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/tts/request`;
+const VOICE_TTS_STATUS_TOPIC = `${TOPIC_PREFIX}/voice/tts/status`;
 const VOICE_STT_REQUEST_TOPIC = `${TOPIC_PREFIX}/voice/stt/request`;
 const VOICE_STT_RESULT_TOPIC = `${TOPIC_PREFIX}/voice/stt/result`;
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
+const SKILLS_SERIAL_ENABLED = process.env.ESPAGENT_SKILLS_SERIAL_ENABLED !== '0';
+const SKILLS_SERIAL_PORT = process.env.ESPAGENT_SKILLS_SERIAL_PORT || '/dev/ttyUSB0';
+const SKILLS_SERIAL_TIMEOUT_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_TIMEOUT_MS || 20000);
+const SKILLS_SERIAL_LIST_CACHE_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_LIST_CACHE_MS || 30000);
+const SKILLS_SERIAL_MAX_CONTENT_BYTES = Number(process.env.ESPAGENT_SKILLS_SERIAL_MAX_CONTENT_BYTES || 4096);
+const SERIAL_CMD_PATH = process.env.ESPAGENT_SERIAL_CMD_PATH ||
+  path.join(REPO_ROOT, 'tools', 'serial_cmd.py');
 const CHAT_GATEWAY_PATH = '/ws';
 const runtimeSkills = new Map();
+let runtimeSkillsCacheAt = 0;
 const chatSessions = new Map();
 const wsSessions = new Set();
+const pendingTtsRequests = new Map();
+const MAX_TIMELINE_EVENTS = 120;
+const MAX_PENDING_TTS = 32;
+
+function isHighValueTimelineEntry(entry) {
+  const text = `${entry?.stage || ''} ${entry?.source || ''} ${entry?.target || ''} ${entry?.payload || ''}`.toLowerCase();
+  return text.includes('sandbox') ||
+    text.includes('guardian') ||
+    text.includes('policy') ||
+    text.includes('denied') ||
+    text.includes('blocked') ||
+    entry?.status === 'warn';
+}
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+function prunePendingTtsRequests() {
+  if (pendingTtsRequests.size <= MAX_PENDING_TTS) {
+    return;
+  }
+  const entries = Array.from(pendingTtsRequests.entries()).sort((a, b) => {
+    return Number(a[1]?.ts_ms || 0) - Number(b[1]?.ts_ms || 0);
+  });
+  while (entries.length > MAX_PENDING_TTS) {
+    const [requestId] = entries.shift();
+    pendingTtsRequests.delete(requestId);
+  }
 }
 
 function normalizeNode(role, nodeId) {
@@ -75,8 +117,28 @@ function normalizeSkillName(name) {
     .slice(0, 48);
 }
 
-function draftToRuntimeRecord(skill, source = 'local_mock', message = 'runtime skill installed') {
-  const runtimeName = normalizeSkillName(skill.name || skill.id);
+function stableNameSuffix(value) {
+  const text = String(value || 'skill');
+  let hash = 5381;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = ((hash << 5) + hash) ^ text.charCodeAt(index);
+  }
+  return (hash >>> 0).toString(36).slice(0, 8);
+}
+
+function runtimeSkillName(skill) {
+  if (typeof skill === 'string') {
+    return normalizeSkillName(skill) || `skill_${stableNameSuffix(skill)}`;
+  }
+  const fromName = normalizeSkillName(skill?.name);
+  if (fromName) return fromName;
+  const fromId = normalizeSkillName(skill?.id);
+  if (fromId) return fromId;
+  return `skill_${stableNameSuffix(JSON.stringify(skill || {}))}`;
+}
+
+function draftToRuntimeRecord(skill, source = 'serial', message = 'runtime skill installed') {
+  const runtimeName = runtimeSkillName(skill);
   return {
     id: skill.id || runtimeName,
     runtimeName,
@@ -90,6 +152,10 @@ function draftToRuntimeRecord(skill, source = 'local_mock', message = 'runtime s
     enabled: Boolean(skill.enabled),
     lastMessage: message
   };
+}
+
+function spiffsSkillPath(name) {
+  return `/spiffs/skills/${runtimeSkillName(name)}.md`;
 }
 
 function upstreamSkillToRuntimeRecord(item) {
@@ -111,10 +177,117 @@ function upstreamSkillToRuntimeRecord(item) {
   };
 }
 
+function serialSkillToRuntimeRecord(item) {
+  const runtimeName = normalizeSkillName(item?.name || item?.title || 'unknown');
+  return {
+    id: runtimeName,
+    runtimeName,
+    title: item?.title || item?.name || runtimeName,
+    path: item?.path || spiffsSkillPath(runtimeName),
+    source: 'serial',
+    installedAt: item?.installedAt || nowIso(),
+    cacheState: 'unknown',
+    status: 'installed',
+    scope: 'runtime',
+    enabled: true,
+    lastMessage: typeof item?.size_bytes === 'number'
+      ? `listed from ESP32 SPIFFS, ${item.size_bytes} bytes`
+      : 'listed from ESP32 SPIFFS'
+  };
+}
+
 function listRuntimeSkills() {
   return Array.from(runtimeSkills.values()).sort((a, b) => {
     return String(b.installedAt).localeCompare(String(a.installedAt));
   });
+}
+
+function invalidateRuntimeSkillCache() {
+  runtimeSkillsCacheAt = 0;
+}
+
+function runSerialCommand(command, timeoutMs = SKILLS_SERIAL_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      SERIAL_CMD_PATH,
+      SKILLS_SERIAL_PORT,
+      command,
+      '--timeout',
+      String(Math.max(1, Math.ceil(timeoutMs / 1000))),
+      '--settle',
+      '0.2'
+    ];
+    const child = spawn('python3', args, {
+      cwd: REPO_ROOT,
+      stdio: ['ignore', 'pipe', 'pipe']
+    });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      reject(new Error(`serial command timed out after ${timeoutMs}ms`));
+    }, timeoutMs + 3000);
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      reject(new Error((stderr || stdout || `serial command exited ${code}`).trim()));
+    });
+  });
+}
+
+function extractSerialPayload(output) {
+  const marker = '===== serial output end =====';
+  const index = output.indexOf(marker);
+  return (index >= 0 ? output.slice(index + marker.length) : output).trim();
+}
+
+function parseSerialSkillList(output) {
+  const payload = extractSerialPayload(output);
+  const records = [];
+  const seen = new Set();
+  const fileRegex = /\/spiffs\/skills\/([A-Za-z0-9_-]+)\.md(?:\s+\((\d+)\s+bytes\))?/g;
+  let match;
+  while ((match = fileRegex.exec(payload)) !== null) {
+    const runtimeName = normalizeSkillName(match[1]);
+    if (!runtimeName || seen.has(runtimeName)) continue;
+    seen.add(runtimeName);
+    records.push(serialSkillToRuntimeRecord({
+      name: runtimeName,
+      title: runtimeName,
+      path: spiffsSkillPath(runtimeName),
+      size_bytes: match[2] ? Number(match[2]) : undefined
+    }));
+  }
+
+  if (records.length === 0) {
+    for (const line of payload.split(/\r?\n/)) {
+      const item = line.match(/-\s+\*\*(.+?)\*\*.*read_file\s+(\/spiffs\/skills\/([A-Za-z0-9_-]+)\.md)/);
+      if (!item) continue;
+      const runtimeName = normalizeSkillName(item[3] || item[1]);
+      if (!runtimeName || seen.has(runtimeName)) continue;
+      seen.add(runtimeName);
+      records.push(serialSkillToRuntimeRecord({
+        name: runtimeName,
+        title: item[1].trim(),
+        path: item[2]
+      }));
+    }
+  }
+  return records;
 }
 
 async function fetchUpstreamRuntimeSkills() {
@@ -129,7 +302,51 @@ async function fetchUpstreamRuntimeSkills() {
     const record = upstreamSkillToRuntimeRecord(item);
     runtimeSkills.set(record.runtimeName, record);
   }
+  runtimeSkillsCacheAt = Date.now();
   return listRuntimeSkills();
+}
+
+async function fetchSerialRuntimeSkills() {
+  if (!SKILLS_SERIAL_ENABLED) {
+    return listRuntimeSkills();
+  }
+  if (runtimeSkillsCacheAt && Date.now() - runtimeSkillsCacheAt < SKILLS_SERIAL_LIST_CACHE_MS) {
+    return listRuntimeSkills();
+  }
+  const output = await runSerialCommand('tool_exec list_files {"prefix":"/spiffs/skills/"}');
+  const skills = parseSerialSkillList(output);
+  runtimeSkills.clear();
+  for (const item of skills) {
+    runtimeSkills.set(item.runtimeName, item);
+  }
+  runtimeSkillsCacheAt = Date.now();
+  return listRuntimeSkills();
+}
+
+async function installSerialRuntimeSkill(skill, runtimeName) {
+  if (!SKILLS_SERIAL_ENABLED) {
+    throw new Error('serial runtime skill gateway disabled');
+  }
+  const content = skillDraftToMarkdown(skill);
+  const contentBytes = Buffer.byteLength(content, 'utf8');
+  if (contentBytes > SKILLS_SERIAL_MAX_CONTENT_BYTES) {
+    throw new Error(
+      `runtime skill content is ${contentBytes} bytes; serial gateway limit is ${SKILLS_SERIAL_MAX_CONTENT_BYTES} bytes`
+    );
+  }
+  const command = `tool_exec write_file ${JSON.stringify({
+    path: spiffsSkillPath(runtimeName),
+    content,
+    confirmed: true
+  })}`;
+  const output = await runSerialCommand(command);
+  const payload = extractSerialPayload(output);
+  if (!/tool_exec status:\s*ESP_OK|OK:/m.test(payload)) {
+    throw new Error(payload || 'ESP32 write_file did not report success');
+  }
+  invalidateRuntimeSkillCache();
+  return payload.split(/\r?\n/).find((line) => line.includes('OK:')) ||
+    `installed to ${spiffsSkillPath(runtimeName)}`;
 }
 
 function createStore() {
@@ -177,8 +394,16 @@ function ensureNode(nodeId, role) {
 
 function pushTimeline(entry) {
   store.timeline.unshift(entry);
-  if (store.timeline.length > 60) {
-    store.timeline.length = 60;
+  while (store.timeline.length > MAX_TIMELINE_EVENTS) {
+    const removableIndex = store.timeline
+      .map((item, index) => ({ item, index }))
+      .reverse()
+      .find(({ item }) => item.stage === 'node_state' && !isHighValueTimelineEntry(item))?.index;
+    if (typeof removableIndex === 'number') {
+      store.timeline.splice(removableIndex, 1);
+    } else {
+      store.timeline.pop();
+    }
   }
 }
 
@@ -510,6 +735,8 @@ client.on('connect', () => {
     `${TOPIC_PREFIX}/agent/timeline`,
     `${TOPIC_PREFIX}/guardian/stateboard`,
     CHAT_REPLY_TOPIC,
+    VOICE_TTS_REQUEST_TOPIC,
+    VOICE_TTS_STATUS_TOPIC,
     VOICE_STT_REQUEST_TOPIC,
     VOICE_STT_RESULT_TOPIC
   ];
@@ -562,6 +789,66 @@ client.on('message', (topic, buffer) => {
     noteChatGatewayEvent(null);
     if (session?.downstream?.readyState === WebSocket.OPEN) {
       session.downstream.send(JSON.stringify(payload));
+    }
+    return;
+  }
+  if (topic === VOICE_TTS_REQUEST_TOPIC) {
+    const requestId = typeof payload.request_id === 'string' ? payload.request_id : `tts-${Date.now()}`;
+    const textValue = typeof payload.text === 'string' ? payload.text.trim() : '';
+    if (textValue) {
+      pendingTtsRequests.set(requestId, {
+        text: textValue,
+        chat_id: typeof payload.chat_id === 'string' ? payload.chat_id : '',
+        source_channel: typeof payload.source_channel === 'string' ? payload.source_channel : '',
+        device_id: typeof payload.device_id === 'string' ? payload.device_id : '',
+        ts_ms: Number(payload.ts_ms || Date.now())
+      });
+      prunePendingTtsRequests();
+    }
+    pushTimeline({
+      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
+      stage: 'tts_request',
+      source: payload.node_id || payload.role || 'coordinator_agent',
+      target: payload.device_id || 'voice_output',
+      payload: textValue || '(empty tts text)',
+      status: 'queued'
+    });
+    return;
+  }
+  if (topic === VOICE_TTS_STATUS_TOPIC) {
+    const status = typeof payload.status === 'string' ? payload.status : 'unknown';
+    const requestId = typeof payload.request_id === 'string' ? payload.request_id : '';
+    const detail = typeof payload.detail === 'string' ? payload.detail : '';
+    pushTimeline({
+      time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
+      stage: 'tts_status',
+      source: payload.node_id || payload.role || 'control_agent',
+      target: payload.device_id || 'voice_output',
+      payload: detail || status,
+      status: status === 'error' ? 'warn' : 'ok'
+    });
+
+    const pending = requestId ? pendingTtsRequests.get(requestId) : null;
+    if (status === 'error' && pending?.text) {
+      const fallbackPayload = {
+        type: 'tts_fallback',
+        request_id: requestId,
+        text: pending.text,
+        detail,
+        source_channel: pending.source_channel || 'voice',
+        chat_id: pending.chat_id || ''
+      };
+      const targetSession = pending.chat_id ? chatSessions.get(pending.chat_id) : null;
+      if (targetSession?.downstream?.readyState === WebSocket.OPEN) {
+        sendWsJson(targetSession.downstream, fallbackPayload);
+      } else {
+        for (const session of wsSessions) {
+          sendWsJson(session.downstream, fallbackPayload);
+        }
+      }
+    }
+    if (requestId) {
+      pendingTtsRequests.delete(requestId);
     }
     return;
   }
@@ -656,6 +943,24 @@ const server = http.createServer((req, res) => {
             source: 'proxy',
             error: error instanceof Error ? error.message : 'upstream runtime list failed'
           });
+      });
+      return;
+    }
+
+    if (SKILLS_SERIAL_ENABLED) {
+      fetchSerialRuntimeSkills()
+        .then((skills) => {
+          sendJson(res, 200, {
+            skills,
+            source: 'serial'
+          });
+        })
+        .catch((error) => {
+          sendJson(res, 502, {
+            skills: listRuntimeSkills(),
+            source: 'serial',
+            error: error instanceof Error ? error.message : 'serial runtime list failed'
+          });
         });
       return;
     }
@@ -689,7 +994,7 @@ const server = http.createServer((req, res) => {
       const payload = safeJsonParse(body);
       const skill = payload?.skill;
       const confirmed = Boolean(payload?.confirmed);
-      const source = SKILLS_API_BASE ? 'proxy' : 'local_mock';
+      const source = SKILLS_API_BASE ? 'proxy' : SKILLS_SERIAL_ENABLED ? 'serial' : 'local_mock';
 
       if (!skill || typeof skill !== 'object') {
         sendJson(res, 400, {
@@ -710,16 +1015,7 @@ const server = http.createServer((req, res) => {
         return;
       }
 
-      const runtimeName = normalizeSkillName(skill.name || skill.id);
-      if (!runtimeName) {
-        sendJson(res, 400, {
-          ok: false,
-          source,
-          message: 'invalid runtime skill name',
-          error: 'invalid runtime skill name'
-        });
-        return;
-      }
+      const runtimeName = runtimeSkillName(skill);
 
       if (SKILLS_API_BASE) {
         try {
@@ -750,6 +1046,7 @@ const server = http.createServer((req, res) => {
           });
           installed.lastMessage = upstreamPayload?.message || 'proxied to runtime gateway';
           runtimeSkills.set(installed.runtimeName, installed);
+          runtimeSkillsCacheAt = Date.now();
           sendJson(res, 200, {
             ok: true,
             source,
@@ -768,12 +1065,37 @@ const server = http.createServer((req, res) => {
         }
       }
 
+      if (SKILLS_SERIAL_ENABLED) {
+        try {
+          const message = await installSerialRuntimeSkill(skill, runtimeName);
+          const installed = draftToRuntimeRecord(skill, 'serial', message);
+          runtimeSkills.set(installed.runtimeName, installed);
+          runtimeSkillsCacheAt = Date.now();
+          sendJson(res, 200, {
+            ok: true,
+            source,
+            message,
+            skill: installed
+          });
+          return;
+        } catch (error) {
+          sendJson(res, 502, {
+            ok: false,
+            source,
+            message: 'runtime install failed on ESP32 serial gateway',
+            error: error instanceof Error ? error.message : 'runtime install failed on ESP32 serial gateway'
+          });
+          return;
+        }
+      }
+
       const installed = draftToRuntimeRecord(
         skill,
         'local_mock',
         'front-end runtime install simulated; ESP32 SPIFFS not yet connected'
       );
       runtimeSkills.set(installed.runtimeName, installed);
+      runtimeSkillsCacheAt = Date.now();
       sendJson(res, 200, {
         ok: true,
         source,

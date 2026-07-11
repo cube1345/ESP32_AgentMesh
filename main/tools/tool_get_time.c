@@ -150,19 +150,23 @@ static esp_err_t time_http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-/* Fetch time via direct HTTPS */
-static esp_err_t fetch_time_direct(char *out, size_t out_size)
+static esp_err_t fetch_time_direct_with_url(const char *url,
+                                            bool use_crt_bundle,
+                                            char *out,
+                                            size_t out_size)
 {
     time_header_ctx_t ctx = {0};
 
     esp_http_client_config_t config = {
-        .url = ESPAGENT_TIME_HTTP_URL,
+        .url = url,
         .method = HTTP_METHOD_HEAD,
         .timeout_ms = 10000,
-        .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler = time_http_event_handler,
         .user_data = &ctx,
     };
+    if (use_crt_bundle) {
+        config.crt_bundle_attach = esp_crt_bundle_attach;
+    }
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
     if (!client) return ESP_FAIL;
@@ -175,6 +179,23 @@ static esp_err_t fetch_time_direct(char *out, size_t out_size)
 
     if (!parse_and_set_time(ctx.date_val, out, out_size)) return ESP_FAIL;
     return ESP_OK;
+}
+
+/* Fetch time via direct HTTPS */
+static esp_err_t fetch_time_direct_https(char *out, size_t out_size)
+{
+    return fetch_time_direct_with_url(ESPAGENT_TIME_HTTP_URL, true, out, out_size);
+}
+
+/* Bootstrap time via plain HTTP Date header to avoid TLS-cert-time chicken-and-egg */
+static esp_err_t fetch_time_direct_http(char *out, size_t out_size)
+{
+    char url[128];
+    int len = snprintf(url, sizeof(url), "http://%s/", ESPAGENT_TIME_HTTP_HOST);
+    if (len <= 0 || len >= (int)sizeof(url)) {
+        return ESP_ERR_NO_MEM;
+    }
+    return fetch_time_direct_with_url(url, false, out, out_size);
 }
 
 esp_err_t tool_get_time_execute(const char *input_json, char *output, size_t output_size)
@@ -191,13 +212,25 @@ esp_err_t tool_get_time_execute(const char *input_json, char *output, size_t out
         return ESP_OK;
     }
 
-    (void)espagent_time_sync_start();
+    esp_err_t sync_err = espagent_time_sync_wait(ESPAGENT_SNTP_SYNC_WAIT_MS);
+    if (sync_err == ESP_OK && format_current_time_if_valid(output, output_size)) {
+        ESP_LOGI(TAG, "Time from SNTP: %s", output);
+        return ESP_OK;
+    }
 
-    esp_err_t err;
+    esp_err_t err = ESP_FAIL;
     if (http_proxy_is_enabled()) {
         err = fetch_time_via_proxy(output, output_size);
     } else {
-        err = fetch_time_direct(output, output_size);
+        if (!espagent_time_is_valid()) {
+            err = fetch_time_direct_http(output, output_size);
+            if (err == ESP_OK) {
+                ESP_LOGI(TAG, "Time bootstrapped via HTTP Date header: %s", output);
+                return ESP_OK;
+            }
+            ESP_LOGW(TAG, "HTTP time bootstrap failed: %s", esp_err_to_name(err));
+        }
+        err = fetch_time_direct_https(output, output_size);
     }
 
     if (err == ESP_OK) {

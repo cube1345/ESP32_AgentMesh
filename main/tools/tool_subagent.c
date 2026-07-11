@@ -13,10 +13,12 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include <ctype.h>
 
 static const char *TAG = "subagent";
 
 static char *s_subagent_tools_json = NULL;
+static void subagent_task(void *arg);
 
 typedef struct {
     char *task;
@@ -25,6 +27,141 @@ typedef struct {
     SemaphoreHandle_t done_sem;
     SemaphoreHandle_t cleanup_sem;
 } subagent_ctx_t;
+
+static bool contains_substr_ci(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || needle[0] == '\0') {
+        return false;
+    }
+
+    const size_t needle_len = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i = 0;
+        while (i < needle_len && p[i]) {
+            unsigned char hc = (unsigned char)p[i];
+            unsigned char nc = (unsigned char)needle[i];
+            if (hc < 0x80) {
+                hc = (unsigned char)tolower(hc);
+            }
+            if (nc < 0x80) {
+                nc = (unsigned char)tolower(nc);
+            }
+            if (hc != nc) {
+                break;
+            }
+            i++;
+        }
+        if (i == needle_len) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool subagent_try_low_memory_shortcut(subagent_ctx_t *ctx)
+{
+    if (!ctx || !ctx->task || ctx->task[0] == '\0') {
+        return false;
+    }
+
+    char *tool_output = heap_caps_calloc(1, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE,
+                                         MALLOC_CAP_SPIRAM);
+    if (!tool_output) {
+        ctx->result = strdup("Error: subagent low-memory shortcut allocation failed");
+        return true;
+    }
+
+    const bool wants_time =
+        contains_substr_ci(ctx->task, "get_current_time") ||
+        contains_substr_ci(ctx->task, "current time") ||
+        contains_substr_ci(ctx->task, "当前时间") ||
+        contains_substr_ci(ctx->task, "现在几点") ||
+        contains_substr_ci(ctx->task, "日期");
+    if (wants_time) {
+        tool_registry_execute_as("get_current_time", "{}",
+                                 ESPAGENT_CAP_CALLER_SUBAGENT,
+                                 tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
+        ctx->result = strdup(tool_output[0] ? tool_output
+                                            : "Error: get_current_time returned empty output");
+        free(tool_output);
+        ESP_LOGI(TAG, "Subagent low-memory shortcut -> get_current_time");
+        return true;
+    }
+
+    const bool wants_weather =
+        contains_substr_ci(ctx->task, "get_weather") ||
+        contains_substr_ci(ctx->task, "weather") ||
+        contains_substr_ci(ctx->task, "天气");
+    if (wants_weather) {
+        tool_registry_execute_as("get_weather", "{}",
+                                 ESPAGENT_CAP_CALLER_SUBAGENT,
+                                 tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
+        ctx->result = strdup(tool_output[0] ? tool_output
+                                            : "Error: get_weather returned empty output");
+        free(tool_output);
+        ESP_LOGI(TAG, "Subagent low-memory shortcut -> get_weather");
+        return true;
+    }
+
+    free(tool_output);
+    return false;
+}
+
+static BaseType_t create_subagent_task(subagent_ctx_t *ctx)
+{
+    static const uint32_t stack_attempts_large_first[] = {
+        ESPAGENT_SUBAGENT_STACK,
+        8192,
+        6144,
+    };
+    static const uint32_t stack_attempts_small_first[] = {
+        6144,
+        8192,
+        ESPAGENT_SUBAGENT_STACK,
+    };
+    const uint32_t free_internal =
+        (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t largest_internal =
+        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const uint32_t *stack_attempts = stack_attempts_large_first;
+
+    if (free_internal < 32768 || largest_internal < 16384) {
+        stack_attempts = stack_attempts_small_first;
+    }
+
+    ESP_LOGI(TAG,
+             "Subagent task create begin: free_internal=%u largest_internal=%u preferred_stack=%u",
+             (unsigned)free_internal,
+             (unsigned)largest_internal,
+             (unsigned)stack_attempts[0]);
+
+    for (size_t i = 0; i < sizeof(stack_attempts_large_first) / sizeof(stack_attempts_large_first[0]); i++) {
+        const uint32_t stack_bytes = stack_attempts[i];
+        BaseType_t ok = xTaskCreatePinnedToCore(subagent_task,
+                                                "subagent",
+                                                stack_bytes,
+                                                ctx,
+                                                ESPAGENT_SUBAGENT_PRIO,
+                                                NULL,
+                                                ESPAGENT_SUBAGENT_CORE);
+        if (ok == pdPASS) {
+            ESP_LOGI(TAG,
+                     "Subagent task created with internal stack=%u (free_internal=%u largest_internal=%u)",
+                     (unsigned)stack_bytes,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+            return ok;
+        }
+
+        ESP_LOGW(TAG,
+                 "Subagent task create failed with internal stack=%u (free_internal=%u largest_internal=%u)",
+                 (unsigned)stack_bytes,
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    }
+
+    return pdFAIL;
+}
 
 static bool subagent_tool_allowed(const char *name)
 {
@@ -91,15 +228,25 @@ static void subagent_cleanup_ctx(subagent_ctx_t *ctx)
     free(ctx);
 }
 
-static void subagent_task(void *arg)
+static void subagent_run(subagent_ctx_t *ctx)
 {
-    subagent_ctx_t *ctx = (subagent_ctx_t *)arg;
     if (!ctx) {
-        vTaskDelete(NULL);
         return;
     }
 
     ESP_LOGI(TAG, "Subagent started: %.80s", ctx->task ? ctx->task : "");
+
+    const uint32_t free_internal =
+        (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t largest_internal =
+        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    if ((free_internal < 32768 || largest_internal < 16384) &&
+        subagent_try_low_memory_shortcut(ctx)) {
+        ESP_LOGI(TAG,
+                 "Subagent satisfied via low-memory shortcut: free_internal=%u largest_internal=%u",
+                 (unsigned)free_internal, (unsigned)largest_internal);
+        return;
+    }
 
     char *system_prompt = heap_caps_calloc(1, ESPAGENT_SUBAGENT_CONTEXT_SIZE,
                                            MALLOC_CAP_SPIRAM);
@@ -230,6 +377,17 @@ done:
 
     ESP_LOGI(TAG, "Subagent done, result=%d bytes",
              ctx->result ? (int)strlen(ctx->result) : 0);
+}
+
+static void subagent_task(void *arg)
+{
+    subagent_ctx_t *ctx = (subagent_ctx_t *)arg;
+    if (!ctx) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    subagent_run(ctx);
 
     xSemaphoreGive(ctx->done_sem);
     xSemaphoreTake(ctx->cleanup_sem, portMAX_DELAY);
@@ -305,24 +463,43 @@ esp_err_t tool_subagent_execute(const char *input_json, char *output, size_t out
     ctx->context = (context_json && cJSON_IsString(context_json))
                        ? strdup(context_json->valuestring)
                        : NULL;
-    ctx->done_sem = xSemaphoreCreateBinary();
-    ctx->cleanup_sem = xSemaphoreCreateBinary();
     cJSON_Delete(input);
 
-    if (!ctx->task || !ctx->done_sem || !ctx->cleanup_sem) {
+    if (!ctx->task) {
+        subagent_cleanup_ctx(ctx);
+        snprintf(output, output_size, "Error: subagent setup failed");
+        return ESP_ERR_NO_MEM;
+    }
+
+    const uint32_t free_internal =
+        (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const uint32_t largest_internal =
+        (uint32_t)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+    const bool run_inline = free_internal < 32768 || largest_internal < 16384;
+
+    if (run_inline) {
+        ESP_LOGW(TAG,
+                 "Running subagent inline due to tight internal heap: free_internal=%u largest_internal=%u",
+                 (unsigned)free_internal,
+                 (unsigned)largest_internal);
+        subagent_run(ctx);
+        snprintf(output, output_size, "%s",
+                 ctx->result ? ctx->result : "(subagent returned no result)");
+        ESP_LOGI(TAG, "Subagent completed inline, output=%d bytes", (int)strlen(output));
+        subagent_cleanup_ctx(ctx);
+        return ESP_OK;
+    }
+
+    ctx->done_sem = xSemaphoreCreateBinary();
+    ctx->cleanup_sem = xSemaphoreCreateBinary();
+    if (!ctx->done_sem || !ctx->cleanup_sem) {
         subagent_cleanup_ctx(ctx);
         snprintf(output, output_size, "Error: subagent setup failed");
         return ESP_ERR_NO_MEM;
     }
 
     ESP_LOGI(TAG, "Spawning subagent: %.80s", ctx->task);
-    BaseType_t ok = xTaskCreatePinnedToCore(subagent_task,
-                                            "subagent",
-                                            ESPAGENT_SUBAGENT_STACK,
-                                            ctx,
-                                            ESPAGENT_SUBAGENT_PRIO,
-                                            NULL,
-                                            ESPAGENT_SUBAGENT_CORE);
+    BaseType_t ok = create_subagent_task(ctx);
     if (ok != pdPASS) {
         subagent_cleanup_ctx(ctx);
         snprintf(output, output_size, "Error: failed to create subagent task");

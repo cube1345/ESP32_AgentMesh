@@ -26,6 +26,29 @@ npm run dev
 http://localhost:4173/
 ```
 
+如果要从同一局域网的其他设备打开页面，并使用浏览器语音输入，需要 HTTPS。浏览器通常只允许 `localhost` 或 HTTPS 页面访问麦克风；直接用 `http://<上位机IP>:4173` 打开时，语音按钮可能返回 `not-allowed`。
+
+生成局域网自签名证书：
+
+```bash
+cd frontend
+bash scripts/create-lan-cert.sh
+```
+
+启动 HTTPS 前端：
+
+```bash
+npm run dev:https
+```
+
+然后在其他设备打开脚本输出的地址，例如：
+
+```text
+https://<上位机IP>:4173/
+```
+
+第一次访问自签名证书时，浏览器会提示证书不受信任。部分浏览器即使允许继续访问，也仍然不会把页面视为安全来源；如果语音输入仍显示 `needs secure origin` 或 `not-allowed`，需要把 `certs/espagent-lan.crt` 导入到测试设备并设为受信任证书，然后重新打开页面，再在地址栏站点权限里允许麦克风。
+
 默认聚合服务地址：
 
 ```text
@@ -114,3 +137,44 @@ ESPAGENT_AGENT_WS_URL=ws://172.29.231.55:18789/
 ```text
 ws://<ESP32_IP>:18789/
 ```
+
+## Runtime Skills Gateway
+
+Skills Studio 的“安装到 Runtime”会把草稿转换为 Markdown，并写入板端：
+
+```text
+/spiffs/skills/<normalized-name>.md
+```
+
+默认上位机服务直接通过串口连接 coordinator：
+
+```bash
+ESPAGENT_SKILLS_SERIAL_PORT=/dev/ttyUSB0 npm run server
+```
+
+可配置环境变量：
+
+```bash
+ESPAGENT_SKILLS_SERIAL_ENABLED=1
+ESPAGENT_SKILLS_SERIAL_PORT=/dev/ttyUSB0
+ESPAGENT_SKILLS_SERIAL_TIMEOUT_MS=20000
+ESPAGENT_SKILLS_SERIAL_LIST_CACHE_MS=30000
+ESPAGENT_SKILLS_SERIAL_MAX_CONTENT_BYTES=4096
+```
+
+安装时服务会执行等价串口命令：
+
+```bash
+python3 tools/serial_cmd.py /dev/ttyUSB0 'tool_exec write_file {"path":"/spiffs/skills/<name>.md","content":"...","confirmed":true}' --timeout 20
+```
+
+刷新 Runtime Skill 列表时会读取 `/spiffs/skills/`，并带 30 秒缓存，避免前端轮询频繁打到串口。
+默认串口安装限制单个 skill Markdown 不超过 4096 bytes，避免超长单行 JSON 命令给板端 console 带来额外内存压力；更大的 skill 建议拆分或改走独立 HTTP gateway。
+
+如果需要外接独立 gateway，可设置：
+
+```bash
+ESPAGENT_SKILLS_API_BASE=http://<gateway-host>:<port>
+```
+
+此时前端服务会改为代理 `GET/POST <base>/api/skills`，不再直连串口。

@@ -1,0 +1,439 @@
+\documentclass[a4paper,12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{CJKutf8}
+\usepackage[margin=2.2cm,includehead,headheight=42pt,headsep=14pt]{geometry}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,shapes.geometric,fit}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  urlcolor=blue
+}
+
+\setlist[itemize]{leftmargin=1.8em}
+\setlist[enumerate]{leftmargin=2.0em}
+\renewcommand{\arraystretch}{1.2}
+\tikzset{
+  box/.style={draw, rounded corners, align=center, minimum width=2.5cm, minimum height=0.9cm, font=\small},
+  sbox/.style={draw, rounded corners, align=center, minimum width=2.1cm, minimum height=0.8cm, font=\small},
+  layer/.style={draw, rounded corners, align=center, minimum width=3.0cm, minimum height=0.9cm, font=\small},
+  flow/.style={-{Latex[length=2mm]}, thick}
+}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\makebox[\textwidth][c]{\includegraphics[width=1.08\textwidth,height=1.35cm]{image.png}}}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\renewcommand{\footrulewidth}{0pt}
+\fancypagestyle{plain}{
+  \fancyhf{}
+  \fancyhead[C]{\makebox[\textwidth][c]{\includegraphics[width=1.08\textwidth,height=1.35cm]{image.png}}}
+  \fancyfoot[C]{\thepage}
+  \renewcommand{\headrulewidth}{0pt}
+  \renewcommand{\footrulewidth}{0pt}
+}
+
+\title{基于 ESP32 的 Agent 交互式智能家居管理系统与 RTOS 实时调度优化}
+\author{}
+\date{}
+
+\begin{document}
+\begin{CJK*}{UTF8}{gbsn}
+\maketitle
+
+\begin{abstract}
+为满足智能家居场景下用户对个性化服务、实时响应、持续自动化控制与本地隐私保护的综合需求，本文设计并实现了一套以 MCU 为核心载体的多 Agent 协同系统。系统以 ESP32-S3 为核心计算节点，构建了 Coordinator、Sensor、Controller 与 Guardian 四角色分工协作架构，其中 Coordinator 负责自然语言理解、上下文组织与任务调度，Sensor 负责环境感知与状态上报，Controller 负责执行器控制与硬件动作落地，Guardian 负责策略裁决、安全审计与风险拦截。系统进一步结合 ESP32-P4 LVGL 终端与 Web 前端，形成“自然语言入口、多节点调度、环境感知、硬件执行、策略审计、结果回传与可视化展示”的完整闭环。通信层基于 MQTT Mesh 实现跨节点消息路由、命令分发与状态同步；运行层集成环境感知、执行器控制、自动化工作流、条件规则、定时任务、Runtime Skills、长期 Memory、SubAgent 调用及语音桥接等能力；安全层通过 Sandbox、参数白名单、Guardian Policy Gate 与急停机制构建可审计、可阻断、可恢复的执行边界。实验结果表明，该系统在资源受限 MCU 平台上具备实现多 Agent 协同、实时任务调度、本地化智能控制与安全闭环管理的可行性，可为边缘侧智能家居系统提供一种轻量化、可扩展且具有工程落地价值的实现路径。
+\end{abstract}
+
+\noindent\textbf{关键词：}ESP32-S3；多 Agent 协同；智能家居；MQTT Mesh；边缘智能；安全审计
+
+\section{作品概述}
+
+\subsection{功能与特性}
+本系统的功能可概括为以下九类：
+\begin{enumerate}
+  \item \textbf{多入口自然语言交互}：系统支持 Feishu 机器人、网页 WebSocket 控制台及串口 CLI 三类用户入口。该设计使系统既能面向普通用户提供自然语言交互能力，也能面向开发阶段提供底层串口调试接口，从而兼顾日常使用与工程验证。
+  \item \textbf{四角色 Agent Mesh 协同}：系统将功能拆分为 Coordinator、Sensor、Controller 和 Guardian 四类角色，并通过 MQTT Mesh 进行协作。这样的分工使“任务理解”“环境感知”“硬件执行”“安全审计”四类职责解耦，提升了系统在多节点场景下的扩展性与可维护性。
+  \item \textbf{环境感知}：系统支持温湿度、空气质量、光照强度、人体存在和超声距离等环境数据采集，并支持运行时虚拟设备读取与缓存。该能力为后续规则触发、联动控制和用户偏好修正提供了可靠的数据基础，使系统具备从“被动响应”向“主动感知”演进的条件。
+  \item \textbf{执行器控制}：系统支持状态灯、普通 GPIO、加湿器、风扇、独立 LED、舵机、红外空调及音频蜂鸣等执行能力。其作用在于将自然语言意图映射为确定性的硬件动作，并通过统一工具接口进行封装，降低上层 Agent 与底层控制细节之间的耦合。
+  \item \textbf{自动化执行}：针对传统 Agent 系统普遍缺乏强实时性的后台执行能力的问题，系统基于 FreeRTOS 实现多步工作流、条件规则和定时任务等自动化机制。该能力使系统可以在不依赖持续对话的前提下完成延时动作、条件联动和周期任务，是智能家居自动化的关键基础。
+  \item \textbf{安全控制}：系统支持 Sandbox、参数白名单、Guardian policy gate、控制急停与状态回读机制。Guardian 可对敏感操作进行主动阻塞、审计与上报，并限制隐私数据的不必要暴露，从而形成可追踪、可阻断、可恢复的安全执行闭环，这是本项目的重要工程创新点之一。
+  \item \textbf{智能运行时能力}：系统支持Runtime Skills 装载、用户偏好建模、长期 Memory、SubAgent 调用以及 Lua 脚本扩展能力。该部分使系统不仅能执行即时命令，还能积累用户习惯、优化用户画像、拆分复杂任务，并通过运行时脚本持续扩展功能边界，提高系统的适应性和可演化能力。
+  \item \textbf{可视化展示}：系统采用 React + TypeScript 构建网页前端，采用 LVGL 构建 ESP32-P4 终端，可展示节点拓扑、Timeline、Sandbox 事件流、Skills Studio 及 AI 通信面板。其作用不仅是展示状态，更是将内部推理、调度、审计和执行过程外显，便于用户理解系统行为，也便于开发者定位问题。
+  \item \textbf{运维与扩展}：系统支持远程 OTA 固件升级、SPIFFS 文件管理及串口强制命令输入等运维能力。该设计保证系统在实际部署后仍具备版本更新、配置维护、故障恢复和现场调试能力，使其从实验性原型进一步接近可长期运行的工程系统。
+\end{enumerate}
+
+\subsection{应用领域}
+本系统面向以下应用场景：
+\begin{itemize}
+  \item \textbf{智能家居控制}：系统可通过 AHT20、SGP30 等传感器模块获取环境温湿度、CO\textsubscript{2} 浓度和空气质量等信息，并结合自然语言交互实现风扇、加湿器、灯光与空调等设备的联动控制。该场景突出系统“感知---决策---执行”一体化能力，适用于日常家居设备的自动调节和个性化服务。
+  \item \textbf{实验室与宿舍环境管理}：系统可持续监测温湿度、CO\textsubscript{2}、TVOC 与光照强度等数据，并根据用户设定规则触发自动化动作。该场景体现了系统在长期监测、后台规则执行和实时状态反馈方面的优势，适合空间相对封闭且环境波动较明显的场所。
+\end{itemize}
+
+\subsection{主要技术特点}
+\begin{itemize}
+  \item \textbf{轻量级 Agent Runtime}：系统基于 ESP-IDF、FreeRTOS 和 cJSON 构建轻量级 Agent Runtime，在资源受限 MCU 平台上完成消息组织、上下文构建、工具调用和结果回传。该设计验证了多 Agent 协作框架在嵌入式侧的可实现性。
+  \item \textbf{MQTT Mesh 协同通信}：系统基于 MQTT Mesh 实现跨节点消息路由、命令下发、结果回传和时间线广播。其作用是把多个 ESP32 节点组织为一个协同系统，而不是若干彼此独立的控制板，从而实现跨节点闭环控制。
+  \item \textbf{ReAct 工具调用机制}：系统基于 ReAct 风格工具调用，将自然语言意图转换为结构化工具执行过程。该机制把大模型的理解能力与嵌入式工具的确定性执行能力结合起来，兼顾交互灵活性与执行可控性。
+  \item \textbf{SPIFFS 本地持久化}：系统基于 SPIFFS 实现 Skills、Memory、Profile、脚本和设备清单的本地持久化。该能力使系统在重启后仍能保留运行时知识、用户偏好和扩展配置，是长期运行能力的重要支撑。
+  \item \textbf{安全执行边界设计}：系统基于 Guardian、Sandbox 和参数白名单建立安全执行边界。其创新点在于将“权限控制”“硬件安全”和“策略审计”从普通控制逻辑中独立出来，形成适用于多 Agent 场景的内生安全机制，进一步强化了对用户数据安全的重视与保护。
+  \item \textbf{前端聚合与展示服务}：系统基于前端聚合服务实现 MQTT 数据聚合、技能安装代理和网页聊天网关。它不仅承担展示功能，也承担板端运行时能力与上位机管理能力之间的桥接任务。
+  \item \textbf{自动化后台引擎}：系统基于自动化引擎实现工作流、条件规则和定时任务的后台运行。与仅依赖即时对话触发的方式相比，该引擎使系统具备持续运行和主动执行能力，是智能家居自动化的重要基础。
+\end{itemize}
+
+\subsection{主要性能指标}
+\begin{table}[h]
+\centering
+\begin{tabular}{p{4.2cm}p{8.6cm}}
+\toprule
+\textbf{指标项} & \textbf{当前实现} \\
+\midrule
+注册工具能力 & 55 项已注册工具能力（以 \texttt{tool\_registry.c} 为准） \\
+显式 Slash 指令数 & 23 项显式 Slash 命令/动作指令 \\
+环境感知能力 & 温湿度、eCO\textsubscript{2}、TVOC、光照、人体存在、超声距离、虚拟只读设备 \\
+执行器能力 & WS2812、普通 GPIO、加湿器、风扇、独立 LED、舵机、Gree 空调红外、MAX98357 音频及虚拟控制设备 \\
+自动化能力 & 工作流 1 类、条件规则 1 类、定时任务 3 类（every/at/daily） \\
+持久化能力 & Skills、Memory、Profile、脚本、设备清单及会话摘要均可落盘至 SPIFFS \\
+用户入口 & Feishu、WebSocket 网页前端、串口 CLI \\
+内部协同链路 & MQTT Mesh + Timeline + StateBoard + PolicyDecision \\
+快捷命令 & 支持13种快捷命令，包括 /clear（清除上下文）、/skills（展示所有可用skills）等等 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{主要创新点}
+\begin{enumerate}
+  \item \textbf{MCU 平台上的多 Agent 角色分工}：本系统在 MCU 平台上构建四角色 Agent 分工体系，并借助 MQTT Mesh 实现多节点协同控制与任务闭环。其创新价值在于，将传统更多出现在高算力边缘设备或云端的多 Agent 思想下沉到嵌入式节点侧。
+  \item \textbf{面向自然语言硬件控制的安全审计机制}：系统引入 Guardian 节点，通过 Sandbox 思想、工具白名单和策略裁决机制，将自然语言控制约束在可审计、可回退的安全边界内。这一设计不仅关注“能否执行”，还关注“是否应该执行”以及“谁来阻止错误执行”。
+  \item \textbf{Runtime Skills 动态装载}：系统支持 Runtime Skills 装载，无需重新烧录即可通过上位机将 Skills 安装至 SPIFFS，从而动态扩展系统知识与行为能力。该机制降低了板端功能扩展成本，使嵌入式系统具备类似软件插件的演化能力与组件化的灵活性。
+  \item \textbf{自动化能力统一}：系统将多步时序动作、条件规则和定时任务统一纳入后台自动化引擎，降低 LLM 持续占用并提升系统实时响应能力。其意义在于把“智能理解”与“持续执行”解耦，使系统在资源受限条件下仍能维持较稳定的后台运行。
+  \item \textbf{推理链路与执行链路可视化}：系统在前端统一展示节点、Timeline、Sandbox 事件和 AI 通信内容，实现推理链路与执行链路的可视化。与传统黑盒式控制不同，这种可视化方式有助于用户理解系统行为，也有助于开发者进行问题定位和性能分析。
+\end{enumerate}
+
+\subsection{设计流程}
+首先根据任务需求将系统划分为调度（负责与用户交互、任务分发）、感知（环境数据的采集与缓存）、执行（硬件执行操作）与安全（主动接入通信，确保用户权限）四类职责；随后围绕 ESP32-S3 建立统一 Tool Registry，将各类传感器、执行器与系统能力封装为标准工具；之后通过 MQTT Mesh 连接多节点，并接入 Feishu、WebSocket 与串口入口；在此基础上进一步补充 Skills、Memory、自动化引擎、Guardian 与前端展示能力；最后通过串口脚本、前端时间线和实际硬件动作进行联调验证。该流程保证了系统从单节点能力到多节点协作，再到可视化与运维能力的逐层演进。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.92\textwidth}{!}{
+\begin{tikzpicture}[node distance=1.0cm and 1.1cm]
+  \node[box] (user) {用户};
+  \node[box, right=of user] (entry) {Feishu / Web / CLI};
+  \node[box, right=of entry] (coord) {Coordinator\\调度节点};
+  \node[box, above right=0.7cm and 0.8cm of coord] (display) {ESP32-P4 / Web\\展示终端};
+  \node[box, below left=1.3cm and 0.3cm of coord] (sensor) {Sensor\\感知节点};
+  \node[box, below=1.3cm of coord] (control) {Control\\执行节点};
+  \node[box, below right=1.3cm and 0.3cm of coord] (guardian) {Guardian\\安全节点};
+  \node[box, right=of coord] (mesh) {MQTT Mesh};
+
+  \draw[flow] (user) -- (entry);
+  \draw[flow] (entry) -- (coord);
+  \draw[flow] (coord) -- (mesh);
+  \draw[flow] (mesh) |- (sensor);
+  \draw[flow] (mesh) -- (control);
+  \draw[flow] (mesh) |- (guardian);
+  \draw[flow] (coord) -- (display);
+  \draw[flow] (sensor) -- (coord);
+  \draw[flow] (control) -- (coord);
+  \draw[flow] (guardian) -- (coord);
+\end{tikzpicture}
+}
+\caption{系统总体协同架构图}
+\end{figure}
+
+\section{系统组成及功能说明}
+
+\subsection{整体介绍}
+系统总体架构可分为六层：
+\begin{enumerate}
+  \item \textbf{用户入口层}：Feishu、网页前端、串口 CLI。
+  \item \textbf{Coordinator 调度层}：负责 LLM 对话、工具调用、Mesh 调度与语音桥接。
+  \item \textbf{Sensor 感知层}：负责温湿度、空气质量、光照、人体存在、距离与虚拟设备读取。
+  \item \textbf{Control 执行层}：负责 GPIO、灯光、风扇、加湿器、空调、舵机和音频输出。
+  \item \textbf{Guardian 安全层}：负责策略裁决、审计、StateBoard 与 Watchdog。
+  \item \textbf{展示与扩展层}：包括网页控制台、ESP32-P4 展示终端与运行时 Skills。
+\end{enumerate}
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.88\textwidth}{!}{
+\begin{tikzpicture}[node distance=0.9cm and 1.0cm]
+  \node[box] (coord) {Coordinator\\理解任务\\分发命令};
+  \node[sbox, below left=1.5cm and 1.3cm of coord] (sensor) {Sensor\\采集环境};
+  \node[sbox, below=1.5cm of coord] (control) {Control\\执行硬件};
+  \node[sbox, below right=1.5cm and 1.3cm of coord] (guardian) {Guardian\\裁决与审计};
+  \node[sbox, above=1.2cm of coord] (user) {用户入口};
+
+  \draw[flow] (user) -- (coord);
+  \draw[flow] (coord) -- (sensor);
+  \draw[flow] (coord) -- (control);
+  \draw[flow] (coord) -- (guardian);
+  \draw[flow] (sensor) -- (coord);
+  \draw[flow] (control) -- (coord);
+  \draw[flow] (guardian) -- (coord);
+\end{tikzpicture}
+}
+\caption{四角色职责分工关系图}
+\end{figure}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{p{3.2cm}p{3.2cm}p{7.0cm}}
+\toprule
+\textbf{节点/模块} & \textbf{角色} & \textbf{主要功能} \\
+\midrule
+Coordinator 节点 & 调度中枢 & 处理用户交互信息、构建上下文、调用工具、下发 Mesh 命令、生成回复并发起语音请求 \\
+Sensor 节点 & 感知中枢 & 周期采集环境数据并缓存，响应传感器读取命令并发布 telemetry \\
+Control 节点 & 执行中枢 & 执行灯光、GPIO、舵机、风扇、加湿器、空调和音频等控制动作 \\
+Guardian 节点 & 安全中枢 & 对高风险操作进行 policy 决策、审计、StateBoard 更新和节点看门狗 \\
+Display/Web 前端 & 展示终端 & 展示各个节点及拓扑关系、时间线、Sandbox、Skills、用户个人偏好和浏览器语音状态 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{硬件系统介绍}
+
+\subsubsection{硬件整体介绍}
+硬件系统由多块 ESP32-S3 节点和一个展示终端组成。各节点通过 MQTT Mesh 协同工作，其中 Coordinator 节点承载 Agent 主循环，Sensor 节点承载环境传感器，Control 节点承载执行器，Guardian 节点承载安全边界和审计逻辑。系统外围可进一步连接 ESP32-P4/C6 显示终端。
+
+\subsubsection{电路各模块介绍}
+\begin{itemize}
+  \item \textbf{温湿度模块}：AHT10/AHT20，通过 I2C 读取温度与湿度，是系统感知室内基础环境状态的核心输入来源。
+  \item \textbf{空气质量模块}：SGP30，读取 eCO\textsubscript{2} 与 TVOC，用于判断空气质量变化，并为通风、风扇控制等策略提供依据。
+  \item \textbf{光照模块}：GY-30/BH1750，读取环境照度，可用于判断昼夜状态、环境亮度和后续灯光联动策略。
+  \item \textbf{灯光模块}：WS2812 状态灯，支持命名颜色和 RGB 数值控制，可用于表达系统状态、执行结果和告警信息。
+  \item \textbf{GPIO 负载模块}：GPIO4 对应加湿器，GPIO5 对应风扇，GPIO6 对应独立 LED，实现典型家居负载的直接控制。
+  \item \textbf{执行机构模块}：舵机 PWM 控制、Gree 空调红外发射，用于验证系统对角度控制和家电协议控制的适配能力。
+  \item \textbf{音频模块}：MAX98357 I2S 扬声器测试输出，用于支撑本地语音播报和音频链路验证。
+  \item \textbf{扩展设备模块}：支持运行时设备清单驱动的 UART、I2C、SPI、ADC 和 GPIO 外设接入，使系统具备更强的可扩展性。
+\end{itemize}
+
+\subsection{软件系统介绍}
+
+\subsubsection{软件整体介绍}
+软件系统由板端 Agent Runtime、Mesh 通信层、自动化引擎、Skills/Memory 持久层、语音桥接层、前端聚合服务和网页控制台共同组成。板端负责实时感知、执行和策略判断；前端负责聚合 MQTT 数据、代理聊天网关、展示 Timeline 并管理运行时 Skills。整体软件形成了“入口---理解---执行---审计---展示”的端到端闭环。
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.96\textwidth}{!}{
+\begin{tikzpicture}[node distance=0.8cm]
+  \node[layer] (l1) {用户入口层：Feishu / WebSocket / CLI};
+  \node[layer, below=of l1] (l2) {Agent Runtime：上下文构建、工具选择、结果归纳};
+  \node[layer, below=of l2] (l3) {协同通信层：MQTT Mesh、Timeline、StateBoard};
+  \node[layer, below=of l3] (l4) {能力执行层：传感器读取、GPIO 控制、自动化任务};
+  \node[layer, below=of l4] (l5) {持久与安全层：SPIFFS、Memory、Skills、Sandbox、Guardian};
+  \node[layer, below=of l5] (l6) {展示与运维层：前端控制台、LVGL 终端、OTA 管理};
+
+  \draw[flow] (l1) -- (l2);
+  \draw[flow] (l2) -- (l3);
+  \draw[flow] (l3) -- (l4);
+  \draw[flow] (l4) -- (l5);
+  \draw[flow] (l5) -- (l6);
+\end{tikzpicture}
+}
+\caption{软件系统分层关系图}
+\end{figure}
+
+\subsubsection{软件各模块介绍}
+
+\paragraph{1) Agent Runtime 与上下文构建}
+\begin{itemize}
+  \item 支持 LLM 主循环、上下文拼接、工具调用、结果归纳和最终回复。该模块负责将用户输入转换为系统可执行的内部任务，是整个智能体运行逻辑的入口。
+  \item 支持 Tool Registry、Context Builder、Session、Brief 与 Trace 管理。其作用是把工具能力、上下文信息和历史状态统一组织起来，为模型提供稳定、可重复的调用环境。
+  \item 支持长期 Memory、用户 Profile 和记忆摘要注入。该能力使系统可以在多轮使用过程中逐步形成对用户偏好和使用习惯的理解，而不是把每次对话都视为完全独立的事件。
+\end{itemize}
+
+\paragraph{2) 多节点协同与消息路由}
+\begin{itemize}
+  \item 支持 MQTT Mesh 命令、结果、Timeline、state、telemetry 和 stateboard。该设计把系统内部各节点的行为统一映射为标准事件流，便于调度、审计和前端展示。
+  \item 支持按 \texttt{target\_role} 或 \texttt{target\_node} 定向路由。其意义在于既可以按功能角色分工下发任务，也可以在需要时精确指定具体节点，提高调度灵活性。
+  \item 支持 \texttt{control\_state}、急停、解急停及 \texttt{agent\_task} 等远程动作。该部分体现了系统不仅能传递普通控制命令，也能在多节点之间传递管理指令、诊断任务和安全指令。
+\end{itemize}
+
+\begin{figure}[htbp]
+\centering
+\resizebox{0.94\textwidth}{!}{
+\begin{tikzpicture}[node distance=1.0cm and 0.9cm]
+  \node[sbox] (u) {用户消息};
+  \node[sbox, right=of u] (c1) {Coordinator\\解析意图};
+  \node[sbox, right=of c1] (mesh1) {Mesh 命令\\下发};
+  \node[sbox, right=of mesh1] (node1) {目标节点\\执行};
+  \node[sbox, below=1.1cm of node1] (node2) {结果 / 状态\\回传};
+  \node[sbox, left=of node2] (mesh2) {MQTT 事件\\广播};
+  \node[sbox, left=of mesh2] (c2) {Coordinator\\归纳回复};
+  \node[sbox, left=of c2] (front) {前端 / Feishu\\展示结果};
+
+  \draw[flow] (u) -- (c1);
+  \draw[flow] (c1) -- (mesh1);
+  \draw[flow] (mesh1) -- (node1);
+  \draw[flow] (node1) -- (node2);
+  \draw[flow] (node2) -- (mesh2);
+  \draw[flow] (mesh2) -- (c2);
+  \draw[flow] (c2) -- (front);
+\end{tikzpicture}
+}
+\caption{指令执行与结果回传流程图}
+\end{figure}
+
+\paragraph{3) 自动化}
+\begin{itemize}
+  \item \textbf{Workflow}：执行带时延的多步动作序列，例如“先执行 A，再等待一段时间执行 B”的场景，是系统实现复杂动作编排的基础，同时借助 RTOS 的实时性确保 Agent 工具调用具有较高的实时性。
+  \item \textbf{Rule}：根据温度或湿度阈值持续触发条件动作，使系统能够在后台根据环境变化自动联动设备，体现出真正的智能家居自动控制能力。
+  \item \textbf{Cron}：支持周期、定点和每日定时注入任务，用于实现定时提醒、周期检测和主动巡检等功能，是系统从被动响应走向主动服务的重要机制。
+\end{itemize}
+
+\paragraph{4) Skills、Lua 与RunTime扩展}
+\begin{itemize}
+  \item Skills 从 \texttt{/spiffs/skills/} 加载，可列出、查看、安装和摘要注入。该机制使板端系统具备可持续补充知识的能力，而不需要每次扩展都依赖固件重编译。
+  \item 支持 Skill 观察记录、运行时 Skill 安装与前端 Skills Studio。其作用是在开发阶段形成“编写---安装---验证---记录”的闭环，降低调试和扩展成本。
+  \item 支持 Lua 运行时信息查询、脚本列出、同步/异步运行、任务查询与停止。Lua 脚本扩展机制为系统保留了轻量级二次开发能力，适合快速验证新功能或实现简单逻辑。
+  \item 支持运行时设备清单，统一描述简单传感器与执行器协议。该设计的价值在于把部分硬件接入从“改固件”转变为“改描述”，提高系统的外设扩展效率。
+\end{itemize}
+
+\paragraph{5) 前端与展示层}
+\begin{itemize}
+  \item 基于React + TypeScript 实现网页前端，支持节点总览、能力目录、环境卡片、调度 Timeline、Sandbox 面板和用户偏好面板。该部分将复杂的系统运行状态转化为可视化信息，便于用户理解和管理。
+  \item 支持 AI 通信窗口、浏览器 STT 状态显示、TTS 回退播报和运行时 Skill 管理。其作用是把语音、聊天和运行时扩展能力统一纳入一个交互界面中，增强系统的一体化体验。
+  \item 支持 admin、operator、viewer 三类演示角色。该设计体现了系统在权限分层和演示管理方面的可扩展性，也便于后续扩展更细粒度的角色控制。
+\end{itemize}
+
+\paragraph{6) 安全与审计层}
+\begin{itemize}
+  \item 支持 Sandbox 拦截，敏感写入和持久规则要求显式确认。其作用是将高风险操作前置到权限边界上，避免错误调用直接落到硬件层。
+  \item 支持 Guardian policy\_decision、StateBoard、Watchdog 和风险事件追踪。这些机制共同构成了系统的审计与安全观测平面，使节点状态、决策结果和异常事件都可被记录和回放。
+  \item 支持 Control 节点急停闭锁，防止高频或异常动作持续执行。该设计在实际硬件控制中具有很强的工程意义，是保护设备和确保人机安全的关键措施。
+\end{itemize}
+
+\paragraph{7) 关键工具能力示例}
+系统当前共注册 55 项工具能力，覆盖信息服务、环境感知、硬件控制、自动化调度、语音桥接、文件系统、运行时扩展与安全相关操作等多个方向。若在论文中逐项展开，不仅篇幅较长，也会削弱重点。因此，这里选取几个最能体现本系统“能理解、能感知、能执行、能自动化、能扩展”特征的代表性工具进行说明。
+
+\begin{longtable}{p{2.8cm}p{3.8cm}p{7.8cm}}
+\toprule
+\textbf{类别} & \textbf{工具名} & \textbf{核心作用} \\
+\midrule
+\endfirsthead
+\toprule
+\textbf{类别} & \textbf{工具名} & \textbf{核心作用} \\
+\midrule
+\endhead
+综合感知 & \texttt{read\_environment} & 一次性读取温湿度、空气质量和光照，是系统获取环境上下文的核心入口。 \\
+协同调度 & \texttt{mesh\_send\_command} & 通过 MQTT Mesh 向指定角色或节点下发标准命令，是多节点协作链路中的关键调度工具。 \\
+基础控制 & \texttt{set\_humidifier} & 直接控制加湿器开关，体现自然语言到真实家居设备动作的映射能力。 \\
+灯光控制 & \texttt{set\_status\_light} & 以颜色名方式控制 WS2812 状态灯，适合做状态提示、告警反馈和交互确认。 \\
+自动化 & \texttt{automation\_create\_workflow} & 创建多步时序动作，使系统能够脱离持续对话独立完成延时执行任务。 \\
+自动化 & \texttt{automation\_create\_rule} & 创建持续条件规则，使环境数据能够直接驱动设备自动联动。 \\
+记忆与技能 & \texttt{memory\_profile\_set} & 写入稳定用户画像与长期偏好，为系统提供跨会话的个性化依据。 \\
+Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理局部任务，用于降低主代理负担并提高复杂任务处理效率。 \\
+语音桥接 & \texttt{voice\_request\_tts} & 向语音终端发布播报请求，使系统回复可以进一步转换为可听的反馈。 \\
+文件系统 & \texttt{write\_file} & 写入 SPIFFS 文件，是 Skills、配置、脚本等运行时扩展能力落盘的基础接口。 \\
+\bottomrule
+\end{longtable}
+
+上述工具中，\texttt{read\_environment}、\texttt{mesh\_send\_command} 与 \texttt{set\_humidifier}/\texttt{set\_status\_light} 共同构成了“感知---决策---执行”的基本闭环：系统先获取环境状态，再由 Coordinator 结合上下文理解用户意图，随后通过 Mesh 将控制任务分发到相应节点执行。这样的工具组织方式使本系统并不是简单地“回答问题”，而是真正具备作用于物理环境的能力。
+
+\texttt{automation\_create\_workflow} 与 \texttt{automation\_create\_rule} 则体现了本系统区别于普通对话式 Agent 的另一项关键能力，即后台自动化执行能力。前者适合处理“打开设备 10 秒后关闭”这类具有时间顺序的任务，后者适合处理“当温度高于阈值时打开风扇”这类持续生效的条件联动任务。二者的引入使系统能够在一次理解之后持续运行，而不必依赖用户不断重复发出命令。
+
+\texttt{memory\_profile\_set} 与 \texttt{spawn\_subagent} 则对应系统的智能化和可扩展特征。前者让系统能够记录稳定偏好、环境习惯和用户画像，使后续决策更贴近真实使用场景；后者则允许系统把复杂任务拆分为多个局部问题分别求解，从而缓解主代理上下文压力，提高多步骤任务的处理效率。这种设计使系统不仅是一个控制器，也具备一定的持续学习与任务分解能力。
+
+最后，\texttt{voice\_request\_tts} 与 \texttt{write\_file} 分别代表系统在多模态交互与运行时扩展方面的能力边界。前者将文本回复转化为语音播报，增强系统在实际家居场景中的可用性；后者则支撑 Skills、脚本与配置的运行时写入，使系统无需频繁重新烧录也能扩展行为逻辑。二者共同说明，本系统不仅关注“当前能做什么”，也关注“后续如何持续扩展和自然交互”。
+
+\paragraph{8) Slash 指令能力}
+系统还支持显式 Slash 路由与动作指令，包括：\texttt{/help}、\texttt{/clear}、\texttt{/clear\_all\_memory}、\texttt{/context\_status}、\texttt{/skills\_list}、\texttt{/skills\_show}、\texttt{/sensor}、\texttt{/control}、\texttt{/guardian}、\texttt{/subagent}、\texttt{/workflow}、\texttt{/rule}、\texttt{/local}、\texttt{/mesh}、\texttt{/status}、\texttt{/stop}、\texttt{/resume}、\texttt{/device}、\texttt{/profile}、\texttt{/skills}、\texttt{/privacy}、\texttt{/lua}、\texttt{/trace} 和 \texttt{/ota}。这些指令可直接约束 Agent 的路由、执行范围和工具选择，使用户能够显式指定当前交互的目标角色、执行方式和控制边界。
+
+\section{完成情况及性能参数}
+
+\subsection{整体介绍}
+从当前实现情况看，系统已经具备完整的多 Agent 智能家居控制闭环：用户可通过 Feishu、网页前端或串口发起请求；Coordinator 负责理解任务并调用工具或下发 Mesh 命令；Sensor 节点持续上报环境数据；Control 节点执行灯光、风扇、加湿器、舵机等动作；Guardian 节点负责策略审计与安全裁决；前端统一展示节点拓扑、Timeline、Sandbox 与 AI 通信结果。该结构说明系统已经不仅是一个单板控制原型，而是一个具备交互、协同、安全、可视化与持续运行能力的嵌入式多 Agent 工程系统。
+
+\subsection{工程成果}
+
+\subsubsection{电路成果}
+当前电路成果主要包括：
+\begin{itemize}
+  \item AHT20 温湿度采集链路；
+  \item SGP30 空气质量采集链路；
+  \item BH1750/GY-30 光照采集链路;
+  \item WS2812 状态灯控制链路；
+  \item GPIO4、GPIO5、GPIO6 分别对应加湿器、风扇和独立 LED 控制链路；
+  \item 舵机 PWM 控制链路；
+  \item Gree 空调红外发送链路；
+  \item MAX98357 音频播放测试链路;
+  \item INA443 麦克风模块测试链路.
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\linewidth]{system.jpg}
+  \caption{系统实物图}
+  \label{fig:hardware_photo}
+\end{figure}
+
+\subsubsection{软件成果}
+当前软件成果主要包括：
+\begin{itemize}
+  \item ESP32 侧 LLM Agent Runtime；
+  \item 四角色 MQTT Mesh 协同框架；
+  \item 自动化工作流、条件规则与定时任务引擎；
+  \item Skills Loader、Memory/Profile 持久化模块；
+  \item Guardian Sandbox、StateBoard 与 Watchdog 审计链路；
+  \item 前端控制台、聊天网关与技能安装代理；
+  \item 语音 TTS/STT 结构化桥接与浏览器回退播报链路。
+\end{itemize}
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\linewidth]{web.png}
+  \caption{上位机界面展示}
+  \label{fig:web_ui}
+\end{figure}
+
+\subsection{特性成果}
+本系统当前已经可以量化展示的能力成果如下：
+\begin{enumerate}
+  \item 支持 4 个固定角色节点协同运行，形成职责清晰的边缘多 Agent 架构，验证了在嵌入式平台上进行角色分工和任务闭环的可实现性。
+  \item 支持 55 项注册工具能力，覆盖感知、控制、自动化、技能、文件、网关、语音和运维能力，说明系统已经具备较为完整的运行时能力面。
+  \item 支持 3 类自动化机制：多步工作流、条件规则和定时任务，表明系统不仅能响应用户指令，也具备持续后台执行能力。
+  \item 支持 3 类用户入口：Feishu、WebSocket 网页前端和串口 CLI，说明系统同时兼顾普通用户交互和开发调试需求。
+  \item 支持 23 项 Slash 指令，实现显式路由、显式清理、显式状态查询与显式技能访问，提高了系统在复杂任务中的可控性。
+  \item 支持 Runtime Skill 安装至 SPIFFS，无需重复烧录即可扩展系统知识，体现了系统在板端功能演进方面的灵活性。
+  \item 支持 Sandbox 可视化，前端可单独查看拦截事件、风险事件和确认要求，使安全策略不再是黑盒逻辑，而成为可观察、可解释的系统行为。
+  \item 支持控制急停与解除急停，适合在执行器联调阶段进行安全兜底，体现了系统在工程安全性方面的考虑。
+  \item 支持语音桥接链路，但云端 TTS/STT 的最终可用性仍依赖相应凭据和配额，这也说明系统在设计上已经为语音能力预留了完整接口和扩展边界。
+\end{enumerate}
+
+\section{总结}
+
+\subsection{可扩展之处}
+系统后续可沿以下方向扩展：
+\begin{itemize}
+  \item 扩展更多运行时设备清单，使 UART、I2C、SPI 外设无需重写大量固件即可接入，进一步增强系统作为通用边缘控制平台的适配能力。
+  \item 将 OTA 从“计划生成”扩展为 Guardian 审批后的远程执行闭环，使系统真正具备远程升级、权限控制和版本回执的一体化运维能力。
+  \item 补强板端 TTS/STT 本地资源与云配额管理，降低对浏览器回退链路的依赖，提升语音能力的稳定性和独立性。
+  \item 将 BLE Mesh、RPi 本地模型、知识库和 MCP 能力进一步纳入统一调度面板，从而把当前原型扩展为更完整的边缘智能协同平台。
+  \item 增加更丰富的用户画像与偏好闭环，实现更主动的环境控制与消息提醒，增强系统的个性化服务能力。
+\end{itemize}
+
+\subsection{心得体会}
+本系统的研究与实现表明，面向真实硬件场景的 Agent 系统不应仅停留于自然语言理解与文本应答层面，而应进一步具备任务执行、过程回溯、行为审计与安全终止等关键工程能力。基于这一目标，系统在架构设计中引入了多角色分工、MQTT Mesh 协同、自动化执行引擎、Guardian 审核机制、Sandbox 拦截机制以及前端 Timeline 可视化展示等核心模块，使自然语言交互不再局限于单轮对话生成，而能够进一步映射为面向真实设备的控制动作、后台任务与持续生效的规则逻辑。同时，系统保留了 Skills、Lua、运行时设备清单与 RPi 网关等扩展接口，为后续从单一智能家居控制原型演进为具备更强协同能力、扩展能力与边缘自治能力的智能平台奠定了基础。
+
+\section{参考文献}
+\begin{enumerate}
+  \item Espressif Systems. \textit{ESP-IDF Programming Guide}. \url{https://docs.espressif.com/projects/esp-idf/en/latest/esp32/}.
+  \item MQTT Version 3.1.1 Specification. OASIS Standard.
+  \item Feishu Open Platform Documentation. \url{https://open.feishu.cn/document/}.
+  \item React Documentation. \url{https://react.dev/}.
+  \item Ant Design Documentation. \url{https://ant.design/}.
+\end{enumerate}
+
+\end{CJK*}
+\end{document}

@@ -23,7 +23,11 @@ static bool is_control_tool(const espagent_capability_descriptor_t *cap)
            is_name(cap, "ws2812_set") ||
            is_name(cap, "servo_write") ||
            is_name(cap, "gree_ac_control") ||
+           is_name(cap, "set_humidifier") ||
+           is_name(cap, "set_fan") ||
+           is_name(cap, "set_device_led") ||
            is_name(cap, "gpio_write") ||
+           is_name(cap, "copper_gpio_write") ||
            is_name(cap, "virtual_device_control") ||
            is_name(cap, "max98357_play_tone");
 }

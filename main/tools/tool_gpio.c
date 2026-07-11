@@ -153,6 +153,70 @@ static esp_err_t ensure_output_gpio(int pin)
     return gpio_config(&cfg);
 }
 
+static bool is_copper_gpio_pin(int pin)
+{
+    return pin == 4 || pin == 5 || pin == 6;
+}
+
+static const char *copper_gpio_meaning(int pin)
+{
+    switch (pin) {
+    case 4:
+        return "copper_gpio_4";
+    case 5:
+        return "copper_gpio_5";
+    case 6:
+        return "copper_gpio_6";
+    default:
+        return "unknown";
+    }
+}
+
+static bool parse_gpio_level(cJSON *root, int *state)
+{
+    if (!root || !state) {
+        return false;
+    }
+    if (get_optional_int(root, "state", state) ||
+        get_optional_int(root, "level", state)) {
+        return true;
+    }
+
+    const char *value = get_optional_string(root, "value");
+    if (!value) {
+        value = get_optional_string(root, "state");
+    }
+    if (!value) {
+        value = get_optional_string(root, "level");
+    }
+    if (!value) {
+        return false;
+    }
+    if (strcasecmp(value, "high") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcmp(value, "open") == 0 ||
+        strcmp(value, "enable") == 0 ||
+        strcmp(value, "打开") == 0 ||
+        strcmp(value, "开启") == 0 ||
+        strcmp(value, "拉高") == 0 ||
+        strcmp(value, "高电平") == 0) {
+        *state = 1;
+        return true;
+    }
+    if (strcasecmp(value, "low") == 0 ||
+        strcasecmp(value, "off") == 0 ||
+        strcmp(value, "close") == 0 ||
+        strcmp(value, "disable") == 0 ||
+        strcmp(value, "关闭") == 0 ||
+        strcmp(value, "关掉") == 0 ||
+        strcmp(value, "拉低") == 0 ||
+        strcmp(value, "低电平") == 0) {
+        *state = 0;
+        return true;
+    }
+    return false;
+}
+
 static int status_led_idle_level(void)
 {
     return s_status_led.active_level ? 0 : 1;
@@ -545,6 +609,109 @@ esp_err_t tool_gpio_write_execute(const char *input_json, char *output, size_t o
     ESP_LOGI(TAG, "gpio_write pin=%d state=%d -> %s", pin, state, esp_err_to_name(err));
     cJSON_Delete(root);
     return err;
+}
+
+esp_err_t tool_copper_gpio_write_execute(const char *input_json, char *output, size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root) {
+        snprintf(output, output_size, "Error: invalid JSON input");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int pin = -1;
+    int state = -1;
+    if (!get_required_int(root, "pin", &pin)) {
+        snprintf(output, output_size, "Error: 'pin' required and must be one of 4, 5, 6");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!is_copper_gpio_pin(pin)) {
+        snprintf(output, output_size, "Error: copper_gpio_write only allows GPIO4, GPIO5, or GPIO6");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!parse_gpio_level(root, &state) || (state != 0 && state != 1)) {
+        snprintf(output, output_size, "Error: state/level/value required, use 0/1 or high/low");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ensure_output_gpio(pin);
+    if (err == ESP_OK) {
+        err = gpio_set_level(pin, state);
+    }
+
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "OK: %s GPIO%d set %s",
+                 copper_gpio_meaning(pin), pin, state ? "HIGH" : "LOW");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        snprintf(output, output_size, "Error: GPIO%d is not a valid output pin", pin);
+    } else {
+        snprintf(output, output_size, "Error: failed to set GPIO%d (%s)",
+                 pin, esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "copper_gpio_write pin=%d state=%d -> %s",
+             pin, state, esp_err_to_name(err));
+    cJSON_Delete(root);
+    return err;
+}
+
+static esp_err_t fixed_device_gpio_write(const char *input_json,
+                                         char *output,
+                                         size_t output_size,
+                                         int pin,
+                                         const char *device_name)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root) {
+        snprintf(output, output_size, "Error: invalid JSON input");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int state = -1;
+    if (!parse_gpio_level(root, &state) || (state != 0 && state != 1)) {
+        snprintf(output, output_size,
+                 "Error: state/level/value required, use 1/on/open or 0/off/close");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ensure_output_gpio(pin);
+    if (err == ESP_OK) {
+        err = gpio_set_level(pin, state);
+    }
+
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "OK: %s on GPIO%d turned %s",
+                 device_name, pin, state ? "ON" : "OFF");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        snprintf(output, output_size, "Error: GPIO%d is not a valid output pin", pin);
+    } else {
+        snprintf(output, output_size, "Error: failed to set %s GPIO%d (%s)",
+                 device_name, pin, esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "%s pin=%d state=%d -> %s",
+             device_name, pin, state, esp_err_to_name(err));
+    cJSON_Delete(root);
+    return err;
+}
+
+esp_err_t tool_set_humidifier_execute(const char *input_json, char *output, size_t output_size)
+{
+    return fixed_device_gpio_write(input_json, output, output_size, 4, "humidifier");
+}
+
+esp_err_t tool_set_fan_execute(const char *input_json, char *output, size_t output_size)
+{
+    return fixed_device_gpio_write(input_json, output, output_size, 5, "fan");
+}
+
+esp_err_t tool_set_device_led_execute(const char *input_json, char *output, size_t output_size)
+{
+    return fixed_device_gpio_write(input_json, output, output_size, 6, "device_led");
 }
 
 esp_err_t tool_gpio_read_execute(const char *input_json, char *output, size_t output_size)

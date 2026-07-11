@@ -1,4 +1,5 @@
 import axios from 'axios';
+import type { AxiosError } from 'axios';
 import { mockDashboardPayload } from '../data/mock';
 import type {
   DashboardPayload,
@@ -52,6 +53,13 @@ function isPreferenceProfile(value: unknown): value is UserPreferenceProfile {
   return isObject(value);
 }
 
+function errorMessage(error: unknown): string {
+  const axiosError = error as AxiosError<{ error?: string; message?: string }>;
+  return axiosError.response?.data?.error ||
+    axiosError.response?.data?.message ||
+    (error instanceof Error ? error.message : 'request failed');
+}
+
 export async function fetchDashboard(): Promise<DashboardPayload> {
   try {
     const response = await api.get<DashboardPayload>('/dashboard');
@@ -78,7 +86,9 @@ export async function saveSkills(skills: SkillDraft[]): Promise<SkillDraft[]> {
 
 export async function fetchRuntimeSkills(): Promise<RuntimeSkillListResponse> {
   try {
-    const response = await api.get<RuntimeSkillListResponse>('/skills/runtime');
+    const response = await api.get<RuntimeSkillListResponse>('/skills/runtime', {
+      timeout: 25000
+    });
     return isRuntimeSkillListResponse(response.data)
       ? response.data
       : { skills: [], source: 'local_mock' };
@@ -95,6 +105,8 @@ export async function installRuntimeSkill(
     const response = await api.post<RuntimeSkillInstallResponse>('/skills/install', {
       skill,
       confirmed
+    }, {
+      timeout: 30000
     });
     return isRuntimeSkillInstallResponse(response.data)
       ? response.data
@@ -109,7 +121,7 @@ export async function installRuntimeSkill(
       ok: false,
       source: 'local_mock',
       message: 'install request failed',
-      error: error instanceof Error ? error.message : 'install request failed'
+      error: errorMessage(error)
     };
   }
 }

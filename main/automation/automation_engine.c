@@ -86,10 +86,11 @@ static void unlock(void)
     }
 }
 
-static BaseType_t create_workflow_runtime_task(TaskFunction_t task_func,
-                                               const char *task_name,
-                                               uint32_t stack_bytes,
-                                               void *task_arg)
+static BaseType_t create_runtime_task(TaskFunction_t task_func,
+                                      const char *task_name,
+                                      uint32_t stack_bytes,
+                                      void *task_arg,
+                                      TaskHandle_t *task_handle)
 {
 #if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
     BaseType_t ok = xTaskCreatePinnedToCoreWithCaps(task_func,
@@ -97,16 +98,16 @@ static BaseType_t create_workflow_runtime_task(TaskFunction_t task_func,
                                                     stack_bytes,
                                                     task_arg,
                                                     4,
-                                                    NULL,
+                                                    task_handle,
                                                     0,
                                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (ok == pdPASS) {
-        ESP_LOGI(TAG, "Workflow task %s created with PSRAM stack=%u", task_name, (unsigned)stack_bytes);
+        ESP_LOGI(TAG, "Automation runtime task %s created with PSRAM stack=%u", task_name, (unsigned)stack_bytes);
         return ok;
     }
 
     ESP_LOGW(TAG,
-             "Workflow task %s PSRAM stack create failed (stack=%u, free_internal=%u, largest_internal=%u), retrying internal RAM",
+             "Automation runtime task %s PSRAM stack create failed (stack=%u, free_internal=%u, largest_internal=%u), retrying internal RAM",
              task_name,
              (unsigned)stack_bytes,
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -118,7 +119,7 @@ static BaseType_t create_workflow_runtime_task(TaskFunction_t task_func,
                                    stack_bytes,
                                    task_arg,
                                    4,
-                                   NULL,
+                                   task_handle,
                                    0);
 }
 
@@ -206,6 +207,9 @@ static const char *default_role_for_action(const char *action, const char *fallb
     if (action &&
         (strcmp(action, "set_status_light") == 0 ||
          strcmp(action, "ws2812_set") == 0 ||
+         strcmp(action, "set_humidifier") == 0 ||
+         strcmp(action, "set_fan") == 0 ||
+         strcmp(action, "set_device_led") == 0 ||
          strcmp(action, "servo_write") == 0 ||
          strcmp(action, "gpio_write") == 0)) {
         return "control_agent";
@@ -333,6 +337,13 @@ static bool parse_temperature_humidity(const char *text, float *temperature_c, f
 
 static bool parse_sensor_output_metric(const char *output_text, automation_metric_t metric, float *value)
 {
+    float t = 0.0f;
+    float h = 0.0f;
+    if (parse_temperature_humidity(output_text, &t, &h)) {
+        *value = (metric == AUTOMATION_METRIC_TEMPERATURE) ? t : h;
+        return true;
+    }
+
     char output_json[1024] = {0};
     if (!extract_output_message_json(output_text, output_json, sizeof(output_json))) {
         return false;
@@ -353,17 +364,11 @@ static bool parse_sensor_output_metric(const char *output_text, automation_metri
 
     cJSON *text = cJSON_GetObjectItem(result, "text");
     const char *result_text = cJSON_IsString(text) ? text->valuestring : NULL;
-    float t = 0.0f;
-    float h = 0.0f;
     if (!parse_temperature_humidity(result_text, &t, &h)) {
         cJSON_Delete(root);
         return false;
     }
-    if (metric == AUTOMATION_METRIC_TEMPERATURE) {
-        *value = t;
-    } else {
-        *value = h;
-    }
+    *value = (metric == AUTOMATION_METRIC_TEMPERATURE) ? t : h;
     cJSON_Delete(root);
     return true;
 }
@@ -667,6 +672,7 @@ static void rule_task(void *arg)
             }
 
             bool above = metric_value > snapshot.threshold;
+            int current_branch = above ? 1 : -1;
             if (snapshot.last_branch > 0) {
                 if (!above && metric_value > (snapshot.threshold - snapshot.hysteresis)) {
                     lock();
@@ -677,6 +683,10 @@ static void rule_task(void *arg)
                     lock();
                     continue;
                 }
+            }
+            if (snapshot.last_branch == current_branch) {
+                lock();
+                continue;
             }
 
             if (snapshot.cooldown_s > 0 && snapshot.last_action_ms > 0 &&
@@ -700,7 +710,7 @@ static void rule_task(void *arg)
             lock();
             if (s_rules[i].used && strcmp(s_rules[i].id, snapshot.id) == 0) {
                 s_rules[i].last_action_ms = now_ms;
-                s_rules[i].last_branch = above ? 1 : -1;
+                s_rules[i].last_branch = current_branch;
             }
         }
         unlock();
@@ -737,9 +747,9 @@ esp_err_t automation_engine_start(void)
     if (s_task) {
         return ESP_OK;
     }
-    BaseType_t ok = xTaskCreatePinnedToCore(rule_task, "automation",
-                                           ESPAGENT_AUTOMATION_STACK,
-                                           NULL, 4, &s_task, 0);
+    BaseType_t ok = create_runtime_task(rule_task, "automation",
+                                        ESPAGENT_AUTOMATION_STACK,
+                                        NULL, &s_task);
     if (ok != pdPASS || !s_task) {
         s_task = NULL;
         return ESP_FAIL;
@@ -819,10 +829,11 @@ static esp_err_t add_workflow_locked(cJSON *root, char *output, size_t output_si
         return ESP_ERR_NO_MEM;
     }
     *runtime = *wf;
-    if (create_workflow_runtime_task(workflow_task,
-                                     "workflow",
-                                     ESPAGENT_AUTOMATION_WORKFLOW_STACK,
-                                     runtime) != pdPASS) {
+    if (create_runtime_task(workflow_task,
+                            "workflow",
+                            ESPAGENT_AUTOMATION_WORKFLOW_STACK,
+                            runtime,
+                            NULL) != pdPASS) {
         free(runtime);
         wf->used = false;
         snprintf(output, output_size, "Error: failed to start workflow task");

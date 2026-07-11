@@ -70,7 +70,11 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"gpio_read_all", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_READ},
     {"set_status_light", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"ws2812_set", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"set_humidifier", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"set_fan", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"set_device_led", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"virtual_device_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"copper_gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"servo_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gree_ac_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
@@ -261,6 +265,10 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
     const char *action = json_string_value(root, "action");
     if (action &&
         strcmp(action, "gpio_write") != 0 &&
+        strcmp(action, "copper_gpio_write") != 0 &&
+        strcmp(action, "set_humidifier") != 0 &&
+        strcmp(action, "set_fan") != 0 &&
+        strcmp(action, "set_device_led") != 0 &&
         strcmp(action, "servo_write") != 0 &&
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
@@ -339,6 +347,17 @@ esp_err_t tool_sandbox_check(const char *name,
         deny(reason, reason_size, "sandbox denied %s: role is not allowed to use %s capability",
              name, tool_sandbox_risk_name(rule->risk));
         return ESP_ERR_INVALID_STATE;
+    }
+
+    /*
+     * Workflows can carry several nested step objects. They are medium-risk,
+     * one-shot automation actions, and the automation engine performs the
+     * full schema/action validation before creating the runtime task. Avoid a
+     * second full cJSON parse in the sandbox pre-check to keep the coordinator
+     * heap stable while Feishu/MQTT/LLM services are resident.
+     */
+    if (strcmp(name, "automation_create_workflow") == 0) {
+        return ESP_OK;
     }
 
     cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");

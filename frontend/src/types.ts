@@ -55,7 +55,7 @@ export interface RuntimeSkillRecord {
   runtimeName: string;
   title: string;
   path: string;
-  source: 'local_mock' | 'proxy';
+  source: 'local_mock' | 'proxy' | 'serial';
   installedAt: string;
   cacheState: 'invalidated' | 'unknown';
   status: 'installed' | 'pending' | 'failed';
@@ -66,13 +66,13 @@ export interface RuntimeSkillRecord {
 
 export interface RuntimeSkillListResponse {
   skills: RuntimeSkillRecord[];
-  source: 'local_mock' | 'proxy';
+  source: 'local_mock' | 'proxy' | 'serial';
 }
 
 export interface RuntimeSkillInstallResponse {
   ok: boolean;
   skill?: RuntimeSkillRecord;
-  source: 'local_mock' | 'proxy';
+  source: 'local_mock' | 'proxy' | 'serial';
   message: string;
   error?: string;
 }
