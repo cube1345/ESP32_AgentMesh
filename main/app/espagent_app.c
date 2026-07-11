@@ -29,7 +29,6 @@
 #include "device/device_registry.h"
 #include "dynamic/dynamic_extension.h"
 #include "events/espagent_event.h"
-#include "gateway/ble_mesh_bridge.h"
 #include "gateway/ws_server.h"
 #include "heartbeat/heartbeat.h"
 #include "llm/llm_proxy.h"
@@ -354,7 +353,6 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(skill_loader_init(), TAG, "skill_loader_init failed");
     ESP_RETURN_ON_ERROR(dynamic_extension_init(), TAG, "dynamic_extension_init failed");
     ESP_RETURN_ON_ERROR(espagent_device_registry_init(), TAG, "device_registry_init failed");
-    ESP_RETURN_ON_ERROR(espagent_ble_mesh_bridge_init(), TAG, "ble_mesh_bridge_init failed");
     ESP_RETURN_ON_ERROR(session_mgr_init(), TAG, "session_mgr_init failed");
     ESP_RETURN_ON_ERROR(wifi_manager_init(), TAG, "wifi_manager_init failed");
     ESP_RETURN_ON_ERROR(http_proxy_init(), TAG, "http_proxy_init failed");

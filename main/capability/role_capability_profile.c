@@ -51,7 +51,6 @@ static bool is_coordinator_tool(const espagent_capability_descriptor_t *cap)
 {
     return is_family(cap, "coordinator") ||
            is_family(cap, "network") ||
-           is_family(cap, "gateway") ||
            is_family(cap, "time") ||
            is_family(cap, "automation") ||
            is_family(cap, "mesh") ||

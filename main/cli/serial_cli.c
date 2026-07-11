@@ -16,7 +16,6 @@
 #include "heartbeat/heartbeat.h"
 #include "proactive/proactive_service.h"
 #include "skills/skill_loader.h"
-#include "ota/ota_manager.h"
 #include "sensors/sensor_mqtt.h"
 #include "guardian/approval_queue.h"
 
@@ -1121,31 +1120,6 @@ static int cmd_restart(int argc, char **argv)
     return 0;  /* unreachable */
 }
 
-static int cmd_ota_info(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-
-    esp_err_t err = ota_print_info();
-    printf("ota_info status: %s\n", esp_err_to_name(err));
-    return err == ESP_OK ? 0 : 1;
-}
-
-static int cmd_ota_update(int argc, char **argv)
-{
-    if (argc < 2) {
-        printf("Usage: ota_update <https_url_to_ESPAgent.bin>\n");
-        printf("The URL must point directly to an app firmware .bin file.\n");
-        return 1;
-    }
-
-    printf("Starting OTA update from HTTPS URL.\n");
-    printf("Device will reboot automatically if the update succeeds.\n");
-    esp_err_t err = ota_update_from_url(argv[1]);
-    printf("ota_update status: %s\n", esp_err_to_name(err));
-    return err == ESP_OK ? 0 : 1;
-}
-
 static int cmd_stateboard_show(int argc, char **argv)
 {
     (void)argc;
@@ -1658,22 +1632,6 @@ esp_err_t serial_cli_init(void)
         .argtable = &web_search_args,
     };
     esp_console_cmd_register(&web_search_cmd);
-
-    /* ota_info */
-    esp_console_cmd_t ota_info_cmd = {
-        .command = "ota_info",
-        .help = "Show OTA running, configured boot, and next update partitions",
-        .func = &cmd_ota_info,
-    };
-    esp_console_cmd_register(&ota_info_cmd);
-
-    /* ota_update */
-    esp_console_cmd_t ota_update_cmd = {
-        .command = "ota_update",
-        .help = "Update firmware from HTTPS app .bin URL: ota_update <https_url>",
-        .func = &cmd_ota_update,
-    };
-    esp_console_cmd_register(&ota_update_cmd);
 
     /* stateboard_show */
     esp_console_cmd_t stateboard_show_cmd = {

@@ -39,9 +39,6 @@ static const char *legacy_family_for_tool(const char *name)
     if (streq(name, "mesh_send_command")) {
         return "mesh";
     }
-    if (starts_with(name, "gateway_") || streq(name, "ota_gateway_plan")) {
-        return "gateway";
-    }
     if (streq(name, "spawn_subagent")) {
         return "subagent";
     }

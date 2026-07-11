@@ -70,7 +70,7 @@
   \item \textbf{安全控制}：系统支持 Sandbox、参数白名单、Guardian policy gate、控制急停与状态回读机制。Guardian 可对敏感操作进行主动阻塞、审计与上报，并限制隐私数据的不必要暴露，从而形成可追踪、可阻断、可恢复的安全执行闭环，这是本项目的重要工程创新点之一。
   \item \textbf{智能运行时能力}：系统支持Runtime Skills 装载、用户偏好建模、长期 Memory、SubAgent 调用以及 Lua 脚本扩展能力。该部分使系统不仅能执行即时命令，还能积累用户习惯、优化用户画像、拆分复杂任务，并通过运行时脚本持续扩展功能边界，提高系统的适应性和可演化能力。
   \item \textbf{可视化展示}：系统采用 React + TypeScript 构建网页前端，采用 LVGL 构建 ESP32-P4 终端，可展示节点拓扑、Timeline、Sandbox 事件流、Skills Studio 及 AI 通信面板。其作用不仅是展示状态，更是将内部推理、调度、审计和执行过程外显，便于用户理解系统行为，也便于开发者定位问题。
-  \item \textbf{运维与扩展}：系统支持远程 OTA 固件升级、SPIFFS 文件管理及串口强制命令输入等运维能力。该设计保证系统在实际部署后仍具备版本更新、配置维护、故障恢复和现场调试能力，使其从实验性原型进一步接近可长期运行的工程系统。
+  \item \textbf{运维与扩展}：系统支持 SPIFFS 文件管理、运行时 Skills 安装及串口强制命令输入等运维能力。该设计保证系统在实际部署后仍具备配置维护、功能扩展、故障恢复和现场调试能力，使其从实验性原型进一步接近可长期运行的工程系统。
 \end{enumerate}
 
 \subsection{应用领域}
@@ -98,8 +98,8 @@
 \toprule
 \textbf{指标项} & \textbf{当前实现} \\
 \midrule
-注册工具能力 & 52 项已注册工具能力（以 \texttt{tool\_registry.c} 为准） \\
-显式 Slash 指令数 & 23 项显式 Slash 命令/动作指令 \\
+注册工具能力 & 48 项已注册工具能力（以 \texttt{tool\_registry.c} 为准） \\
+显式 Slash 指令数 & 22 项显式 Slash 命令/动作指令 \\
 环境感知能力 & 温湿度、eCO\textsubscript{2}、TVOC、光照、人体存在、超声距离、虚拟只读设备 \\
 执行器能力 & WS2812、普通 GPIO、加湿器、风扇、独立 LED、舵机、Gree 空调红外、MAX98357 音频及虚拟控制设备 \\
 自动化能力 & 工作流 1 类、条件规则 1 类、定时任务 3 类（every/at/daily） \\
@@ -232,7 +232,7 @@ Display/Web 前端 & 展示终端 & 展示各个节点及拓扑关系、时间�
   \node[layer, below=of l2] (l3) {协同通信层：MQTT Mesh、Timeline、StateBoard};
   \node[layer, below=of l3] (l4) {能力执行层：传感器读取、GPIO 控制、自动化任务};
   \node[layer, below=of l4] (l5) {持久与安全层：SPIFFS、Memory、Skills、Sandbox、Guardian};
-  \node[layer, below=of l5] (l6) {展示与运维层：前端控制台、LVGL 终端、OTA 管理};
+  \node[layer, below=of l5] (l6) {展示与运维层：前端控制台、LVGL 终端、Skills 管理};
 
   \draw[flow] (l1) -- (l2);
   \draw[flow] (l2) -- (l3);
@@ -315,7 +315,7 @@ Display/Web 前端 & 展示终端 & 展示各个节点及拓扑关系、时间�
 \end{itemize}
 
 \paragraph{7) 关键工具能力示例}
-系统当前共注册 52 项工具能力，覆盖信息服务、环境感知、硬件控制、自动化调度、文件系统、运行时扩展与安全相关操作等多个方向。若在论文中逐项展开，不仅篇幅较长，也会削弱重点。因此，这里选取几个最能体现本系统“能理解、能感知、能执行、能自动化、能扩展”特征的代表性工具进行说明。
+系统当前共注册 48 项工具能力，覆盖信息服务、环境感知、硬件控制、自动化调度、文件系统、运行时扩展与安全相关操作等多个方向。若在论文中逐项展开，不仅篇幅较长，也会削弱重点。因此，这里选取几个最能体现本系统“能理解、能感知、能执行、能自动化、能扩展”特征的代表性工具进行说明。
 
 \begin{longtable}{p{2.8cm}p{3.8cm}p{7.8cm}}
 \toprule
@@ -347,7 +347,7 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理局部任�
 最后，\texttt{write\_file} 代表系统在运行时扩展方面的能力边界。它支撑 Skills、脚本与配置的运行时写入，使系统无需频繁重新烧录也能扩展行为逻辑，说明本系统不仅关注“当前能做什么”，也关注“后续如何持续扩展”。
 
 \paragraph{8) Slash 指令能力}
-系统还支持显式 Slash 路由与动作指令，包括：\texttt{/help}、\texttt{/clear}、\texttt{/clear\_all\_memory}、\texttt{/context\_status}、\texttt{/skills\_list}、\texttt{/skills\_show}、\texttt{/sensor}、\texttt{/control}、\texttt{/guardian}、\texttt{/subagent}、\texttt{/workflow}、\texttt{/rule}、\texttt{/local}、\texttt{/mesh}、\texttt{/status}、\texttt{/stop}、\texttt{/resume}、\texttt{/device}、\texttt{/profile}、\texttt{/skills}、\texttt{/privacy}、\texttt{/lua}、\texttt{/trace} 和 \texttt{/ota}。这些指令可直接约束 Agent 的路由、执行范围和工具选择，使用户能够显式指定当前交互的目标角色、执行方式和控制边界。
+系统还支持显式 Slash 路由与动作指令，包括：\texttt{/help}、\texttt{/clear}、\texttt{/clear\_all\_memory}、\texttt{/context\_status}、\texttt{/skills\_list}、\texttt{/skills\_show}、\texttt{/sensor}、\texttt{/control}、\texttt{/guardian}、\texttt{/subagent}、\texttt{/workflow}、\texttt{/rule}、\texttt{/local}、\texttt{/mesh}、\texttt{/status}、\texttt{/stop}、\texttt{/resume}、\texttt{/device}、\texttt{/profile}、\texttt{/skills}、\texttt{/privacy}、\texttt{/lua} 和 \texttt{/trace}。这些指令可直接约束 Agent 的路由、执行范围和工具选择，使用户能够显式指定当前交互的目标角色、执行方式和控制边界。
 
 \section{完成情况及性能参数}
 
@@ -398,10 +398,10 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理局部任�
 本系统当前已经可以量化展示的能力成果如下：
 \begin{enumerate}
   \item 支持 4 个固定角色节点协同运行，形成职责清晰的边缘多 Agent 架构，验证了在嵌入式平台上进行角色分工和任务闭环的可实现性。
-  \item 支持 52 项注册工具能力，覆盖感知、控制、自动化、技能、文件、网关和运维能力，说明系统已经具备较为完整的运行时能力面。
+  \item 支持 48 项注册工具能力，覆盖感知、控制、自动化、技能、文件和运行时扩展能力，说明系统已经具备较为完整且更聚焦于多 Agent 协作的运行时能力面。
   \item 支持 3 类自动化机制：多步工作流、条件规则和定时任务，表明系统不仅能响应用户指令，也具备持续后台执行能力。
   \item 支持 3 类用户入口：Feishu、WebSocket 网页前端和串口 CLI，说明系统同时兼顾普通用户交互和开发调试需求。
-  \item 支持 23 项 Slash 指令，实现显式路由、显式清理、显式状态查询与显式技能访问，提高了系统在复杂任务中的可控性。
+  \item 支持 22 项 Slash 指令，实现显式路由、显式清理、显式状态查询与显式技能访问，提高了系统在复杂任务中的可控性。
   \item 支持 Runtime Skill 安装至 SPIFFS，无需重复烧录即可扩展系统知识，体现了系统在板端功能演进方面的灵活性。
   \item 支持 Sandbox 可视化，前端可单独查看拦截事件、风险事件和确认要求，使安全策略不再是黑盒逻辑，而成为可观察、可解释的系统行为。
   \item 支持控制急停与解除急停，适合在执行器联调阶段进行安全兜底，体现了系统在工程安全性方面的考虑。
@@ -413,14 +413,12 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理局部任�
 系统后续可沿以下方向扩展：
 \begin{itemize}
   \item 扩展更多运行时设备清单，使 UART、I2C、SPI 外设无需重写大量固件即可接入，进一步增强系统作为通用边缘控制平台的适配能力。
-  \item 将 OTA 从“计划生成”扩展为 Guardian 审批后的远程执行闭环，使系统真正具备远程升级、权限控制和版本回执的一体化运维能力。
   \item 继续优化前端交互链路和板端任务调度策略，降低实时控制与长上下文推理之间的资源竞争。
-  \item 将 BLE Mesh、RPi 本地模型、知识库和 MCP 能力进一步纳入统一调度面板，从而把当前原型扩展为更完整的边缘智能协同平台。
   \item 增加更丰富的用户画像与偏好闭环，实现更主动的环境控制与消息提醒，增强系统的个性化服务能力。
 \end{itemize}
 
 \subsection{心得体会}
-本系统的研究与实现表明，面向真实硬件场景的 Agent 系统不应仅停留于自然语言理解与文本应答层面，而应进一步具备任务执行、过程回溯、行为审计与安全终止等关键工程能力。基于这一目标，系统在架构设计中引入了多角色分工、MQTT Mesh 协同、自动化执行引擎、Guardian 审核机制、Sandbox 拦截机制以及前端 Timeline 可视化展示等核心模块，使自然语言交互不再局限于单轮对话生成，而能够进一步映射为面向真实设备的控制动作、后台任务与持续生效的规则逻辑。同时，系统保留了 Skills、Lua、运行时设备清单与 RPi 网关等扩展接口，为后续从单一智能家居控制原型演进为具备更强协同能力、扩展能力与边缘自治能力的智能平台奠定了基础。
+本系统的研究与实现表明，面向真实硬件场景的 Agent 系统不应仅停留于自然语言理解与文本应答层面，而应进一步具备任务执行、过程回溯、行为审计与安全终止等关键工程能力。基于这一目标，系统在架构设计中引入了多角色分工、MQTT Mesh 协同、自动化执行引擎、Guardian 审核机制、Sandbox 拦截机制以及前端 Timeline 可视化展示等核心模块，使自然语言交互不再局限于单轮对话生成，而能够进一步映射为面向真实设备的控制动作、后台任务与持续生效的规则逻辑。同时，系统保留了 Skills、Lua 与运行时设备清单等扩展接口，为后续从单一智能家居控制原型演进为具备更强协同能力、扩展能力与边缘自治能力的智能平台奠定了基础。
 
 \section{参考文献}
 \begin{enumerate}

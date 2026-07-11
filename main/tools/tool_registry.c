@@ -5,7 +5,6 @@
 #include "tools/tool_cron.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
-#include "tools/tool_gateway.h"
 #include "tools/tool_lua.h"
 #include "tools/tool_mesh_command.h"
 #include "tools/tool_sandbox.h"
@@ -389,10 +388,6 @@ static bool coordinator_compact_tool_allowed(const char *name)
         "automation_create_rule",
         "automation_list",
         "automation_remove",
-        "gateway_status",
-        "gateway_register_ble_mesh_device",
-        "gateway_ble_mesh_send",
-        "ota_gateway_plan",
         "read_file",
         "list_dir",
         "cron_add",
@@ -762,54 +757,6 @@ esp_err_t tool_registry_init(void)
             "\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Workflow or rule id returned by automation_list/create\"}},"
             "\"required\":[\"id\"]}",
         .execute = tool_automation_remove_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "gateway_status",
-        .description = "Return ESPAgent gateway status, including device registry, WiFi/IP state, BLE Mesh bridge availability, and OTA gateway boundary. Use this to inspect what external devices and gateway capabilities are currently known.",
-        .input_schema_json =
-            "{\"type\":\"object\",\"properties\":{},\"required\":[],\"additionalProperties\":false}",
-        .execute = tool_gateway_status_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "gateway_register_ble_mesh_device",
-        .description = "Register an external BLE Mesh device in the ESPAgent device registry. This records device_id, address, name, and capabilities for future Gateway Agent use. It does not provision real BLE hardware unless BLE Mesh backend is linked.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"device_id\":{\"type\":\"string\",\"description\":\"Stable device id, e.g. blemesh_living_room_light\"},"
-            "\"address\":{\"type\":\"string\",\"description\":\"BLE Mesh unicast address or external address token\"},"
-            "\"name\":{\"type\":\"string\",\"description\":\"Human-readable device name\"},"
-            "\"capabilities\":{\"type\":\"string\",\"description\":\"Comma-separated capabilities such as light,onoff,rgb\"}},"
-            "\"required\":[\"device_id\",\"address\"],\"additionalProperties\":false}",
-        .execute = tool_gateway_register_ble_mesh_device_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "gateway_ble_mesh_send",
-        .description = "Send or stage a BLE Mesh gateway command using device_id/address, opcode, and hex data. In current firmware this records timeline intent and returns not_linked unless BLE Mesh backend is compiled in; do not claim real BLE execution unless the tool returns OK.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"device_id\":{\"type\":\"string\",\"description\":\"Known BLE Mesh device id from the registry\"},"
-            "\"address\":{\"type\":\"string\",\"description\":\"BLE Mesh unicast address when device_id is not enough\"},"
-            "\"opcode\":{\"type\":\"string\",\"description\":\"Vendor/model opcode as hex string\"},"
-            "\"data\":{\"type\":\"string\",\"description\":\"Payload as hex string, may be empty for reads\"}},"
-            "\"required\":[\"opcode\",\"data\"],\"additionalProperties\":false}",
-        .execute = tool_gateway_ble_mesh_send_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "ota_gateway_plan",
-        .description = "Create a structured OTA gateway plan for a target node or role and publish it to timeline. This does not directly flash firmware from the LLM path; execution remains via serial ota_update or a future Guardian-gated remote OTA command.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target ESPAgent node id\"},"
-            "\"target_role\":{\"type\":\"string\",\"description\":\"Optional target role when node id is not known\"},"
-            "\"url\":{\"type\":\"string\",\"description\":\"HTTPS URL to ESPAgent.bin\"},"
-            "\"version\":{\"type\":\"string\",\"description\":\"Optional expected firmware version\"},"
-            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only after explicit operator confirmation\"}},"
-            "\"required\":[\"url\"],\"additionalProperties\":false}",
-        .execute = tool_ota_gateway_plan_execute,
     });
 
     register_tool(&(espagent_tool_t){

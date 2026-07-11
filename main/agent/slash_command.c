@@ -114,8 +114,8 @@ static const slash_command_spec_t s_commands[] = {
         .name = "status",
         .usage = "/status <自然语言任务>",
         .template_text =
-            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、网关、Guardian 或控制面状态。"
-            "优先考虑 gateway_status、automation_list，"
+            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、Guardian 或控制面状态。"
+            "优先考虑 automation_list，"
             "以及对 control_agent 使用 mesh_send_command(action=control_state)。用户原始请求：%s",
     },
     {
@@ -179,16 +179,8 @@ static const slash_command_spec_t s_commands[] = {
         .usage = "/trace <自然语言任务>",
         .template_text =
             "这是一个显式的 /trace 指令。请优先从 timeline、StateBoard、Mesh trace、控制状态、"
-            "自动化状态、网关状态角度处理下面请求。必要时组合 gateway_status、automation_list、"
+            "自动化状态角度处理下面请求。必要时组合 automation_list、"
             "以及对 control_agent 的 control_state 查询。用户原始请求：%s",
-    },
-    {
-        .name = "ota",
-        .usage = "/ota <自然语言任务>",
-        .template_text =
-            "这是一个显式的 /ota 指令。请优先从 OTA 计划、升级目标、版本、Guardian 审批、"
-            "gateway timeline 角度处理下面请求。优先考虑 ota_gateway_plan，而不是声称已经真正升级。"
-            "用户原始请求：%s",
     },
 };
 

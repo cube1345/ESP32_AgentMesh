@@ -20,8 +20,7 @@ This is still an MCU-oriented runtime, not a Linux multi-process agent framework
 - ESP32-S3 firmware built with ESP-IDF 6.1
 - Feishu/Lark WebSocket channel for chat input and replies
 - Local WebSocket gateway on port `18789`
-- Local Wi-Fi onboarding/admin portal with gateway status, device registry,
-  BLE Mesh device registration boundary, and OTA gateway plan API
+- Local Wi-Fi onboarding/admin portal with device status, device registry, and runtime skills API
 - Serial CLI for diagnostics and local maintenance
 - Slash command layer for explicit routing: `/help`, `/sensor`, `/control`,
   `/guardian`, `/subagent`, `/workflow`, `/rule`, and `/local`
@@ -54,24 +53,15 @@ This is still an MCU-oriented runtime, not a Linux multi-process agent framework
 - Manifest trust check: `manifest_version=1`, `permissions`, role/risk consistency, and `<device>.json.sha256` sidecar verification; control manifests require a matching SHA-256 sidecar before execution
 - ESP-NOW environment telemetry sender
 - MQTT state, telemetry, events, dispatch, timeline, alerts, and security topics
-- SPIFFS-backed `device_registry` for MQTT Mesh nodes and registered external
-  gateway devices
-- BLE Mesh gateway boundary tools: register external BLE Mesh devices and stage
-  BLE Mesh commands into timeline/events. The current firmware does not claim
-  physical BLE Mesh control unless the BLE backend is explicitly linked and the
-  tool returns `ESP_OK`.
+- SPIFFS-backed `device_registry` for MQTT Mesh nodes
 - Automation runtime for delayed workflows and persistent condition-action rules
-- HTTPS OTA app update through the serial CLI
-- OTA gateway planning tool/API that publishes structured OTA plans to the
-  timeline. Actual firmware flashing still requires serial `ota_update` or a
-  later Guardian-gated remote OTA executor.
 - Four ESP32-S3 role profiles: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`
 - Wi-Fi onboarding/admin AP under the `ESPAgent-XXXX` network name
 
 Current verified highlights:
 
-- USB0 `coordinator_agent` has recovered from an OTA-slot boot failure through a
-  raw full-device `esptool` reflash; the board now boots normally and Feishu WS
+- USB0 `coordinator_agent` has recovered from a bootloader loop through a raw
+  full-device `esptool` reflash; the board now boots normally and Feishu WS
   startup has been re-verified.
 - Feishu entry can route common natural-language requests to Sensor or Control without requiring the user to name an MQTT node id.
 - Slash commands have been board-verified on USB0: `/help` returns directly
@@ -86,11 +76,8 @@ Current verified highlights:
 - Guardian policy decisions include `risk_score` and `privacy_mode=metadata_only`; Guardian also subscribes to `nodes/+/state` and `nodes/+/telemetry` to build lightweight watchdog StateBoard updates.
 - Managed Lua runtime has been deployed to all four ESP32-S3 roles. `tools/test_lua_usb0.py --echo` passed 7/7 on USB0 after SNTP sync, and `tools/test_lua_roles_usb0_3.py` passed 8/8 across USB0-3.
 - ESP32-P4 display firmware has verified Wi-Fi/MQTT connect and topic subscription; full live UI binding should still be treated as in-progress.
-- OTA is intentionally exposed through Serial CLI first, not as a Feishu/LLM tool.
-- Gateway management is now software-integrated: `/status`, `/devices`,
-  `/gateway/ble_mesh/register`, and `/ota/plan` are exposed by the local admin
-  portal. BLE Mesh physical execution and remote OTA execution remain future
-  guarded backends.
+- Local admin mode exposes `/status`, `/devices`, and `/api/skills` for board
+  status, node registry inspection, and runtime skill management.
 
 ## Runtime Flow
 
@@ -162,17 +149,16 @@ ESPAgent/
 │   ├── channels/feishu/        Feishu/Lark WebSocket channel
 │   ├── cli/                    USB serial CLI
 │   ├── cron/                   scheduled agent trigger service
-│   ├── device/                 device registry for Mesh nodes and external gateway devices
+│   ├── device/                 device registry for Mesh nodes
 │   ├── drivers/                sensor and peripheral drivers
 │   ├── espnow/                 ESP-NOW telemetry sender
-│   ├── gateway/                local WebSocket chat gateway and BLE Mesh bridge boundary
+│   ├── gateway/                local WebSocket chat gateway
 │   ├── heartbeat/              heartbeat-driven background checks
 │   ├── llm/                    HTTPS LLM provider client and tool-use parser
 │   ├── memory/                 long-term memory and per-chat JSONL sessions
 │   ├── mesh/                   MQTT Mesh command, policy, and protocol validation
 │   ├── node/                   node identity, role, capabilities, responsibilities
 │   ├── onboard/                Wi-Fi onboarding/admin portal
-│   ├── ota/                    HTTPS OTA update support
 │   ├── proxy/                  HTTP CONNECT proxy support
 │   ├── roles/                  coordinator/sensor/control/guardian/display boundaries
 │   ├── sensors/                periodic sensor publishing integrations
@@ -238,32 +224,14 @@ If a board falls into a bootloader loop such as `invalid segment length 0xffffff
 or `No bootable app partitions`, recover it with a raw full-device reflash
 instead of another incremental `idf.py flash`.
 
-Serial OTA maintenance commands:
-
-```text
-ota_info
-ota_update <https_url_to_ESPAgent.bin>
-```
-
-The OTA URL must point directly to an HTTPS app `.bin` that fits the 2MB OTA slot.
-
-OTA is currently a maintenance primitive, not an AI code-generation feature. A developer or CI still builds `ESPAgent.bin`; future Agent-side work should only orchestrate version discovery, role matching, Guardian approval, user confirmation, deployment, reboot observation, and result reporting.
-
-Gateway/admin validation helpers:
-
-```text
-tool_exec gateway_status '{}'
-tool_exec gateway_register_ble_mesh_device '{"device_id":"blemesh_lamp_01","address":"0005","name":"Lamp","capabilities":"light,onoff"}'
-tool_exec ota_gateway_plan '{"target_role":"control_agent","url":"https://example.com/ESPAgent.bin","version":"test","confirmed":false}'
-```
-
 In AP/admin mode, the same management surface is available through:
 
 ```text
 GET  /status
 GET  /devices
-POST /gateway/ble_mesh/register
-POST /ota/plan
+GET  /api/skills
+POST /api/skills
+DELETE /api/skills
 ```
 
 ## Configuration

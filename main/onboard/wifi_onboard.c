@@ -2,10 +2,8 @@
 #include "onboard_html.h"
 #include "espagent_config.h"
 #include "device/device_registry.h"
-#include "gateway/ble_mesh_bridge.h"
 #include "node/node_profile.h"
 #include "skills/skill_runtime.h"
-#include "tools/tool_gateway.h"
 #include "wifi/wifi_manager.h"
 
 #include <stdint.h>
@@ -251,9 +249,7 @@ static esp_err_t http_get_config(httpd_req_t *req)
 static esp_err_t http_get_status(httpd_req_t *req)
 {
     char devices[3072] = {0};
-    char ble[512] = {0};
     esp_err_t dev_err = espagent_device_registry_to_json(devices, sizeof(devices));
-    esp_err_t ble_err = espagent_ble_mesh_bridge_status_json(ble, sizeof(ble));
 
     cJSON *root = cJSON_CreateObject();
     if (!root) {
@@ -269,12 +265,8 @@ static esp_err_t http_get_status(httpd_req_t *req)
     cJSON_AddNumberToObject(root, "ts_ms", (double)(esp_timer_get_time() / 1000));
 
     cJSON *dev_root = dev_err == ESP_OK ? cJSON_Parse(devices) : NULL;
-    cJSON *ble_root = ble_err == ESP_OK ? cJSON_Parse(ble) : NULL;
     if (dev_root) {
         cJSON_AddItemToObject(root, "device_registry", dev_root);
-    }
-    if (ble_root) {
-        cJSON_AddItemToObject(root, "ble_mesh", ble_root);
     }
 
     char *json = cJSON_PrintUnformatted(root);
@@ -328,66 +320,6 @@ static esp_err_t read_json_body(httpd_req_t *req, char **out)
     }
     *out = buf;
     return ESP_OK;
-}
-
-static esp_err_t http_post_ble_register(httpd_req_t *req)
-{
-    char *body = NULL;
-    esp_err_t err = read_json_body(req, &body);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON body");
-        return ESP_FAIL;
-    }
-    char output[384] = {0};
-    err = espagent_ble_mesh_bridge_register_device(body, output, sizeof(output));
-    free(body);
-    httpd_resp_set_type(req, "application/json");
-    cJSON *resp = cJSON_CreateObject();
-    if (!resp) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
-    cJSON_AddStringToObject(resp, "message", output);
-    char *json = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-    if (!json) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-    esp_err_t send_err = httpd_resp_send(req, json, strlen(json));
-    free(json);
-    return err == ESP_OK ? send_err : ESP_FAIL;
-}
-
-static esp_err_t http_post_ota_plan(httpd_req_t *req)
-{
-    char *body = NULL;
-    esp_err_t err = read_json_body(req, &body);
-    if (err != ESP_OK) {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad JSON body");
-        return ESP_FAIL;
-    }
-    char output[1024] = {0};
-    err = tool_ota_gateway_plan_execute(body, output, sizeof(output));
-    free(body);
-    httpd_resp_set_type(req, "application/json");
-    cJSON *resp = cJSON_CreateObject();
-    if (!resp) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-    cJSON_AddBoolToObject(resp, "ok", err == ESP_OK);
-    cJSON_AddStringToObject(resp, "message", output);
-    char *json = cJSON_PrintUnformatted(resp);
-    cJSON_Delete(resp);
-    if (!json) {
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
-        return ESP_FAIL;
-    }
-    esp_err_t send_err = httpd_resp_send(req, json, strlen(json));
-    free(json);
-    return err == ESP_OK ? send_err : ESP_FAIL;
 }
 
 static esp_err_t http_get_skills(httpd_req_t *req)
@@ -671,7 +603,7 @@ static httpd_handle_t start_http_server(bool captive)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = ESPAGENT_ONBOARD_HTTP_PORT;
-    /* Base admin routes now include config/status/devices/save/OTA/BLE/skills APIs. */
+    /* Base admin routes include config/status/devices/save/skills APIs. */
     config.max_uri_handlers = 24;
     config.stack_size = 8192;
     config.lru_purge_enable = true;
@@ -713,16 +645,6 @@ static httpd_handle_t start_http_server(bool captive)
         .uri = "/save", .method = HTTP_POST, .handler = http_post_save,
     };
     httpd_register_uri_handler(s_server, &uri_save);
-
-    httpd_uri_t uri_ble_register = {
-        .uri = "/gateway/ble_mesh/register", .method = HTTP_POST, .handler = http_post_ble_register,
-    };
-    httpd_register_uri_handler(s_server, &uri_ble_register);
-
-    httpd_uri_t uri_ota_plan = {
-        .uri = "/ota/plan", .method = HTTP_POST, .handler = http_post_ota_plan,
-    };
-    httpd_register_uri_handler(s_server, &uri_ota_plan);
 
     httpd_uri_t uri_skills_get = {
         .uri = "/api/skills", .method = HTTP_GET, .handler = http_get_skills,

@@ -46,11 +46,9 @@ set(ESPAGENT_MESH_ROLE_SRCS
 set(ESPAGENT_CHANNEL_SRCS
     "channels/feishu/feishu_bot.c"
     "gateway/ws_server.c"
-    "gateway/ble_mesh_bridge.c"
     "cli/serial_cli.c"
     "proxy/http_proxy.c"
     "onboard/wifi_onboard.c"
-    "ota/ota_manager.c"
 )
 
 set(ESPAGENT_BACKGROUND_SRCS
@@ -69,7 +67,6 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_web_search.c"
     "tools/tool_get_time.c"
     "tools/tool_lua.c"
-    "tools/tool_gateway.c"
     "tools/tool_files.c"
     "tools/tool_mesh_command.c"
     "tools/tool_virtual_device.c"
@@ -107,7 +104,7 @@ idf_component_register(
         "."
     REQUIRES
         nvs_flash esp_wifi esp_netif esp_http_client esp_http_server
-        esp_https_ota esp_event spiffs console vfs app_update esp-tls
+        esp_event spiffs console vfs esp-tls
         esp_timer esp_websocket_client esp_driver_gpio esp_driver_rmt esp_driver_i2c
         esp_driver_spi esp_adc
         esp_driver_ledc esp_driver_uart esp_driver_i2s

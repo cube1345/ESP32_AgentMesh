@@ -56,7 +56,6 @@ main/
 ├── mesh/           MQTT Mesh protocol structs, topics, and validation
 ├── node/           Node identity, role, and capability model
 ├── onboard/        Wi-Fi onboarding/admin portal
-├── ota/            HTTPS OTA maintenance primitive
 ├── proxy/          HTTP CONNECT proxy support
 ├── roles/          Coordinator/Sensor/Control/Guardian/Display role services
 ├── sensors/        Periodic sensor telemetry and MQTT integrations

@@ -20,7 +20,7 @@
 \setlist[enumerate]{leftmargin=2.0em}
 \renewcommand{\arraystretch}{1.2}
 
-\title{基于 ESP32/RPi 的多 Agent 智能管家系统功能说明}
+\title{基于 ESP32 的多 Agent 智能管家系统功能说明}
 \author{}
 \date{}
 
@@ -29,7 +29,7 @@
 \maketitle
 
 \begin{abstract}
-本文基于项目当前仓库实现，对多 Agent 智能管家系统的功能进行系统化梳理，并按作品说明文档格式输出为 \LaTeX{} 版本。系统以 ESP32-S3 为核心，构建了 coordinator\_agent、sensor\_agent、control\_agent、guardian\_agent 四角色协同架构，结合 ESP32-P4/网页前端展示终端与 RPi 扩展网关，形成“自然语言入口---多节点调度---环境感知---硬件执行---策略审计---结果回传”的完整闭环。系统已实现 Feishu/WebSocket/串口多入口交互、MQTT Mesh 节点协同、环境感知、执行器控制、自动化工作流、条件规则、定时任务、技能装载、长期记忆、子代理调用、可视化时间线、Sandbox 拦截展示、Guardian 策略裁决和控制急停等能力。本文重点列出当前代码中已经落地的功能边界、工具能力、软件组成与扩展方向，便于后续参赛文档、答辩汇报与系统归档统一使用。
+本文基于项目当前仓库实现，对多 Agent 智能管家系统的功能进行系统化梳理，并按作品说明文档格式输出为 \LaTeX{} 版本。系统以 ESP32-S3 为核心，构建了 coordinator\_agent、sensor\_agent、control\_agent、guardian\_agent 四角色协同架构，结合 ESP32-P4/网页前端展示终端，形成“自然语言入口---多节点调度---环境感知---硬件执行---策略审计---结果回传”的完整闭环。系统已实现 Feishu/WebSocket/串口多入口交互、MQTT Mesh 节点协同、环境感知、执行器控制、自动化工作流、条件规则、定时任务、技能装载、长期记忆、子代理调用、可视化时间线、Sandbox 拦截展示、Guardian 策略裁决和控制急停等能力。本文重点列出当前代码中已经落地的功能边界、工具能力、软件组成与扩展方向，便于后续参赛文档、答辩汇报与系统归档统一使用。
 \end{abstract}
 
 \section{作品概述}
@@ -45,7 +45,7 @@
   \item \textbf{安全控制}：支持 Sandbox、参数白名单、Guardian policy gate、控制急停与状态回读。
   \item \textbf{智能运行时能力}：支持 Skills、长期记忆、用户画像、子代理、Lua 脚本扩展和运行时设备清单。
   \item \textbf{可视化展示}：支持节点拓扑、时间线、Sandbox 事件流、Skills Studio、用户偏好面板与 AI 通信面板。
-  \item \textbf{运维与扩展}：支持 OTA 计划、网关状态查看、BLE Mesh 设备注册边界、SPIFFS 文件管理和串口调试命令。
+  \item \textbf{运维与扩展}：支持 SPIFFS 文件管理、运行时 Skills 安装和串口调试命令。
 \end{enumerate}
 
 \subsection{应用领域}
@@ -78,8 +78,8 @@
 \midrule
 Agent 角色数 & 4 个固定 ESP32-S3 角色节点：coordinator\_agent、sensor\_agent、control\_agent、guardian\_agent \\
 展示终端 & 1 个显示/前端终端，支持网页控制台与状态展示 \\
-注册工具能力 & 52 项已注册工具能力（以 \texttt{main/tools/tool\_registry.c} 为准） \\
-Slash 指令数 & 23 项显式 Slash 命令/动作指令 \\
+注册工具能力 & 48 项已注册工具能力（以 \texttt{main/tools/tool\_registry.c} 为准） \\
+Slash 指令数 & 22 项显式 Slash 命令/动作指令 \\
 环境感知能力 & 温湿度、eCO\textsubscript{2}、TVOC、光照、人体存在、超声距离、虚拟只读设备 \\
 执行器能力 & WS2812、普通 GPIO、加湿器、风扇、独立 LED、舵机、Gree 空调 IR、MAX98357 音频、虚拟控制设备 \\
 自动化能力 & 工作流 1 类、条件规则 1 类、定时任务 3 类（every/at/daily） \\
@@ -112,7 +112,7 @@ Slash 指令数 & 23 项显式 Slash 命令/动作指令 \\
   \item \textbf{Sensor 感知层}：负责温湿度、空气质量、光照、人体存在、距离与虚拟设备读取；
   \item \textbf{Control 执行层}：负责 GPIO、灯光、风扇、加湿器、空调、舵机和音频输出；
   \item \textbf{Guardian 安全层}：负责策略裁决、审计、状态板与 Watchdog；
-  \item \textbf{展示与扩展层}：包括网页控制台、ESP32-P4 展示终端、RPi 网关与运行时 Skills。
+  \item \textbf{展示与扩展层}：包括网页控制台、ESP32-P4 展示终端与运行时 Skills。
 \end{enumerate}
 
 \begin{table}[h]
@@ -126,7 +126,6 @@ Sensor 节点 & 感知中枢 & 周期采集环境数据，响应传感器读取�
 Control 节点 & 执行中枢 & 执行灯光、GPIO、舵机、风扇、加湿器、空调和音频等控制动作 \\
 Guardian 节点 & 安全中枢 & 对高风险操作进行 policy 决策、审计、StateBoard 更新和节点看门狗 \\
 Display/Web 前端 & 展示终端 & 展示拓扑、时间线、Sandbox、Skills、偏好和聊天消息 \\
-RPi 网关 & 扩展网关 & 作为本地 AI/MQTT/MCP/知识库扩展载体，承接后续边缘计算能力 \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -134,7 +133,7 @@ RPi 网关 & 扩展网关 & 作为本地 AI/MQTT/MCP/知识库扩展载体，承
 \subsection{硬件系统介绍}
 
 \subsubsection{硬件整体介绍}
-硬件系统由多块 ESP32-S3 节点和一个展示终端组成。各节点通过 MQTT Mesh 协同工作，其中 coordinator 节点承载 Agent 主循环，sensor 节点承载环境传感器，control 节点承载执行器，guardian 节点承载安全边界和审计逻辑。系统外围可进一步连接 ESP32-P4/C6 显示终端与 RPi 网关。
+硬件系统由多块 ESP32-S3 节点和一个展示终端组成。各节点通过 MQTT Mesh 协同工作，其中 coordinator 节点承载 Agent 主循环，sensor 节点承载环境传感器，control 节点承载执行器，guardian 节点承载安全边界和审计逻辑。系统外围可进一步连接 ESP32-P4/C6 显示终端。
 
 \subsubsection{机械设计介绍}
 当前系统核心侧重电子与软件联调，机械结构不是主要实现对象，因此暂未形成独立的机械机构设计模块。若后续参赛版本加入外壳、传感器支架或桌面终端结构，可在本节补充总体外观、局部支撑件和装配图。
@@ -202,7 +201,7 @@ RPi 网关 & 扩展网关 & 作为本地 AI/MQTT/MCP/知识库扩展载体，承
   \item 支持 control\_agent 急停闭锁，防止高频或异常动作持续执行。
 \end{itemize}
 
-\paragraph{7) 52 项工具能力清单}
+\paragraph{7) 48 项工具能力清单}
 \begin{longtable}{p{2.8cm}p{3.6cm}p{8.0cm}}
 \toprule
 \textbf{类别} & \textbf{工具名} & \textbf{功能说明} \\
@@ -234,10 +233,6 @@ Lua 扩展 & \texttt{lua\_stop\_job} & 停止 Lua 后台任务 \\
 自动化 & \texttt{automation\_create\_rule} & 创建持续条件规则 \\
 自动化 & \texttt{automation\_list} & 列出工作流和规则 \\
 自动化 & \texttt{automation\_remove} & 删除工作流或规则 \\
-网关 & \texttt{gateway\_status} & 查询网关、设备注册表和 OTA 边界状态 \\
-网关 & \texttt{gateway\_register\_ble\_mesh\_device} & 注册 BLE Mesh 外部设备信息 \\
-网关 & \texttt{gateway\_ble\_mesh\_send} & 发送或暂存 BLE Mesh 网关命令 \\
-运维 & \texttt{ota\_gateway\_plan} & 生成 OTA 升级计划 \\
 Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理聚焦子任务 \\
 综合感知 & \texttt{read\_environment} & 一次性读取温湿度、空气质量和光照 \\
 综合感知 & \texttt{read\_presence} & 读取人体存在或近距靠近状态 \\
@@ -268,7 +263,7 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理聚焦子�
 \end{longtable}
 
 \paragraph{8) Slash 指令能力}
-系统还支持显式 Slash 路由与动作指令，包括：\texttt{/help}、\texttt{/clear}、\texttt{/clear\_all\_memory}、\texttt{/context\_status}、\texttt{/skills\_list}、\texttt{/skills\_show}、\texttt{/sensor}、\texttt{/control}、\texttt{/guardian}、\texttt{/subagent}、\texttt{/workflow}、\texttt{/rule}、\texttt{/local}、\texttt{/mesh}、\texttt{/status}、\texttt{/stop}、\texttt{/resume}、\texttt{/device}、\texttt{/profile}、\texttt{/skills}、\texttt{/privacy}、\texttt{/lua}、\texttt{/trace}、\texttt{/ota}。这些指令可直接约束 Agent 的路由、执行范围和工具选择。
+系统还支持显式 Slash 路由与动作指令，包括：\texttt{/help}、\texttt{/clear}、\texttt{/clear\_all\_memory}、\texttt{/context\_status}、\texttt{/skills\_list}、\texttt{/skills\_show}、\texttt{/sensor}、\texttt{/control}、\texttt{/guardian}、\texttt{/subagent}、\texttt{/workflow}、\texttt{/rule}、\texttt{/local}、\texttt{/mesh}、\texttt{/status}、\texttt{/stop}、\texttt{/resume}、\texttt{/device}、\texttt{/profile}、\texttt{/skills}、\texttt{/privacy}、\texttt{/lua} 和 \texttt{/trace}。这些指令可直接约束 Agent 的路由、执行范围和工具选择。
 
 \section{完成情况及性能参数}
 
@@ -309,10 +304,10 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理聚焦子�
 本系统当前已经可以量化展示的能力成果如下：
 \begin{enumerate}
   \item 支持 4 个固定角色节点协同运行，形成分工明确的边缘多 Agent 架构。
-  \item 支持 52 项注册工具能力，覆盖感知、控制、自动化、技能、文件、网关和运维能力。
+  \item 支持 48 项注册工具能力，覆盖感知、控制、自动化、技能、文件和运行时扩展能力。
   \item 支持 3 类自动化机制：多步工作流、条件规则、定时任务。
   \item 支持 3 类用户入口：Feishu、WebSocket 网页前端、串口 CLI。
-  \item 支持 23 项 Slash 指令，实现显式路由、显式清理、显式状态查询与显式技能访问。
+  \item 支持 22 项 Slash 指令，实现显式路由、显式清理、显式状态查询与显式技能访问。
   \item 支持 Runtime Skill 安装到 SPIFFS，无需重复烧录即可扩展系统知识。
   \item 支持 Sandbox 可视化，前端可以单独查看拦截事件、风险事件和确认要求。
   \item 支持控制急停与解除急停，适合在执行器联调阶段进行安全兜底。
@@ -324,14 +319,12 @@ Agent 协作 & \texttt{spawn\_subagent} & 派生临时子代理处理聚焦子�
 系统后续可沿以下方向扩展：
 \begin{itemize}
   \item 扩展更多运行时设备清单，使 UART/I2C/SPI 外设无需重写大量固件即可接入；
-  \item 将 OTA 从“计划生成”扩展为 Guardian 审批后的远程执行闭环；
   \item 继续优化前端交互链路和板端任务调度策略，降低实时控制与长上下文推理之间的资源竞争；
-  \item 将 BLE Mesh、RPi 本地模型、知识库和 MCP 能力进一步纳入统一调度面板；
   \item 增加更丰富的用户画像与偏好闭环，实现更主动的环境控制与消息提醒。
 \end{itemize}
 
 \subsection{心得体会}
-本系统的核心经验在于：面向真实硬件的 Agent 系统，不能只追求“能回答”，更要追求“能执行、能回看、能审计、能停下”。因此在设计中引入了角色分工、Mesh 协同、自动化引擎、Guardian 审核、Sandbox 拦截和前端时间线展示等机制，使自然语言控制不再停留在单轮对话，而是能够落到实际设备、后台任务和持续规则中。同时，系统保留了 Skills、Lua、设备清单和 RPi 网关等扩展边界，为后续从单一智能家居演示走向复杂边缘智能平台留下了接口。
+本系统的核心经验在于：面向真实硬件的 Agent 系统，不能只追求“能回答”，更要追求“能执行、能回看、能审计、能停下”。因此在设计中引入了角色分工、Mesh 协同、自动化引擎、Guardian 审核、Sandbox 拦截和前端时间线展示等机制，使自然语言控制不再停留在单轮对话，而是能够落到实际设备、后台任务和持续规则中。同时，系统保留了 Skills、Lua 和设备清单等扩展边界，为后续从单一智能家居演示走向复杂边缘智能平台留下了接口。
 
 \section{参考文献}
 \begin{enumerate}

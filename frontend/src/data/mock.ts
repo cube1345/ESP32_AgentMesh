@@ -67,8 +67,7 @@ const capabilities: Capability[] = [
   { name: 'gree_ac_control', category: '控制', role: 'control_agent', maturity: '已验证', summary: '格力空调 IR 发射控制，支持常用模式和温度调整。' },
   { name: 'policy_check', category: '安全', role: 'guardian_agent', maturity: '已验证', summary: '对远程控制请求进行风险判定与审计。' },
   { name: 'lua_run_script', category: '扩展', role: 'coordinator_agent', maturity: '已验证', summary: '通过受限 Lua 运行时扩展板端能力。' },
-  { name: 'virtual_device_control', category: '扩展', role: 'control_agent', maturity: '进行中', summary: '以 manifest 驱动受控设备，统一权限与 cooldown。' },
-  { name: 'BLE Mesh Gateway', category: '协同', role: 'coordinator_agent', maturity: '规划中', summary: '网关边界已经建模，物理执行仍待后端链路接入。' }
+  { name: 'virtual_device_control', category: '扩展', role: 'control_agent', maturity: '进行中', summary: '以 manifest 驱动受控设备，统一权限与 cooldown。' }
 ];
 
 const timeline: TimelineEvent[] = [

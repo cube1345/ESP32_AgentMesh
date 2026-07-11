@@ -31,8 +31,7 @@
 - `/dev/ttyACM*` 不作为四角色烧录端口；如果某个 `/dev/ttyUSB0-3` 不存在，就视为对应 ESP32-S3 未检测到，不要改烧 ACM。
 - 在本工作环境中，读取串口监视器时需要提权；非提权扫描可能短暂看不到 `/dev/ttyUSB*`，但提权读取可看到四块板日志。
 - 建议联调时一次发送一条飞书命令，再并行观察 USB0/USB1/USB2/USB3，避免多条 LLM 回合交错。
-- 2026-06-17 起固件已加入串口 OTA 维护命令：`ota_info` 查看当前 OTA 分区，`ota_update <https_url_to_ESPAgent.bin>` 从 HTTPS app bin 升级 inactive slot。四角色仍是 build-time profile，OTA 镜像必须按目标角色构建，或后续把 role profile 迁移到 NVS。
-- 2026-06-21 已新增 `ota_gateway_plan` 和本地 `/ota/plan` API，用于 Coordinator/管理页生成 OTA 运维计划并发布到 timeline；它不是远程刷机执行器。真正升级仍通过串口 `ota_update`，后续远程执行必须补 Guardian 审批、镜像来源校验、目标角色校验和进度回传。
+- 当前分支已移除串口 OTA 维护命令和 OTA 计划 API，固件更新回到开发机侧烧录流程，避免 MCU 侧承担额外运维链路。
 
 当前联调用的 MQTT broker 是公网测试 broker：
 
@@ -206,7 +205,7 @@ espagent/roles/control_agent/command
 - 2026-06-21 已补齐 esp-claw-like 单板 runtime 第一版：`main/capability/` 将 legacy tools 镜像成 capability descriptor，`role_capability_profile` 按角色过滤 LLM 可见能力，`main/events/` 统一事件流，Memory v2 保存用户画像和 skill observation，dynamic extension catalog 记录 manifest/Lua/复杂协议扩展边界。
 - Lua runtime 已部署到四个 ESP32-S3 角色：`ESPAGENT_ENABLE_LUA_RUNTIME=1`，`georgik/lua` 已链接，`lua_runtime_info`、`lua_list_modules`、`lua_list_scripts`、`lua_run_source`、`lua_run_script`、`lua_run_script_async`、`lua_list_jobs`、`lua_get_job`、`lua_stop_job` 进入 tool/capability/sandbox/profile 体系。USB0 Lua smoke 7/7 PASS，USB0-3 跨角色 smoke 8/8 PASS。
 - 2026-06-21 已推进“多节点必要性”软件侧增强：Sensor telemetry 增加本地 ring cache/EWMA 滤波字段 `temp_avg`、`humidity_avg`、`light_lux_avg` 和 `sample_count`，并在温度高、湿度低/高、光照低等阈值状态变化时发布 `espagent.sensor_event.v1` 到 node events、全局 alerts 和 timeline；Control 在每次远程执行器命令后发布 `espagent.control_state.v1`，让 Android/P4 可见 busy、emergency_stop、interlock 和最近 actuator 状态；Guardian `policy_decision` 增加 `risk_score` 与 `privacy_mode=metadata_only`，并订阅 `nodes/+/state`、`nodes/+/telemetry` 聚合轻量 watchdog StateBoard。该轮已通过 `idf.py build`，最新 app 约 `0x190fe0`，2MB app 分区剩余约 22%；四板实机压测仍需后续执行。
-- 2026-06-21 已新增 Gateway 管理能力：`device_registry` 持久化 MQTT Mesh 节点和外部网关设备；Wi-Fi onboarding/admin 页面新增 Gateway Status、BLE Mesh Device、OTA Gateway Plan；本地 API 提供 `/status`、`/devices`、`/gateway/ble_mesh/register`、`/ota/plan`；工具层新增 `gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`。BLE Mesh 当前只完成 bridge boundary，真实 BLE Mesh 后端未链接时会返回 `not_linked`。
+- 当前分支已移除 BLE Mesh Gateway 和 OTA Plan 相关工具/API，保留 `device_registry` 用于 MQTT Mesh 节点状态记录；Wi-Fi onboarding/admin 页面仅保留 `/status`、`/devices` 与 Skills 管理接口。
 
 尚未完善：
 
@@ -223,7 +222,7 @@ espagent/roles/control_agent/command
 
 当前需要分清“固件体积”和“运行时启用服务”：
 
-- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；2026-06-21 加入 Gateway/device_registry/管理 API 后 app 镜像约 `0x195920`，2MB app 分区剩余约 `0x6a6e0`，约 21%。后续继续加入 BLE Mesh 后端、Lua package、board profile 和 display console 时需要关注 app 分区余量。
+- Flash 还没有按角色裁剪。四块板使用同一套 app 镜像；当前分支已移除 BLE Mesh Gateway、OTA Plan 和语音链路，后续继续加入 Lua package、board profile 和 display console 时仍需要关注 app 分区余量。
 - 运行时已经按 role/capability 裁剪服务。Coordinator 最重，Sensor/Control 中等，Guardian 目前较轻但已承担审计入口。
 - USB0 Coordinator 启动日志显示 PSRAM 约 8MB 可用，完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用；说明当前并未真正把硬件资源吃满。
 

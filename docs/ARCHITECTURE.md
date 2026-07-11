@@ -360,10 +360,6 @@ main/
 ├── cli/
 │   ├── serial_cli.h        CLI init API
 │   └── serial_cli.c        esp_console REPL with debug/maintenance commands
-│
-└── ota/
-    ├── ota_manager.h       OTA update API
-    └── ota_manager.c       HTTPS-only esp_https_ota wrapper + partition info
 ```
 
 ---
@@ -425,15 +421,11 @@ faster than a 12 MB SPIFFS image.
 
 Total: 16 MB flash.
 
-Current OTA behavior:
+Firmware update behavior:
 
-- `main/ota/ota_manager.c` uses ESP-IDF `esp_https_ota` with the bundled root CA store.
-- `ota_update` rejects empty URLs and non-HTTPS URLs.
-- The target URL must be an app image such as `ESPAgent.bin`, not a full flash image.
-- The current trigger surface is Serial CLI only: `ota_info` and `ota_update <HTTPS_BIN_URL>`.
-- The Agent does not write firmware source code or compile firmware on the MCU. OTA is an operations path: a developer or CI prepares `ESPAgent.bin`, then the device downloads and installs it.
-- Future Agent-driven OTA should be treated as orchestration only: version discovery, role matching, Guardian approval, human confirmation, command dispatch, reboot observation, and health reporting.
-- Four S3 roles currently use the same firmware image with build-time profile in `espagent_secrets.h`; OTAing a generic image can change that role profile unless the uploaded `.bin` was built for the intended role. A future improvement is to move role identity to NVS so one app image can update all roles safely.
+- Current firmware update flow is handled from the development host through the normal ESP-IDF flashing tools.
+- MCU-side HTTPS OTA code, serial OTA commands, and Agent OTA planning APIs are removed in the focused Agent collaboration branch to reduce firmware surface area and memory pressure.
+- Four S3 roles currently use the same firmware image with build-time profile in `espagent_secrets.h`; role identity can still be moved to NVS later if unified image management becomes necessary.
 
 ---
 
@@ -670,36 +662,8 @@ The CLI provides debug and maintenance commands only. All configuration is done 
 | `session_list`                 | List all session files               |
 | `session_clear <CHAT_ID>`      | Delete a session file                |
 | `heap_info`                    | Show internal + PSRAM free bytes     |
-| `ota_info`                     | Show running, boot, and next OTA partitions |
-| `ota_update <HTTPS_BIN_URL>`   | Download HTTPS app `.bin`, write inactive OTA slot, reboot on success |
 | `restart`                      | Reboot the device                    |
 | `help`                         | List all available commands           |
-
-OTA is currently a local maintenance capability only. It is not registered as an LLM tool and should not be exposed through Feishu until it is gated by Guardian policy, explicit human confirmation, image provenance checks, and role/profile handling.
-
-The intended higher-level OTA flow is:
-
-```text
-developer/CI builds ESPAgent.bin
-        |
-        v
-publish firmware + manifest
-        |
-        v
-Coordinator compares node versions and roles
-        |
-        v
-Guardian checks source, role, version, and risk
-        |
-        v
-user confirms
-        |
-        v
-target ESP32 downloads and applies OTA
-        |
-        v
-node reboots, reports version and health
-```
 
 ---
 
