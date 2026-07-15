@@ -289,6 +289,22 @@ static bool message_has_any_keyword(const char *message,
   return false;
 }
 
+static bool message_has_any_ascii_word(const char *message,
+                                       const char *const *keywords,
+                                       size_t keyword_count) {
+  if (!message || !keywords) {
+    return false;
+  }
+
+  for (size_t i = 0; i < keyword_count; i++) {
+    if (contains_ascii_word_ci(message, keywords[i])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void build_relevance_query(const char *input, char *out,
                                   size_t out_size) {
   if (!out || out_size == 0) {
@@ -1156,12 +1172,18 @@ static bool message_requests_task_removal(const char *message) {
 }
 
 static bool message_requests_task_list(const char *message) {
-  static const char *const keywords[] = {
-      "list", "show", "inspect", "current", "列出", "查看", "当前",
-      "有哪些", "任务列表", "规则列表", "定时列表",
+  static const char *const ascii_keywords[] = {
+      "list", "show", "inspect", "current",
   };
-  return message_has_any_keyword(message, keywords,
-                                 sizeof(keywords) / sizeof(keywords[0]));
+  static const char *const cjk_keywords[] = {
+      "列出", "查看", "当前", "有哪些", "任务列表", "规则列表", "定时列表",
+  };
+  return message_has_any_ascii_word(message, ascii_keywords,
+                                    sizeof(ascii_keywords) /
+                                        sizeof(ascii_keywords[0])) ||
+         message_has_any_keyword(message, cjk_keywords,
+                                 sizeof(cjk_keywords) /
+                                     sizeof(cjk_keywords[0]));
 }
 
 static bool message_mentions_managed_task(const char *message) {
@@ -1300,8 +1322,12 @@ static uint32_t parse_light_sequence_delay_ms(const char *message) {
     while (*q && isspace((unsigned char)*q)) {
       q++;
     }
+    const bool short_seconds =
+        (*q == 's' || *q == 'S') && !isalpha((unsigned char)q[1]);
+    const bool short_minutes =
+        (*q == 'm' || *q == 'M') && !isalpha((unsigned char)q[1]);
     if (strncmp(q, "秒", strlen("秒")) == 0 ||
-        *q == 's' || *q == 'S' || starts_with_ci_ascii(q, "sec") ||
+        short_seconds || starts_with_ci_ascii(q, "sec") ||
         starts_with_ci_ascii(q, "second")) {
       if (value == 0) {
         return 1000;
@@ -1313,7 +1339,7 @@ static uint32_t parse_light_sequence_delay_ms(const char *message) {
     }
     if (strncmp(q, "分钟", strlen("分钟")) == 0 ||
         strncmp(q, "分", strlen("分")) == 0 ||
-        *q == 'm' || *q == 'M' || starts_with_ci_ascii(q, "minute")) {
+        short_minutes || starts_with_ci_ascii(q, "minute")) {
       if (value == 0) {
         return 60000;
       }
@@ -1384,6 +1410,83 @@ static bool extract_next_number_token(const char **cursor,
 
   *out_value = value;
   *cursor = endptr;
+  return true;
+}
+
+static const char *find_first_keyword_position(const char *message,
+                                               const char *const *keywords,
+                                               size_t keyword_count) {
+  if (!message || !keywords) {
+    return NULL;
+  }
+
+  const char *best = NULL;
+  for (size_t i = 0; i < keyword_count; i++) {
+    const char *pos = find_substr_ci_ascii(message, keywords[i]);
+    if (pos && (!best || pos < best)) {
+      best = pos;
+    }
+  }
+  return best;
+}
+
+static bool threshold_in_reasonable_range(double threshold, bool is_humidity) {
+  if (is_humidity) {
+    return threshold >= 0.0 && threshold <= 100.0;
+  }
+  return threshold >= -40.0 && threshold <= 125.0;
+}
+
+static bool extract_condition_threshold_token(const char *message,
+                                              bool is_humidity,
+                                              double *out_value,
+                                              char *token_buf,
+                                              size_t token_buf_size) {
+  if (!message || !out_value || !token_buf || token_buf_size < 2) {
+    return false;
+  }
+
+  static const char *const humidity_keywords[] = {"humidity", "湿度"};
+  static const char *const temperature_keywords[] = {
+      "temperature", "temp", "温度", "气温", "室温",
+  };
+  static const char *const comparator_keywords[] = {
+      "above", "greater", "over", "below", "less", "otherwise", "else",
+      "大于",  "高于",    "超过", "小于",  "低于", "不超过",    "否则",
+  };
+
+  const char *metric_pos =
+      is_humidity
+          ? find_first_keyword_position(
+                message, humidity_keywords,
+                sizeof(humidity_keywords) / sizeof(humidity_keywords[0]))
+          : find_first_keyword_position(
+                message, temperature_keywords,
+                sizeof(temperature_keywords) / sizeof(temperature_keywords[0]));
+  const char *comparator_pos =
+      find_first_keyword_position(
+          message, comparator_keywords,
+          sizeof(comparator_keywords) / sizeof(comparator_keywords[0]));
+  const char *cursor = metric_pos;
+  if (comparator_pos && (!cursor || comparator_pos < cursor)) {
+    cursor = comparator_pos;
+  }
+  if (!cursor) {
+    cursor = message;
+  }
+
+  double threshold = 0.0;
+  char local_token[32] = {0};
+  if (!extract_next_number_token(&cursor, &threshold, local_token,
+                                 sizeof(local_token))) {
+    return false;
+  }
+  if (!threshold_in_reasonable_range(threshold, is_humidity)) {
+    return false;
+  }
+
+  snprintf(token_buf, token_buf_size, "%s", local_token);
+  *out_value = threshold;
   return true;
 }
 
@@ -1602,6 +1705,208 @@ static bool try_execute_deterministic_task_remove_request(
   return *final_text != NULL;
 }
 
+static bool is_skill_name_char(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+}
+
+static void strip_skill_md_suffix(char *name) {
+  if (!name) {
+    return;
+  }
+  size_t len = strlen(name);
+  if (len > 3 && strcmp(name + len - 3, ".md") == 0) {
+    name[len - 3] = '\0';
+  }
+}
+
+static bool extract_skill_name_from_message(const char *message, char *out,
+                                            size_t out_size) {
+  if (!message || !out || out_size < 2) {
+    return false;
+  }
+  out[0] = '\0';
+
+  const char *prefix = "/spiffs/skills/";
+  const char *p = find_substr_ci_ascii(message, prefix);
+  if (p) {
+    p += strlen(prefix);
+    size_t off = 0;
+    while (*p && is_skill_name_char(*p) && off + 1 < out_size) {
+      out[off++] = *p++;
+    }
+    out[off] = '\0';
+    strip_skill_md_suffix(out);
+    return out[0] != '\0';
+  }
+
+  for (p = message; *p; p++) {
+    if (!is_skill_name_char(*p)) {
+      continue;
+    }
+    char token[96] = {0};
+    size_t off = 0;
+    const char *q = p;
+    while (*q && is_skill_name_char(*q) && off + 1 < sizeof(token)) {
+      token[off++] = *q++;
+    }
+    token[off] = '\0';
+    if (contains_substr_ci(token, ".md")) {
+      strip_skill_md_suffix(token);
+      snprintf(out, out_size, "%s", token);
+      return out[0] != '\0';
+    }
+    p = q;
+    if (!*p) {
+      break;
+    }
+  }
+
+  return false;
+}
+
+static bool message_requests_skill_summary(const char *message) {
+  static const char *const keywords[] = {
+      "summary", "summarize", "purpose", "use", "用途", "总结", "概括",
+      "一句话", "说明",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static bool message_requests_skill_mutation_or_tool_execution(
+    const char *message) {
+  static const char *const keywords[] = {
+      "write_file", "edit_file", "delete", "remove", "create", "update",
+      "confirmed=true", "confirmed", "写入", "创建", "修改", "删除",
+      "移除", "覆盖", "确认", "持久", "落盘",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
+static void build_skill_description_summary(const char *skill_text,
+                                            char *out,
+                                            size_t out_size) {
+  if (!out || out_size == 0) {
+    return;
+  }
+  out[0] = '\0';
+  if (!skill_text) {
+    return;
+  }
+
+  const char *p = skill_text;
+  while (*p) {
+    const char *line_start = p;
+    const char *line_end = strchr(p, '\n');
+    if (!line_end) {
+      line_end = p + strlen(p);
+    }
+
+    while (line_start < line_end &&
+           isspace((unsigned char)*line_start)) {
+      line_start++;
+    }
+    const bool blank = line_start >= line_end;
+    const bool heading = !blank && *line_start == '#';
+    if (!blank && !heading) {
+      size_t off = 0;
+      while (line_start < line_end && off + 1 < out_size) {
+        out[off++] = *line_start++;
+      }
+      out[off] = '\0';
+      while (*line_end == '\n' || *line_end == '\r') {
+        line_end++;
+      }
+      while (*line_end && *line_end != '\n' && *line_end != '\r' &&
+             *line_end != '#') {
+        if (off + 2 >= out_size) {
+          break;
+        }
+        out[off++] = ' ';
+        while (*line_end && *line_end != '\n' && *line_end != '\r' &&
+               off + 1 < out_size) {
+          out[off++] = *line_end++;
+        }
+        out[off] = '\0';
+        while (*line_end == '\n' || *line_end == '\r') {
+          line_end++;
+        }
+      }
+      return;
+    }
+
+    p = (*line_end == '\0') ? line_end : line_end + 1;
+  }
+}
+
+static bool try_execute_deterministic_skill_read_request(
+    const espagent_msg_t *msg, char **final_text) {
+  if (!msg || !msg->content || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content)) {
+    return false;
+  }
+  if (!contains_substr_ci(msg->content, "/spiffs/skills/") &&
+      !contains_substr_ci(msg->content, "skill") &&
+      !contains_substr_ci(msg->content, "技能")) {
+    return false;
+  }
+  if (message_requests_skill_mutation_or_tool_execution(msg->content)) {
+    return false;
+  }
+
+  char skill_name[96] = {0};
+  if (!extract_skill_name_from_message(msg->content, skill_name,
+                                       sizeof(skill_name))) {
+    return false;
+  }
+
+  char *skill_text = heap_caps_calloc(1, 4096, MALLOC_CAP_SPIRAM);
+  if (!skill_text) {
+    *final_text = strdup("内存不足，无法读取 runtime skill。");
+    return *final_text != NULL;
+  }
+
+  char title[128] = {0};
+  esp_err_t err = skill_loader_read_skill_by_name(
+      skill_name, skill_text, 4096, title, sizeof(title));
+  if (err != ESP_OK || !skill_text[0]) {
+    char reply[192] = {0};
+    snprintf(reply, sizeof(reply), "未找到 runtime skill: %.96s", skill_name);
+    free(skill_text);
+    *final_text = strdup(reply);
+    return *final_text != NULL;
+  }
+
+  bool wants_summary = message_requests_skill_summary(msg->content);
+  if (wants_summary) {
+    char summary[512] = {0};
+    char reply[768] = {0};
+    build_skill_description_summary(skill_text, summary, sizeof(summary));
+    snprintf(reply, sizeof(reply), "%s 的用途：%s",
+             title[0] ? title : skill_name,
+             summary[0] ? summary : "提供该 runtime skill 的操作说明。");
+    free(skill_text);
+    *final_text = strdup(reply);
+    return *final_text != NULL;
+  }
+
+  char *full_reply = heap_caps_calloc(1, 4608, MALLOC_CAP_SPIRAM);
+  if (full_reply) {
+    snprintf(full_reply, 4608, "# %s\n\n%s",
+             title[0] ? title : skill_name, skill_text);
+    free(skill_text);
+    *final_text = full_reply;
+    return true;
+  }
+
+  *final_text = strdup(skill_text);
+  free(skill_text);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_condition_rule_request(
     const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
     char **final_text) {
@@ -1646,11 +1951,11 @@ static bool try_execute_deterministic_condition_rule_request(
     return false;
   }
 
-  const char *cursor = msg->content;
   char threshold_token[32] = {0};
   double threshold = 0.0;
-  if (!extract_next_number_token(&cursor, &threshold, threshold_token,
-                                 sizeof(threshold_token))) {
+  if (!extract_condition_threshold_token(msg->content, is_humidity,
+                                         &threshold, threshold_token,
+                                         sizeof(threshold_token))) {
     return false;
   }
 
@@ -1853,11 +2158,11 @@ static bool try_execute_deterministic_temperature_fan_rule(
     return false;
   }
 
-  const char *cursor = msg->content;
   char threshold_token[32] = {0};
   double threshold = 0.0;
-  if (!extract_next_number_token(&cursor, &threshold, threshold_token,
-                                 sizeof(threshold_token))) {
+  if (!extract_condition_threshold_token(msg->content, false, &threshold,
+                                         threshold_token,
+                                         sizeof(threshold_token))) {
     return false;
   }
 
@@ -1993,6 +2298,250 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
   return *final_text != NULL;
 }
 
+typedef struct {
+  const char *pos;
+  const char *action;
+  const char *label;
+  char args_json[96];
+} workflow_step_hint_t;
+
+static const char *find_first_alias_position(const char *message,
+                                             const char *const *aliases,
+                                             size_t alias_count) {
+  const char *best = NULL;
+  if (!message || !aliases) {
+    return NULL;
+  }
+  for (size_t i = 0; i < alias_count; i++) {
+    const char *pos = find_substr_ci_ascii(message, aliases[i]);
+    if (pos && (!best || pos < best)) {
+      best = pos;
+    }
+  }
+  return best;
+}
+
+static const char *find_first_status_light_color_position(
+    const char *message, const char **out_color) {
+  const char *best_pos = NULL;
+  const char *best_color = NULL;
+  if (out_color) {
+    *out_color = NULL;
+  }
+  if (!message) {
+    return NULL;
+  }
+
+  for (size_t i = 0; i < sizeof(status_light_colors) / sizeof(status_light_colors[0]); i++) {
+    const status_light_color_alias_t *color = &status_light_colors[i];
+    for (size_t j = 0; j < color->alias_count; j++) {
+      const char *pos = find_substr_ci_ascii(message, color->aliases[j]);
+      if (pos && (!best_pos || pos < best_pos)) {
+        best_pos = pos;
+        best_color = color->name;
+      }
+    }
+  }
+  if (out_color) {
+    *out_color = best_color;
+  }
+  return best_pos;
+}
+
+static void copy_keyword_window(const char *message, const char *pos,
+                                char *out, size_t out_size) {
+  if (!message || !pos || !out || out_size == 0) {
+    return;
+  }
+  out[0] = '\0';
+  const char *start = pos;
+  size_t back = 0;
+  while (start > message && back < 96) {
+    start--;
+    back++;
+  }
+  const char *end = pos;
+  size_t forward = 0;
+  while (*end && forward < 96) {
+    end++;
+    forward++;
+  }
+  size_t len = (size_t)(end - start);
+  if (len >= out_size) {
+    len = out_size - 1;
+  }
+  memcpy(out, start, len);
+  out[len] = '\0';
+}
+
+static int detect_binary_state_near(const char *message, const char *pos,
+                                    int default_state) {
+  char window[224] = {0};
+  copy_keyword_window(message, pos, window, sizeof(window));
+  if (contains_substr_ci(window, "turn off") ||
+      contains_substr_ci(window, "switch off") ||
+      contains_substr_ci(window, "close") ||
+      contains_substr_ci(window, "disable") ||
+      contains_substr_ci(window, "关闭") ||
+      contains_substr_ci(window, "关掉") ||
+      contains_substr_ci(window, "关上") ||
+      contains_substr_ci(window, "拉低")) {
+    return 0;
+  }
+  if (contains_substr_ci(window, "turn on") ||
+      contains_substr_ci(window, "switch on") ||
+      contains_substr_ci(window, "open") ||
+      contains_substr_ci(window, "enable") ||
+      contains_substr_ci(window, "打开") ||
+      contains_substr_ci(window, "开启") ||
+      contains_substr_ci(window, "启动") ||
+      contains_substr_ci(window, "拉高")) {
+    return 1;
+  }
+  return default_state;
+}
+
+static bool add_binary_device_workflow_hint(
+    workflow_step_hint_t *hints, int *count, int max_count,
+    const char *message, const char *action, const char *label,
+    const char *const *aliases, size_t alias_count) {
+  if (!hints || !count || *count >= max_count || !message || !action ||
+      !label || !aliases) {
+    return false;
+  }
+  const char *pos = find_first_alias_position(message, aliases, alias_count);
+  if (!pos) {
+    return false;
+  }
+  int state = detect_binary_state_near(message, pos, 1);
+  workflow_step_hint_t *hint = &hints[*count];
+  hint->pos = pos;
+  hint->action = action;
+  hint->label = label;
+  snprintf(hint->args_json, sizeof(hint->args_json), "{\"state\":%d}", state);
+  (*count)++;
+  return true;
+}
+
+static void sort_workflow_hints_by_position(workflow_step_hint_t *hints,
+                                            int count) {
+  for (int i = 0; i < count; i++) {
+    for (int j = i + 1; j < count; j++) {
+      if (hints[j].pos < hints[i].pos) {
+        workflow_step_hint_t tmp = hints[i];
+        hints[i] = hints[j];
+        hints[j] = tmp;
+      }
+    }
+  }
+}
+
+static bool try_execute_deterministic_mixed_control_workflow(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      message_has_condition_rule_marker(msg->content) ||
+      !message_has_sequence_marker(msg->content)) {
+    return false;
+  }
+
+  workflow_step_hint_t hints[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
+  int count = 0;
+
+  const char *color = NULL;
+  const char *color_pos =
+      find_first_status_light_color_position(msg->content, &color);
+  if (color_pos && color && count < ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS) {
+    hints[count].pos = color_pos;
+    hints[count].action = "set_status_light";
+    hints[count].label = "状态灯";
+    snprintf(hints[count].args_json, sizeof(hints[count].args_json),
+             "{\"color\":\"%s\"}", color);
+    count++;
+  }
+
+  static const char *const fan_aliases[] = {"set_fan", "fan", "风扇"};
+  static const char *const humidifier_aliases[] = {
+      "set_humidifier", "humidifier", "加湿器",
+  };
+  static const char *const led_aliases[] = {
+      "set_device_led", "device led", "gpio6 led", "gpio6灯", "gpio 6灯",
+      "普通led", "单色led", "独立led",
+  };
+
+  add_binary_device_workflow_hint(
+      hints, &count, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
+      msg->content, "set_fan", "风扇", fan_aliases,
+      sizeof(fan_aliases) / sizeof(fan_aliases[0]));
+  add_binary_device_workflow_hint(
+      hints, &count, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
+      msg->content, "set_humidifier", "加湿器", humidifier_aliases,
+      sizeof(humidifier_aliases) / sizeof(humidifier_aliases[0]));
+  add_binary_device_workflow_hint(
+      hints, &count, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
+      msg->content, "set_device_led", "GPIO6 独立 LED", led_aliases,
+      sizeof(led_aliases) / sizeof(led_aliases[0]));
+
+  if (count < 2) {
+    return false;
+  }
+  sort_workflow_hints_by_position(hints, count);
+
+  uint32_t delay_ms = parse_light_sequence_delay_ms(msg->content);
+  cJSON *root = cJSON_CreateObject();
+  cJSON *steps = cJSON_CreateArray();
+  if (!root || !steps) {
+    cJSON_Delete(root);
+    cJSON_Delete(steps);
+    return false;
+  }
+  cJSON_AddStringToObject(root, "name", "mixed_control_sequence");
+  cJSON_AddItemToObject(root, "steps", steps);
+
+  for (int i = 0; i < count; i++) {
+    cJSON *step = cJSON_CreateObject();
+    cJSON *args = cJSON_Parse(hints[i].args_json);
+    if (!step || !args || !cJSON_IsObject(args)) {
+      cJSON_Delete(step);
+      cJSON_Delete(args);
+      cJSON_Delete(root);
+      return false;
+    }
+    cJSON_AddNumberToObject(step, "delay_ms", i == 0 ? 0 : (double)delay_ms);
+    cJSON_AddStringToObject(step, "target_role", "control_agent");
+    cJSON_AddStringToObject(step, "action", hints[i].action);
+    cJSON_AddItemToObject(step, "args", args);
+    cJSON_AddItemToArray(steps, step);
+  }
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_workflow", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic mixed workflow route => %s",
+           tool_output);
+
+  char reply_buf[640] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建混合多步流程：先执行%s，%.1f秒后继续执行后续动作，共%d步。%s",
+             hints[0].label, (double)delay_ms / 1000.0, count, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "混合多步流程创建失败：%s",
+             tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_subagent_request(
     const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
     char **final_text) {
@@ -2091,11 +2640,7 @@ static bool try_execute_deterministic_scheduled_light_request(
     return false;
   }
 
-  const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
-  if (message_has_sequence_marker(msg->content) &&
-      extract_status_light_color_sequence(msg->content,
-                                          colors,
-                                          ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS) >= 2) {
+  if (message_has_sequence_marker(msg->content)) {
     return false;
   }
 
@@ -3409,6 +3954,7 @@ static void agent_loop_task(void *arg) {
     tool_fallback[0] = '\0';
 
     if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
+        !try_execute_deterministic_skill_read_request(&msg, &final_text) &&
         !try_execute_deterministic_task_list_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_task_remove_request(
@@ -3422,6 +3968,8 @@ static void agent_loop_task(void *arg) {
         !try_execute_deterministic_light_workflow(&msg, tool_output,
                                                   TOOL_OUTPUT_SIZE,
                                                   &final_text) &&
+        !try_execute_deterministic_mixed_control_workflow(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_scheduled_light_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_cron_clarification(&msg, &final_text) &&

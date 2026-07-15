@@ -713,7 +713,7 @@ esp_err_t tool_registry_init(void)
             "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
             "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"],\"description\":\"Whitelisted mesh action\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
             "\"required\":[\"action\"]}}},"
@@ -735,9 +735,9 @@ esp_err_t tool_registry_init(void)
             "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this persistent automation rule\"},"
             "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
             "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
             "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
             "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
         .execute = tool_automation_create_rule_execute,
     });

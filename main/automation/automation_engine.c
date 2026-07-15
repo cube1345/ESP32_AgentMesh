@@ -201,16 +201,21 @@ static void json_copy_object_string(cJSON *obj, const char *key, char *out, size
 
 static const char *default_role_for_action(const char *action, const char *fallback)
 {
-    if (action && strcmp(action, "read_temperature_humidity") == 0) {
+    if (action &&
+        (strcmp(action, "read_temperature_humidity") == 0 ||
+         strcmp(action, "virtual_device_read") == 0)) {
         return "sensor_agent";
     }
     if (action &&
         (strcmp(action, "set_status_light") == 0 ||
          strcmp(action, "ws2812_set") == 0 ||
+         strcmp(action, "virtual_device_control") == 0 ||
          strcmp(action, "set_humidifier") == 0 ||
          strcmp(action, "set_fan") == 0 ||
          strcmp(action, "set_device_led") == 0 ||
          strcmp(action, "servo_write") == 0 ||
+         strcmp(action, "copper_gpio_write") == 0 ||
+         strcmp(action, "gree_ac_control") == 0 ||
          strcmp(action, "gpio_write") == 0)) {
         return "control_agent";
     }
