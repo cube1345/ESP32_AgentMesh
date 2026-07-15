@@ -1,6 +1,6 @@
 # Public Knowledge
 
-Last updated: 2026-06-21
+Last updated: 2026-07-15
 
 This file is the required shared handoff document for any AI working in this repository.
 
@@ -32,6 +32,49 @@ Build and maintain a practical ESP32-S3 based ESPAgent firmware that can:
 - control onboard hardware such as the ESP32-S3 board WS2812 RGB LED
 - read external sensors such as the SGP30 air-quality sensor over I2C
 - avoid unsafe or hallucinated hardware actions when the requested capability does not actually exist
+
+## Competition Defense Documentation - 2026-07-15
+
+- Added a Chinese competition-defense documentation suite under `docs/defense/`:
+  - `README.md`: study order and preparation plan
+  - `01_答辩讲稿.md`: 30-second, 2-minute, and 5-minute presentations
+  - `02_架构与源码深挖.md`: current architecture and source-code walkthrough
+  - `03_现场演示与故障预案.md`: demo runbook, diagnostics, and recovery plan
+  - `04_评委问答题库.md`: judge Q&A with implementation and production boundaries
+  - `05_一页速记表.md`: final pre-defense cheat sheet
+  - `06_源码证据地图.md`: claim-to-source evidence map
+- These documents use the `agent-update` branch at commit `ba6d08c` as their
+  baseline. Revalidate them when the branch or hardware setup changes.
+- Current code, not older narrative docs, is authoritative for disputed claims.
+  In particular, Coordinator, Sensor, Control, and Guardian currently all satisfy
+  `espagent_role_runs_llm()`, while Feishu/WebSocket chat channels remain
+  Coordinator/communication-only.
+- The defense material explicitly distinguishes implemented, hardware-verified,
+  current-boundary, and planned capabilities. It must not be used to claim a
+  local ESP32 LLM, production MQTT security, complete P4/Android UI, or personal
+  authorship that did not occur.
+
+## Frontend Console Redesign - 2026-07-15
+
+- Reworked `frontend/` into a quieter operational Agent Mesh console while
+  preserving the existing MQTT, HTTP, WebSocket, Skill, preference, and login
+  contracts.
+- Split the former monolithic `App.tsx` presentation into:
+  - `frontend/src/components/ConsoleViews.tsx` for overview, collaboration,
+    Sandbox, Skills Studio, and preference workspaces
+  - `frontend/src/components/ChatWorkspace.tsx` for the responsive Agent chat
+    drawer
+- The overview now prioritizes the four-role topology, environment status,
+  recent execution events, and role-visible capabilities instead of repeating
+  raw per-node communication panels.
+- Added explicit live/demo/runtime-unavailable state labels, stable timeline
+  keys, responsive mobile navigation, a full-width mobile chat workspace, and a
+  project favicon.
+- Runtime Skill list failures now return cached data with an explicit error in a
+  successful HTTP response instead of producing repeated 502 browser errors.
+- Verified with `npm run build` and Playwright at 1440x1000 and 390x844. All five
+  workspaces loaded without horizontal overflow, and the browser reported no
+  console or page errors.
 
 ## Project Identity / Documentation Baseline
 

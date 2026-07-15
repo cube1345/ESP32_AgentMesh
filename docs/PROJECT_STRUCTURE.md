@@ -132,6 +132,8 @@ Use the following ownership rules for docs:
 - `docs/ESP32_ROLE_PROFILES.md`: four ESP32-S3 role identities and flash order.
 - `docs/SKILL_BENCHMARK.md`: benchmark dataset and runner instructions.
 - `docs/PROJECT_STRUCTURE.md`: this file, directory ownership and placement rules.
+- `docs/defense/`: competition defense scripts, architecture study notes, demo
+  runbooks, judge Q&A, cheat sheets, and source-evidence maps.
 - `docs/im-integration/`: Feishu/Lark integration.
 - `docs/tool-setup/`: external service setup such as Amap and Tavily.
 

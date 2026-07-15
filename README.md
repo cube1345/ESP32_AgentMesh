@@ -300,6 +300,7 @@ Next esp-claw-inspired work should focus on Board Descriptor / Board Profile, Lu
 
 ## Documentation
 
+- [Competition defense guide (Chinese)](docs/defense/README.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Public knowledge base](docs/PUBLIC_KNOWLEDGE_BASE.md)
 - [Project structure](docs/PROJECT_STRUCTURE.md)
