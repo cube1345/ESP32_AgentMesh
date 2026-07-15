@@ -81,7 +81,9 @@ Current verified highlights:
 - Managed Lua runtime has been deployed to all four ESP32-S3 roles. `tools/test_lua_usb0.py --echo` passed 7/7 on USB0 after SNTP sync, and `tools/test_lua_roles_usb0_3.py` passed 8/8 across USB0-3.
 - ESP32-P4 display firmware has verified Wi-Fi/MQTT connect and topic subscription; full live UI binding should still be treated as in-progress.
 - Local admin mode exposes `/status`, `/devices`, and `/api/skills` for board
-  status, node registry inspection, and runtime skill management.
+  status, node registry inspection, and runtime skill management. The host
+  console compares edited skill content with SPIFFS content and skips writes
+  when the SHA-256 hash is unchanged.
 
 ## Runtime Flow
 
@@ -236,6 +238,7 @@ In AP/admin mode, the same management surface is available through:
 GET  /status
 GET  /devices
 GET  /api/skills
+GET  /api/skills?name=<runtime_skill>
 POST /api/skills
 DELETE /api/skills
 ```

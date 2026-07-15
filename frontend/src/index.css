@@ -728,10 +728,17 @@ select {
 .skill-select small { margin-top: 3px; color: #89938e; font-size: 9px; }
 .skill-select i { width: 7px; height: 7px; border-radius: 50%; background: #bdc7c1; }
 .skill-select i.is-enabled { background: #1a8b70; }
+.runtime-select small { max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.studio-list-divider { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 18px 6px 8px; padding-top: 14px; border-top: 1px solid #dfe5e2; color: #89938e; font-size: 9px; text-transform: uppercase; }
+.studio-list-divider button { display: grid; width: 24px; height: 24px; place-items: center; border: 0; border-radius: 5px; color: #55615a; background: transparent; cursor: pointer; }
+.studio-list-divider button:hover { color: #1d4fa8; background: #edf3ff; }
+.studio-list-note { margin: 8px 6px; color: #89938e; font-size: 10px; line-height: 1.5; }
 .studio-editor { min-width: 0; padding: 24px; }
 .section-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
 .skill-form .ant-form-item { margin-bottom: 16px; }
+.runtime-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin: 0 0 16px; }
+.runtime-detail-grid span { min-width: 0; overflow: hidden; padding: 8px 10px; border: 1px solid #dfe5e2; border-radius: 5px; color: #55615a; background: #f8faf9; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .runtime-list { display: flex; min-width: 0; gap: 8px; overflow-x: auto; }
 .runtime-list > span { flex: 0 0 auto; padding: 7px 10px; border: 1px solid #dfe5e2; border-radius: 5px; font-size: 10px; }
 .runtime-list small { margin-left: 8px; color: #1a8b70; }
@@ -843,6 +850,7 @@ select {
   .section-heading { flex-wrap: wrap; }
   .section-actions { width: 100%; }
   .field-grid { grid-template-columns: 1fr; gap: 0; }
+  .runtime-detail-grid { grid-template-columns: 1fr; }
 
   .connection-grid { grid-template-columns: 1fr; }
   .connection-actions { align-items: center; }

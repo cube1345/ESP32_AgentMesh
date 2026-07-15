@@ -61,6 +61,8 @@ export interface RuntimeSkillRecord {
   status: 'installed' | 'pending' | 'failed';
   scope: string;
   enabled: boolean;
+  content?: string;
+  contentHash?: string;
   lastMessage?: string;
 }
 
@@ -76,6 +78,7 @@ export interface RuntimeSkillInstallResponse {
   source: 'local_mock' | 'proxy' | 'serial';
   message: string;
   error?: string;
+  skipped?: boolean;
 }
 
 export interface UserPreferenceProfile {

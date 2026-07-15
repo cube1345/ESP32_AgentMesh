@@ -324,6 +324,30 @@ static esp_err_t read_json_body(httpd_req_t *req, char **out)
 
 static esp_err_t http_get_skills(httpd_req_t *req)
 {
+    char query[160] = {0};
+    char name[64] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "name", name, sizeof(name)) == ESP_OK &&
+        name[0]) {
+        char *skill_json = NULL;
+        esp_err_t get_err = skill_runtime_get_json(name, &skill_json);
+        if (get_err != ESP_OK) {
+            httpd_resp_send_err(req,
+                                get_err == ESP_ERR_NOT_FOUND
+                                    ? HTTPD_404_NOT_FOUND
+                                    : HTTPD_400_BAD_REQUEST,
+                                get_err == ESP_ERR_NOT_FOUND
+                                    ? "skill not found"
+                                    : "invalid skill name or content size");
+            return ESP_FAIL;
+        }
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
+        esp_err_t send_err = httpd_resp_send(req, skill_json, strlen(skill_json));
+        cJSON_free(skill_json);
+        return send_err;
+    }
+
     char json[4096] = {0};
     esp_err_t err = skill_runtime_list_json(json, sizeof(json));
     if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) {

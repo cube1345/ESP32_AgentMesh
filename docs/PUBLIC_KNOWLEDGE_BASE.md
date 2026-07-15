@@ -736,6 +736,7 @@ ESPAgent/
 
 - 静态可用性：通过 `skill_list` / `skill_show` 确认 SPIFFS skills 被加载并可读。
 - 全量 skill 可读性：runner 会自动为 `spiffs_data/skills/*.md` 生成 `skill_show` 用例，确保每个运行时 skill 都能从 SPIFFS 被读取。
+- 上位机 Skills Studio 管理 runtime skills 时，列表先读取 metadata，编辑/保存时按单个 skill 读取正文；云端网关会对编辑后的内容和 SPIFFS 当前内容计算 SHA-256，内容未变化则跳过写入，只对新增或变化的 skill 执行 `/api/skills` upsert，从而减少 SPIFFS 擦写和串口/HTTP 往返。
 - 固件/运行时策略：通过行为用例验证 sandbox 对受保护路径、高风险动作、确认参数的拦截。
 - 行为级 Agent 验证：通过 `inject_msg` 进入 Coordinator 的 ReAct loop，检查自然语言是否触发 Mesh routing、Guardian policy、OutputMessage、workflow、privacy 和 prompt-injection 相关行为。
 - 通用协议扩展验证：`protocol_extension_001` 检查 Agent 面对未实现的新 I2C 传感器时，会回答 manifest/通用原语/驱动边界，而不是编造已有工具或直接调用硬件；`protocol_boundary_advanced_001` 检查 Agent 能区分 RS485/Modbus、CAN/TWAI、I2S、RMT、USB CDC、SDIO、BLE GATT 中哪些适合 manifest，哪些必须走固件驱动。

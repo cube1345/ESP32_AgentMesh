@@ -697,4 +697,4 @@ The CLI provides debug and maintenance commands only. All configuration is done 
 | Agent runtime | `agent/`, `llm/`, `tools/` | Build prompts, call the LLM, parse tool-use blocks, execute tools, and return final text |
 | Persistence | `memory/`, `cache/`, `skills/`, `spiffs_data/` | Store sessions, long-term memory, daily notes, skill summaries, and cached prompt fragments |
 | Hardware access | `drivers/`, `tools/`, `sensors/`, `espnow/` | Keep sensor/peripheral I/O bounded and expose narrow AI-callable tools |
-| Operations | `cli/`, `onboard/`, `proxy/` | Support local setup, diagnostics, status/skills management, and proxied HTTPS access |
+| Operations | `cli/`, `onboard/`, `proxy/` | Support local setup, diagnostics, status/skills management, proxied HTTPS access, and host-side runtime skill diff-sync before SPIFFS writes |

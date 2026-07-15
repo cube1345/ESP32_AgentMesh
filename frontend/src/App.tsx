@@ -25,7 +25,7 @@ import {
   type TimelineFilter
 } from './components/ConsoleViews';
 import { mockDashboardPayload } from './data/mock';
-import { fetchDashboard, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills } from './services/dashboard';
+import { fetchDashboard, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills, updateRuntimeSkill } from './services/dashboard';
 import type { AgentNode, DashboardPayload, RuntimeSkillRecord, SkillDraft, TimelineEvent, UserPreferenceProfile } from './types';
 
 type ViewMode = '总览' | '协作链路' | 'Sandbox' | 'Skills Studio' | '用户偏好';
@@ -141,8 +141,11 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('总览');
   const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>('全部');
   const [activeSkillId, setActiveSkillId] = useState(mockDashboardPayload.skills[0]?.id || '');
+  const [skillEditorMode, setSkillEditorMode] = useState<'draft' | 'runtime'>('draft');
+  const [activeRuntimeSkillId, setActiveRuntimeSkillId] = useState('');
   const [savingSkills, setSavingSkills] = useState(false);
   const [installingSkillId, setInstallingSkillId] = useState<string | null>(null);
+  const [savingRuntimeSkillId, setSavingRuntimeSkillId] = useState<string | null>(null);
   const [runtimeSkillSource, setRuntimeSkillSource] = useState<'local_mock' | 'proxy' | 'serial'>('local_mock');
   const [runtimeSkillError, setRuntimeSkillError] = useState('');
   const [savingPrefs, setSavingPrefs] = useState(false);
@@ -179,10 +182,20 @@ function App() {
   useEffect(() => { localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(preferences)); }, [preferences]);
   useEffect(() => { if (session) localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session)); else localStorage.removeItem(AUTH_STORAGE_KEY); }, [session]);
   useEffect(() => { if (!draftSkills.some((item) => item.id === activeSkillId)) setActiveSkillId(draftSkills[0]?.id || ''); }, [activeSkillId, draftSkills]);
+  useEffect(() => {
+    if (!runtimeSkills.length) {
+      if (activeRuntimeSkillId) setActiveRuntimeSkillId('');
+      return;
+    }
+    if (!runtimeSkills.some((item) => item.runtimeName === activeRuntimeSkillId)) {
+      setActiveRuntimeSkillId(runtimeSkills[0].runtimeName);
+    }
+  }, [activeRuntimeSkillId, runtimeSkills]);
   useEffect(() => () => wsInstance?.close(), [wsInstance]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [chatMessages]);
 
   const activeSkill = useMemo(() => draftSkills.find((item) => item.id === activeSkillId) || null, [activeSkillId, draftSkills]);
+  const activeRuntimeSkill = useMemo(() => runtimeSkills.find((item) => item.runtimeName === activeRuntimeSkillId) || null, [activeRuntimeSkillId, runtimeSkills]);
   const canEditSkills = session?.role === 'admin';
   const canUseChat = session?.role !== 'viewer';
   const isLive = Boolean(payload.mqtt);
@@ -233,6 +246,7 @@ function App() {
     const draft: SkillDraft = { id: `skill-${Date.now()}`, name: '新建 Skill', scope: 'coordinator_agent', trigger: '用户自定义触发条件', policy: '默认经过 Guardian 审核', prompt: '描述触发、约束、输出和回执格式。', enabled: false };
     setDraftSkills((current) => [draft, ...current]);
     setActiveSkillId(draft.id);
+    setSkillEditorMode('draft');
   }
 
   async function handleSaveSkills() {
@@ -250,12 +264,49 @@ function App() {
     const next = await fetchRuntimeSkills(); setRuntimeSkills(next.skills); setRuntimeSkillSource(next.source); setRuntimeSkillError(next.error || '');
   }
 
+  function patchRuntimeSkill(patch: Partial<RuntimeSkillRecord>) {
+    if (!activeRuntimeSkillId) return;
+    setRuntimeSkills((current) => current.map((item) => (
+      item.runtimeName === activeRuntimeSkillId ? { ...item, ...patch } : item
+    )));
+  }
+
+  async function handleSaveRuntimeSkill() {
+    if (!activeRuntimeSkill || !canEditSkills) return;
+    setSavingRuntimeSkillId(activeRuntimeSkill.runtimeName);
+    try {
+      const result = await updateRuntimeSkill(activeRuntimeSkill, true);
+      if (result.ok) {
+        if (result.skill) {
+          setRuntimeSkills((current) => current.map((item) => (
+            item.runtimeName === result.skill?.runtimeName ? result.skill : item
+          )));
+          setActiveRuntimeSkillId(result.skill.runtimeName);
+        }
+        messageApi.success(result.message || 'Runtime Skill 已保存');
+        await refreshRuntimeSkills();
+      } else {
+        messageApi.error(result.error || result.message || '保存失败');
+      }
+    } finally {
+      setSavingRuntimeSkillId(null);
+    }
+  }
+
   async function handleInstallSkill() {
     if (!activeSkill || !canEditSkills) return;
     setInstallingSkillId(activeSkill.id);
     try {
       const result = await installRuntimeSkill(activeSkill, true);
-      if (result.ok) { messageApi.success(result.message || 'Runtime Skill 已安装'); await refreshRuntimeSkills(); }
+      if (result.ok) {
+        if (result.skill) {
+          setRuntimeSkills((current) => [result.skill as RuntimeSkillRecord, ...current.filter((item) => item.runtimeName !== result.skill?.runtimeName)]);
+          setActiveRuntimeSkillId(result.skill.runtimeName);
+          setSkillEditorMode('runtime');
+        }
+        messageApi.success(result.message || 'Runtime Skill 已安装');
+        await refreshRuntimeSkills();
+      }
       else messageApi.error(result.error || result.message || '安装失败');
     } finally { setInstallingSkillId(null); }
   }
@@ -332,7 +383,33 @@ function App() {
               {viewMode === '总览' && <OverviewView payload={payload} nodes={fixedNodes} isLive={isLive} />}
               {viewMode === '协作链路' && <CollaborationView payload={payload} filteredTimeline={filteredTimeline} filter={timelineFilter} setFilter={setTimelineFilter} />}
               {viewMode === 'Sandbox' && <SandboxView events={sandboxEvents} warnCount={sandboxEvents.filter((event) => event.status === 'warn').length} latest={sandboxEvents[0] || null} command={SANDBOX_DENY_TEST_COMMAND} />}
-              {viewMode === 'Skills Studio' && <SkillsView drafts={draftSkills} active={activeSkill} activeId={activeSkillId} setActiveId={setActiveSkillId} patchSkill={(patch) => setDraftSkills((current) => current.map((item) => item.id === activeSkillId ? { ...item, ...patch } : item))} canEdit={canEditSkills} addSkill={addSkill} saveSkills={handleSaveSkills} saving={savingSkills} install={handleInstallSkill} installing={installingSkillId === activeSkillId} runtimeSkills={runtimeSkills} runtimeSource={runtimeSkillSource} runtimeError={runtimeSkillError} refresh={refreshRuntimeSkills} />}
+              {viewMode === 'Skills Studio' && (
+                <SkillsView
+                  drafts={draftSkills}
+                  active={activeSkill}
+                  activeId={activeSkillId}
+                  editorMode={skillEditorMode}
+                  setEditorMode={setSkillEditorMode}
+                  setActiveId={setActiveSkillId}
+                  patchSkill={(patch) => setDraftSkills((current) => current.map((item) => item.id === activeSkillId ? { ...item, ...patch } : item))}
+                  canEdit={canEditSkills}
+                  addSkill={addSkill}
+                  saveSkills={handleSaveSkills}
+                  saving={savingSkills}
+                  install={handleInstallSkill}
+                  installing={installingSkillId === activeSkillId}
+                  runtimeSkills={runtimeSkills}
+                  activeRuntime={activeRuntimeSkill}
+                  activeRuntimeId={activeRuntimeSkillId}
+                  setActiveRuntimeId={setActiveRuntimeSkillId}
+                  patchRuntimeSkill={patchRuntimeSkill}
+                  saveRuntimeSkill={handleSaveRuntimeSkill}
+                  savingRuntime={savingRuntimeSkillId === activeRuntimeSkillId}
+                  runtimeSource={runtimeSkillSource}
+                  runtimeError={runtimeSkillError}
+                  refresh={refreshRuntimeSkills}
+                />
+              )}
               {viewMode === '用户偏好' && <PreferencesView preferences={preferences} setPreferences={setPreferences} save={handleSavePreferences} saving={savingPrefs} username={session.username} role={session.role} />}
             </div>
           </main>

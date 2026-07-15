@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -192,6 +193,77 @@ esp_err_t skill_runtime_list_json(char *buf, size_t size)
 
     snprintf(buf, size, "%s", json);
     cJSON_free(json);
+    return ESP_OK;
+}
+
+esp_err_t skill_runtime_get_json(const char *name, char **json_out)
+{
+    /* Keep content reads per-skill so the admin UI does not build one large SPIFFS JSON payload. */
+    if (!json_out) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    *json_out = NULL;
+    if (!skill_name_is_valid(name)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char path[160];
+    esp_err_t err = build_skill_path(name, path, sizeof(path));
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    if (st.st_size < 0 || st.st_size > SKILL_RUNTIME_MAX_CONTENT_BYTES) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char *content = calloc(1, (size_t)st.st_size + 1);
+    if (!content) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t read = fread(content, 1, (size_t)st.st_size, f);
+    fclose(f);
+    content[read] = '\0';
+
+    char title[96];
+    extract_title_from_content(content, title, sizeof(title));
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *skill = cJSON_CreateObject();
+    if (!root || !skill) {
+        cJSON_Delete(root);
+        cJSON_Delete(skill);
+        free(content);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddItemToObject(root, "skill", skill);
+    cJSON_AddStringToObject(skill, "name", name);
+    cJSON_AddStringToObject(skill, "path", path);
+    cJSON_AddStringToObject(skill, "title", title[0] ? title : name);
+    cJSON_AddNumberToObject(skill, "size_bytes", (double)read);
+    cJSON_AddStringToObject(skill, "content", content);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    free(content);
+    if (!json) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    *json_out = json;
     return ESP_OK;
 }
 

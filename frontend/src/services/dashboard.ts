@@ -5,6 +5,7 @@ import type {
   DashboardPayload,
   RuntimeSkillInstallResponse,
   RuntimeSkillListResponse,
+  RuntimeSkillRecord,
   SkillDraft,
   UserPreferenceProfile
 } from '../types';
@@ -121,6 +122,35 @@ export async function installRuntimeSkill(
       ok: false,
       source: 'local_mock',
       message: 'install request failed',
+      error: errorMessage(error)
+    };
+  }
+}
+
+export async function updateRuntimeSkill(
+  skill: RuntimeSkillRecord,
+  confirmed = true
+): Promise<RuntimeSkillInstallResponse> {
+  try {
+    const response = await api.post<RuntimeSkillInstallResponse>('/skills/runtime', {
+      skill,
+      confirmed
+    }, {
+      timeout: 30000
+    });
+    return isRuntimeSkillInstallResponse(response.data)
+      ? response.data
+      : {
+          ok: false,
+          source: 'local_mock',
+          message: 'invalid runtime skill update response',
+          error: 'invalid runtime skill update response'
+        };
+  } catch (error) {
+    return {
+      ok: false,
+      source: 'local_mock',
+      message: 'runtime skill update request failed',
       error: errorMessage(error)
     };
   }

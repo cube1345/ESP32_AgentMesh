@@ -6,6 +6,8 @@
 
 esp_err_t skill_runtime_list_json(char *buf, size_t size);
 
+esp_err_t skill_runtime_get_json(const char *name, char **json_out);
+
 esp_err_t skill_runtime_upsert(const char *name,
                                const char *content,
                                bool confirmed,

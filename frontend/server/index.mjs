@@ -1,4 +1,5 @@
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -107,10 +108,23 @@ function stableNameSuffix(value) {
   return (hash >>> 0).toString(36).slice(0, 8);
 }
 
+function contentSha256(content) {
+  return createHash('sha256').update(String(content || ''), 'utf8').digest('hex');
+}
+
+function attachContentHash(record) {
+  if (record && typeof record.content === 'string') {
+    record.contentHash = contentSha256(record.content);
+  }
+  return record;
+}
+
 function runtimeSkillName(skill) {
   if (typeof skill === 'string') {
     return normalizeSkillName(skill) || `skill_${stableNameSuffix(skill)}`;
   }
+  const fromRuntimeName = normalizeSkillName(skill?.runtimeName);
+  if (fromRuntimeName) return fromRuntimeName;
   const fromName = normalizeSkillName(skill?.name);
   if (fromName) return fromName;
   const fromId = normalizeSkillName(skill?.id);
@@ -118,9 +132,21 @@ function runtimeSkillName(skill) {
   return `skill_${stableNameSuffix(JSON.stringify(skill || {}))}`;
 }
 
+function normalizeRuntimeSkillContent(content, title) {
+  const text = String(content || '').trimEnd();
+  const firstNonSpace = text.trimStart();
+  if (firstNonSpace.startsWith('# ')) {
+    return `${text}\n`;
+  }
+  return `# ${title || 'Runtime Skill'}\n\n${text}\n`;
+}
+
 function draftToRuntimeRecord(skill, source = 'serial', message = 'runtime skill installed') {
   const runtimeName = runtimeSkillName(skill);
-  return {
+  const content = typeof skill?.content === 'string'
+    ? skill.content
+    : skillDraftToMarkdown(skill);
+  return attachContentHash({
     id: skill.id || runtimeName,
     runtimeName,
     title: skill.name || runtimeName,
@@ -131,8 +157,9 @@ function draftToRuntimeRecord(skill, source = 'serial', message = 'runtime skill
     status: 'installed',
     scope: skill.scope || 'unspecified',
     enabled: Boolean(skill.enabled),
+    content,
     lastMessage: message
-  };
+  });
 }
 
 function spiffsSkillPath(name) {
@@ -141,7 +168,7 @@ function spiffsSkillPath(name) {
 
 function upstreamSkillToRuntimeRecord(item) {
   const runtimeName = normalizeSkillName(item?.name || item?.title || 'unknown');
-  return {
+  return attachContentHash({
     id: runtimeName,
     runtimeName,
     title: item?.title || item?.name || runtimeName,
@@ -150,17 +177,18 @@ function upstreamSkillToRuntimeRecord(item) {
     installedAt: nowIso(),
     cacheState: 'unknown',
     status: 'installed',
-    scope: 'runtime',
+    scope: item?.scope || 'runtime',
     enabled: true,
+    content: typeof item?.content === 'string' ? item.content : '',
     lastMessage: typeof item?.size_bytes === 'number'
       ? `upstream listed, ${item.size_bytes} bytes`
       : 'upstream listed'
-  };
+  });
 }
 
 function serialSkillToRuntimeRecord(item) {
   const runtimeName = normalizeSkillName(item?.name || item?.title || 'unknown');
-  return {
+  return attachContentHash({
     id: runtimeName,
     runtimeName,
     title: item?.title || item?.name || runtimeName,
@@ -169,12 +197,13 @@ function serialSkillToRuntimeRecord(item) {
     installedAt: item?.installedAt || nowIso(),
     cacheState: 'unknown',
     status: 'installed',
-    scope: 'runtime',
+    scope: item?.scope || 'runtime',
     enabled: true,
+    content: typeof item?.content === 'string' ? item.content : '',
     lastMessage: typeof item?.size_bytes === 'number'
       ? `listed from ESP32 SPIFFS, ${item.size_bytes} bytes`
       : 'listed from ESP32 SPIFFS'
-  };
+  });
 }
 
 function listRuntimeSkills() {
@@ -271,6 +300,137 @@ function parseSerialSkillList(output) {
   return records;
 }
 
+function extractSerialToolOutput(output) {
+  const payload = extractSerialPayload(output);
+  const lines = payload.split(/\r?\n/);
+  const statusIndex = lines.findIndex((line) => /^tool_exec status:\s*/.test(line.trim()));
+  if (statusIndex < 0) {
+    throw new Error(payload || 'missing tool_exec status');
+  }
+  const statusLine = lines[statusIndex];
+  if (!/tool_exec status:\s*ESP_OK/.test(statusLine)) {
+    throw new Error(payload || 'ESP32 tool_exec failed');
+  }
+  const bodyLines = lines.slice(statusIndex + 1);
+  while (bodyLines.length && /^ESPAgent>\s*$/.test(bodyLines.at(-1)?.trim() || '')) {
+    bodyLines.pop();
+  }
+  return bodyLines.join('\n').trimEnd();
+}
+
+async function fetchUpstreamSkillContent(record) {
+  const response = await fetch(`${SKILLS_API_BASE}/api/skills?name=${encodeURIComponent(record.runtimeName)}`);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.ok === false) {
+    throw new Error(payload?.error || `HTTP ${response.status}`);
+  }
+
+  const detail = payload?.skill && typeof payload.skill === 'object'
+    ? payload.skill
+    : payload;
+  return upstreamSkillToRuntimeRecord({
+    ...record,
+    ...detail,
+    name: detail?.name || record.runtimeName,
+    title: detail?.title || record.title,
+    path: detail?.path || record.path,
+    content: typeof detail?.content === 'string' ? detail.content : record.content
+  });
+}
+
+async function fetchSerialSkillContent(record) {
+  const output = await runSerialCommand(`tool_exec read_file ${JSON.stringify({
+    path: record.path || spiffsSkillPath(record.runtimeName)
+  })}`);
+  const content = extractSerialToolOutput(output);
+  return serialSkillToRuntimeRecord({
+    ...record,
+    name: record.runtimeName,
+    content,
+    title: content.trimStart().startsWith('# ')
+      ? content.trimStart().split(/\r?\n/, 1)[0].replace(/^#\s+/, '').trim()
+      : record.title
+  });
+}
+
+function isMissingRuntimeSkillError(error) {
+  const message = error instanceof Error ? error.message : String(error || '');
+  return /not found|HTTP 404|file not found|ESP_ERR_NOT_FOUND/i.test(message);
+}
+
+async function fetchUpstreamSkillContentOrNull(runtimeName) {
+  try {
+    return await fetchUpstreamSkillContent({
+      runtimeName,
+      title: runtimeName,
+      path: spiffsSkillPath(runtimeName)
+    });
+  } catch (error) {
+    if (isMissingRuntimeSkillError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function fetchSerialSkillContentOrNull(runtimeName) {
+  try {
+    return await fetchSerialSkillContent({
+      runtimeName,
+      title: runtimeName,
+      path: spiffsSkillPath(runtimeName)
+    });
+  } catch (error) {
+    if (isMissingRuntimeSkillError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function buildUnchangedSkillMessage(runtimeName, hash) {
+  return `unchanged: ${runtimeName} already matches SPIFFS sha256=${hash.slice(0, 12)}; skipped write`;
+}
+
+async function upsertUpstreamRuntimeSkillIfChanged(runtimeName, content) {
+  // Cloud-side change detection avoids rewriting SPIFFS when the edited skill is byte-identical.
+  const desiredHash = contentSha256(content);
+  const existing = await fetchUpstreamSkillContentOrNull(runtimeName);
+  if (existing?.content && existing.contentHash === desiredHash) {
+    return {
+      skipped: true,
+      message: buildUnchangedSkillMessage(runtimeName, desiredHash)
+    };
+  }
+
+  const upstream = await fetch(`${SKILLS_API_BASE}/api/skills`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      name: runtimeName,
+      content,
+      confirmed: true
+    })
+  });
+  const payload = await upstream.json().catch(() => ({}));
+  if (!upstream.ok || payload?.ok === false) {
+    throw new Error(payload?.error || `HTTP ${upstream.status}`);
+  }
+  return {
+    skipped: false,
+    message: payload?.message || 'runtime skill saved through upstream gateway'
+  };
+}
+
+async function upsertSerialRuntimeSkillContentIfChanged(runtimeName, content) {
+  const desiredHash = contentSha256(content);
+  const existing = await fetchSerialSkillContentOrNull(runtimeName);
+  if (existing?.content && existing.contentHash === desiredHash) {
+    return buildUnchangedSkillMessage(runtimeName, desiredHash);
+  }
+  return upsertSerialRuntimeSkillContent(runtimeName, content);
+}
+
 async function fetchUpstreamRuntimeSkills() {
   const response = await fetch(`${SKILLS_API_BASE}/api/skills`);
   const payload = await response.json().catch(() => ({}));
@@ -280,7 +440,14 @@ async function fetchUpstreamRuntimeSkills() {
 
   runtimeSkills.clear();
   for (const item of payload.skills) {
-    const record = upstreamSkillToRuntimeRecord(item);
+    let record = upstreamSkillToRuntimeRecord(item);
+    if (!record.content) {
+      try {
+        record = await fetchUpstreamSkillContent(record);
+      } catch (error) {
+        record.lastMessage = error instanceof Error ? error.message : 'content unavailable';
+      }
+    }
     runtimeSkills.set(record.runtimeName, record);
   }
   runtimeSkillsCacheAt = Date.now();
@@ -298,17 +465,22 @@ async function fetchSerialRuntimeSkills() {
   const skills = parseSerialSkillList(output);
   runtimeSkills.clear();
   for (const item of skills) {
-    runtimeSkills.set(item.runtimeName, item);
+    let record = item;
+    try {
+      record = await fetchSerialSkillContent(item);
+    } catch (error) {
+      record.lastMessage = error instanceof Error ? error.message : 'content unavailable';
+    }
+    runtimeSkills.set(record.runtimeName, record);
   }
   runtimeSkillsCacheAt = Date.now();
   return listRuntimeSkills();
 }
 
-async function installSerialRuntimeSkill(skill, runtimeName) {
+async function upsertSerialRuntimeSkillContent(runtimeName, content) {
   if (!SKILLS_SERIAL_ENABLED) {
     throw new Error('serial runtime skill gateway disabled');
   }
-  const content = skillDraftToMarkdown(skill);
   const contentBytes = Buffer.byteLength(content, 'utf8');
   if (contentBytes > SKILLS_SERIAL_MAX_CONTENT_BYTES) {
     throw new Error(
@@ -327,7 +499,7 @@ async function installSerialRuntimeSkill(skill, runtimeName) {
   }
   invalidateRuntimeSkillCache();
   return payload.split(/\r?\n/).find((line) => line.includes('OK:')) ||
-    `installed to ${spiffsSkillPath(runtimeName)}`;
+    `saved to ${spiffsSkillPath(runtimeName)}`;
 }
 
 function createStore() {
@@ -803,6 +975,140 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && url.pathname === '/api/skills/runtime') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      const payload = safeJsonParse(body);
+      const skill = payload?.skill;
+      const confirmed = Boolean(payload?.confirmed);
+      const source = SKILLS_API_BASE ? 'proxy' : SKILLS_SERIAL_ENABLED ? 'serial' : 'local_mock';
+
+      if (!skill || typeof skill !== 'object') {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'missing runtime skill payload',
+          error: 'missing runtime skill payload'
+        });
+        return;
+      }
+      if (!confirmed) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'runtime skill update requires confirmed=true',
+          error: 'runtime skill update requires confirmed=true'
+        });
+        return;
+      }
+
+      const runtimeName = runtimeSkillName(skill);
+      const content = normalizeRuntimeSkillContent(skill.content, skill.title || runtimeName);
+      if (!content.trim()) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'missing runtime skill content',
+          error: 'missing runtime skill content'
+        });
+        return;
+      }
+
+      if (SKILLS_API_BASE) {
+        try {
+          const result = await upsertUpstreamRuntimeSkillIfChanged(runtimeName, content);
+
+          const saved = upstreamSkillToRuntimeRecord({
+            ...skill,
+            name: runtimeName,
+            content,
+            title: skill.title || runtimeName,
+            path: skill.path || `/spiffs/skills/${runtimeName}.md`
+          });
+          saved.lastMessage = result.message;
+          saved.cacheState = result.skipped ? 'unknown' : 'invalidated';
+          runtimeSkills.set(saved.runtimeName, saved);
+          runtimeSkillsCacheAt = Date.now();
+          sendJson(res, 200, {
+            ok: true,
+            source,
+            message: saved.lastMessage,
+            skipped: result.skipped,
+            skill: saved
+          });
+          return;
+        } catch (error) {
+          sendJson(res, 502, {
+            ok: false,
+            source,
+            message: 'runtime skill update request failed',
+            error: error instanceof Error ? error.message : 'runtime skill update request failed'
+          });
+          return;
+        }
+      }
+
+      if (SKILLS_SERIAL_ENABLED) {
+        try {
+          const message = await upsertSerialRuntimeSkillContentIfChanged(runtimeName, content);
+          const skipped = message.startsWith('unchanged:');
+          const saved = serialSkillToRuntimeRecord({
+            ...skill,
+            name: runtimeName,
+            content,
+            title: skill.title || runtimeName,
+            path: skill.path || spiffsSkillPath(runtimeName)
+          });
+          saved.lastMessage = message;
+          runtimeSkills.set(saved.runtimeName, saved);
+          runtimeSkillsCacheAt = Date.now();
+          sendJson(res, 200, {
+            ok: true,
+            source,
+            message,
+            skipped,
+            skill: saved
+          });
+          return;
+        } catch (error) {
+          sendJson(res, 502, {
+            ok: false,
+            source,
+            message: 'runtime skill update failed on ESP32 serial gateway',
+            error: error instanceof Error ? error.message : 'runtime skill update failed on ESP32 serial gateway'
+          });
+          return;
+        }
+      }
+
+      const localExisting = runtimeSkills.get(runtimeName);
+      const localSkipped = localExisting?.contentHash === contentSha256(content);
+      const saved = draftToRuntimeRecord({
+        ...skill,
+        id: skill.id || runtimeName,
+        name: skill.title || runtimeName,
+        content,
+        enabled: skill.enabled !== false,
+        scope: skill.scope || 'runtime'
+      }, 'local_mock', localSkipped
+        ? buildUnchangedSkillMessage(runtimeName, contentSha256(content))
+        : 'front-end runtime skill update simulated; ESP32 SPIFFS not yet connected');
+      runtimeSkills.set(saved.runtimeName, saved);
+      runtimeSkillsCacheAt = Date.now();
+      sendJson(res, 200, {
+        ok: true,
+        source,
+        message: saved.lastMessage,
+        skipped: localSkipped,
+        skill: saved
+      });
+    });
+    return;
+  }
+
   if (req.method === 'POST' && url.pathname === '/api/skills') {
     let body = '';
     req.on('data', (chunk) => {
@@ -847,41 +1153,27 @@ const server = http.createServer((req, res) => {
       }
 
       const runtimeName = runtimeSkillName(skill);
+      const content = skillDraftToMarkdown(skill);
 
       if (SKILLS_API_BASE) {
         try {
-          const upstream = await fetch(`${SKILLS_API_BASE}/api/skills`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: runtimeName,
-              content: skillDraftToMarkdown(skill),
-              confirmed: true
-            })
-          });
-          const upstreamPayload = await upstream.json().catch(() => ({}));
-          if (!upstream.ok || upstreamPayload?.ok === false) {
-            sendJson(res, 502, {
-              ok: false,
-              source,
-              message: 'runtime install failed on upstream gateway',
-              error: upstreamPayload?.error || `HTTP ${upstream.status}`
-            });
-            return;
-          }
+          const result = await upsertUpstreamRuntimeSkillIfChanged(runtimeName, content);
 
           const installed = upstreamSkillToRuntimeRecord({
             name: runtimeName,
             title: skill.name || runtimeName,
-            path: `/spiffs/skills/${runtimeName}.md`
+            path: `/spiffs/skills/${runtimeName}.md`,
+            content
           });
-          installed.lastMessage = upstreamPayload?.message || 'proxied to runtime gateway';
+          installed.lastMessage = result.message;
+          installed.cacheState = result.skipped ? 'unknown' : 'invalidated';
           runtimeSkills.set(installed.runtimeName, installed);
           runtimeSkillsCacheAt = Date.now();
           sendJson(res, 200, {
             ok: true,
             source,
             message: installed.lastMessage,
+            skipped: result.skipped,
             skill: installed
           });
           return;
@@ -898,7 +1190,8 @@ const server = http.createServer((req, res) => {
 
       if (SKILLS_SERIAL_ENABLED) {
         try {
-          const message = await installSerialRuntimeSkill(skill, runtimeName);
+          const message = await upsertSerialRuntimeSkillContentIfChanged(runtimeName, content);
+          const skipped = message.startsWith('unchanged:');
           const installed = draftToRuntimeRecord(skill, 'serial', message);
           runtimeSkills.set(installed.runtimeName, installed);
           runtimeSkillsCacheAt = Date.now();
@@ -906,6 +1199,7 @@ const server = http.createServer((req, res) => {
             ok: true,
             source,
             message,
+            skipped,
             skill: installed
           });
           return;
@@ -920,10 +1214,14 @@ const server = http.createServer((req, res) => {
         }
       }
 
+      const localExisting = runtimeSkills.get(runtimeName);
+      const localSkipped = localExisting?.contentHash === contentSha256(content);
       const installed = draftToRuntimeRecord(
         skill,
         'local_mock',
-        'front-end runtime install simulated; ESP32 SPIFFS not yet connected'
+        localSkipped
+          ? buildUnchangedSkillMessage(runtimeName, contentSha256(content))
+          : 'front-end runtime install simulated; ESP32 SPIFFS not yet connected'
       );
       runtimeSkills.set(installed.runtimeName, installed);
       runtimeSkillsCacheAt = Date.now();
@@ -931,6 +1229,7 @@ const server = http.createServer((req, res) => {
         ok: true,
         source,
         message: installed.lastMessage,
+        skipped: localSkipped,
         skill: installed
       });
     });

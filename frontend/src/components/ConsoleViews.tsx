@@ -257,6 +257,8 @@ interface SkillsProps {
   drafts: SkillDraft[];
   active: SkillDraft | null;
   activeId: string;
+  editorMode: 'draft' | 'runtime';
+  setEditorMode: (mode: 'draft' | 'runtime') => void;
   setActiveId: (id: string) => void;
   patchSkill: (patch: Partial<SkillDraft>) => void;
   canEdit: boolean;
@@ -266,30 +268,150 @@ interface SkillsProps {
   install: () => void;
   installing: boolean;
   runtimeSkills: RuntimeSkillRecord[];
+  activeRuntime: RuntimeSkillRecord | null;
+  activeRuntimeId: string;
+  setActiveRuntimeId: (id: string) => void;
+  patchRuntimeSkill: (patch: Partial<RuntimeSkillRecord>) => void;
+  saveRuntimeSkill: () => void;
+  savingRuntime: boolean;
   runtimeSource: 'local_mock' | 'proxy' | 'serial';
   runtimeError: string;
   refresh: () => void;
 }
 
 export function SkillsView(props: SkillsProps) {
-  const { drafts, active, activeId, setActiveId, patchSkill, canEdit, addSkill, saveSkills, saving, install, installing, runtimeSkills, runtimeSource, runtimeError, refresh } = props;
+  const {
+    drafts,
+    active,
+    activeId,
+    editorMode,
+    setEditorMode,
+    setActiveId,
+    patchSkill,
+    canEdit,
+    addSkill,
+    saveSkills,
+    saving,
+    install,
+    installing,
+    runtimeSkills,
+    activeRuntime,
+    activeRuntimeId,
+    setActiveRuntimeId,
+    patchRuntimeSkill,
+    saveRuntimeSkill,
+    savingRuntime,
+    runtimeSource,
+    runtimeError,
+    refresh
+  } = props;
+  const runtimeSourceLabel = runtimeError
+    ? '连接不可用'
+    : runtimeSource === 'serial'
+      ? '串口实时'
+      : runtimeSource === 'proxy'
+        ? '网关代理'
+        : '本地演示';
+
   return (
     <div className="view-stack view-enter">
       <div className="studio-grid">
         <aside className="studio-list">
-          <div className="section-heading"><div><span>Drafts</span><h2>Skill 草稿</h2></div><Button type="text" icon={<PlusOutlined />} onClick={addSkill} disabled={!canEdit} aria-label="新增 Skill" /></div>
-          {drafts.map((draft) => <button key={draft.id} className={`skill-select ${draft.id === activeId ? 'is-active' : ''}`} onClick={() => setActiveId(draft.id)}><span><strong>{draft.name}</strong><small>{draft.scope}</small></span><i className={draft.enabled ? 'is-enabled' : ''} /></button>)}
+          <div className="section-heading">
+            <div><span>Drafts</span><h2>Skill 草稿</h2></div>
+            <Button type="text" icon={<PlusOutlined />} onClick={addSkill} disabled={!canEdit} aria-label="新增 Skill" />
+          </div>
+          {drafts.map((draft) => (
+            <button
+              key={draft.id}
+              className={`skill-select ${editorMode === 'draft' && draft.id === activeId ? 'is-active' : ''}`}
+              onClick={() => { setEditorMode('draft'); setActiveId(draft.id); }}
+            >
+              <span><strong>{draft.name}</strong><small>{draft.scope}</small></span>
+              <i className={draft.enabled ? 'is-enabled' : ''} />
+            </button>
+          ))}
+
+          <div className="studio-list-divider">
+            <span>Runtime</span>
+            <button onClick={refresh} aria-label="刷新 Runtime Skills"><ReloadOutlined /></button>
+          </div>
+          {runtimeError ? (
+            <p className="studio-list-note">{runtimeErrorLabel(runtimeError)}</p>
+          ) : runtimeSkills.length ? runtimeSkills.map((item) => (
+            <button
+              key={item.runtimeName}
+              className={`skill-select runtime-select ${editorMode === 'runtime' && item.runtimeName === activeRuntimeId ? 'is-active' : ''}`}
+              onClick={() => { setEditorMode('runtime'); setActiveRuntimeId(item.runtimeName); }}
+            >
+              <span><strong>{item.title || item.runtimeName}</strong><small>{item.path || item.runtimeName}</small></span>
+              <i className={item.content ? 'is-enabled' : ''} />
+            </button>
+          )) : <p className="studio-list-note">当前未读取到 Runtime Skill</p>}
         </aside>
         <section className="studio-editor">
-          <div className="section-heading">
-            <div><span>Editor</span><h2>{active?.name || '选择一个 Skill'}</h2></div>
-            <div className="section-actions"><Button icon={<SaveOutlined />} onClick={saveSkills} loading={saving} disabled={!canEdit}>保存</Button><Button type="primary" icon={<CloudUploadOutlined />} onClick={install} loading={installing} disabled={!canEdit || !active}>安装到 Runtime</Button></div>
-          </div>
-          {active ? <Form layout="vertical" className="skill-form"><div className="field-grid"><Form.Item label="名称"><Input value={active.name} onChange={(event) => patchSkill({ name: event.target.value })} disabled={!canEdit} /></Form.Item><Form.Item label="作用域"><Input value={active.scope} onChange={(event) => patchSkill({ scope: event.target.value })} disabled={!canEdit} /></Form.Item></div><div className="field-grid"><Form.Item label="触发条件"><Input value={active.trigger} onChange={(event) => patchSkill({ trigger: event.target.value })} disabled={!canEdit} /></Form.Item><Form.Item label="启用"><Switch checked={active.enabled} onChange={(value) => patchSkill({ enabled: value })} disabled={!canEdit} /></Form.Item></div><Form.Item label="策略要求"><Input value={active.policy} onChange={(event) => patchSkill({ policy: event.target.value })} disabled={!canEdit} /></Form.Item><Form.Item label="Skill 内容"><Input.TextArea rows={9} value={active.prompt} onChange={(event) => patchSkill({ prompt: event.target.value })} disabled={!canEdit} /></Form.Item></Form> : <Empty description="没有可编辑的 Skill" />}
+          {editorMode === 'draft' ? (
+            <>
+              <div className="section-heading">
+                <div><span>Draft Editor</span><h2>{active?.name || '选择一个 Skill 草稿'}</h2></div>
+                <div className="section-actions">
+                  <Button icon={<SaveOutlined />} onClick={saveSkills} loading={saving} disabled={!canEdit}>保存草稿</Button>
+                  <Button type="primary" icon={<CloudUploadOutlined />} onClick={install} loading={installing} disabled={!canEdit || !active}>安装到 Runtime</Button>
+                </div>
+              </div>
+              {active ? (
+                <Form layout="vertical" className="skill-form">
+                  <div className="field-grid">
+                    <Form.Item label="名称"><Input value={active.name} onChange={(event) => patchSkill({ name: event.target.value })} disabled={!canEdit} /></Form.Item>
+                    <Form.Item label="作用域"><Input value={active.scope} onChange={(event) => patchSkill({ scope: event.target.value })} disabled={!canEdit} /></Form.Item>
+                  </div>
+                  <div className="field-grid">
+                    <Form.Item label="触发条件"><Input value={active.trigger} onChange={(event) => patchSkill({ trigger: event.target.value })} disabled={!canEdit} /></Form.Item>
+                    <Form.Item label="启用"><Switch checked={active.enabled} onChange={(value) => patchSkill({ enabled: value })} disabled={!canEdit} /></Form.Item>
+                  </div>
+                  <Form.Item label="策略要求"><Input value={active.policy} onChange={(event) => patchSkill({ policy: event.target.value })} disabled={!canEdit} /></Form.Item>
+                  <Form.Item label="Skill 内容"><Input.TextArea rows={9} value={active.prompt} onChange={(event) => patchSkill({ prompt: event.target.value })} disabled={!canEdit} /></Form.Item>
+                </Form>
+              ) : <Empty description="没有可编辑的 Skill 草稿" />}
+            </>
+          ) : (
+            <>
+              <div className="section-heading">
+                <div><span>Runtime Editor</span><h2>{activeRuntime?.title || '选择一个 Runtime Skill'}</h2></div>
+                <div className="section-actions">
+                  <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
+                  <Button type="primary" icon={<SaveOutlined />} onClick={saveRuntimeSkill} loading={savingRuntime} disabled={!canEdit || !activeRuntime}>保存到上位机/板端</Button>
+                </div>
+              </div>
+              {activeRuntime ? (
+                <Form layout="vertical" className="skill-form">
+                  <div className="field-grid">
+                    <Form.Item label="运行时文件名"><Input value={activeRuntime.runtimeName} disabled /></Form.Item>
+                    <Form.Item label="标题"><Input value={activeRuntime.title} onChange={(event) => patchRuntimeSkill({ title: event.target.value })} disabled={!canEdit} /></Form.Item>
+                  </div>
+                  <div className="runtime-detail-grid">
+                    <span>Source：{activeRuntime.source}</span>
+                    <span>Status：{activeRuntime.status}</span>
+                    <span>Path：{activeRuntime.path}</span>
+                  </div>
+                  {activeRuntime.lastMessage ? <p className="studio-list-note">{activeRuntime.lastMessage}</p> : null}
+                  <Form.Item label="Runtime Skill Markdown">
+                    <Input.TextArea
+                      rows={16}
+                      value={activeRuntime.content || ''}
+                      onChange={(event) => patchRuntimeSkill({ content: event.target.value })}
+                      disabled={!canEdit}
+                      placeholder={'# Skill 标题\n\n写入该 skill 的完整 Markdown 内容。'}
+                    />
+                  </Form.Item>
+                </Form>
+              ) : <Empty description="没有可编辑的 Runtime Skill" />}
+            </>
+          )}
         </section>
       </div>
       <section className="runtime-band">
-        <div><span>Runtime Skills</span><strong>{runtimeError ? '连接不可用' : runtimeSource === 'serial' ? '串口实时' : runtimeSource === 'proxy' ? '网关代理' : '本地演示'}</strong></div>
+        <div><span>Runtime Skills</span><strong>{runtimeSourceLabel}</strong></div>
         <div className="runtime-list">{runtimeError ? <em>{runtimeErrorLabel(runtimeError)}</em> : runtimeSkills.length ? runtimeSkills.map((item) => <span key={item.id || item.runtimeName}>{item.title}<small>{item.status}</small></span>) : <em>当前未读取到 Runtime Skill</em>}</div>
         <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
       </section>
