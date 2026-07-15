@@ -4245,6 +4245,11 @@ static void agent_loop_task(void *arg) {
       } else {
         final_text = NULL;
       }
+      esp_err_t trim_err = session_trim_completed_task_context(msg.chat_id);
+      if (trim_err != ESP_OK) {
+        ESP_LOGW(TAG, "Session trim failed for chat %s: %s",
+                 msg.chat_id, esp_err_to_name(trim_err));
+      }
     } else {
       /* Error or empty response */
       free(final_text);
@@ -4272,6 +4277,11 @@ static void agent_loop_task(void *arg) {
         if (message_bus_push_outbound(&out) != ESP_OK) {
           ESP_LOGW(TAG, "Outbound queue full, drop error response");
           free(out.content);
+        }
+        esp_err_t trim_err = session_trim_completed_task_context(msg.chat_id);
+        if (trim_err != ESP_OK) {
+          ESP_LOGW(TAG, "Session trim failed for chat %s: %s",
+                   msg.chat_id, esp_err_to_name(trim_err));
         }
       }
     }

@@ -21,6 +21,119 @@ static const char *TAG = "session";
 #define SESSION_BRIEF_MAX_ASSISTANT_ITEMS 2
 #define SESSION_BRIEF_MAX_TASKS 3
 #define SESSION_BRIEF_ITEM_CHARS 160
+#define SESSION_TRIM_LINE_MAX 4096
+
+static esp_err_t remove_if_exists(const char *path, bool *removed);
+
+static char *session_strdup_line(const char *line)
+{
+    if (!line) {
+        return NULL;
+    }
+    size_t len = strlen(line);
+    char *copy = malloc(len + 1);
+    if (!copy) {
+        return NULL;
+    }
+    memcpy(copy, line, len + 1);
+    return copy;
+}
+
+static void free_line_ring(char **ring, int keep_lines)
+{
+    if (!ring) {
+        return;
+    }
+    for (int i = 0; i < keep_lines; i++) {
+        free(ring[i]);
+    }
+    free(ring);
+}
+
+static esp_err_t trim_jsonl_tail(const char *path, int keep_lines)
+{
+    if (!path || path[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (keep_lines <= 0) {
+        bool removed = false;
+        return remove_if_exists(path, &removed);
+    }
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    char **ring = calloc((size_t)keep_lines, sizeof(char *));
+    if (!ring) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    char line[SESSION_TRIM_LINE_MAX];
+    int count = 0;
+    int next = 0;
+    int total = 0;
+    int skipped_overlong = 0;
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        bool complete = (len > 0 && line[len - 1] == '\n') || feof(f);
+        if (!complete) {
+            int ch = 0;
+            while ((ch = fgetc(f)) != EOF && ch != '\n') {
+            }
+            total++;
+            skipped_overlong++;
+            ESP_LOGW(TAG, "Dropping overlong JSONL line while trimming %s", path);
+            continue;
+        }
+
+        char *copy = session_strdup_line(line);
+        if (!copy) {
+            fclose(f);
+            free_line_ring(ring, keep_lines);
+            return ESP_ERR_NO_MEM;
+        }
+        free(ring[next]);
+        ring[next] = copy;
+        next = (next + 1) % keep_lines;
+        if (count < keep_lines) {
+            count++;
+        }
+        total++;
+    }
+    fclose(f);
+
+    if (total <= keep_lines && skipped_overlong == 0) {
+        free_line_ring(ring, keep_lines);
+        return ESP_OK;
+    }
+
+    f = fopen(path, "w");
+    if (!f) {
+        free_line_ring(ring, keep_lines);
+        return ESP_FAIL;
+    }
+
+    int start = (count < keep_lines) ? 0 : next;
+    for (int i = 0; i < count; i++) {
+        int idx = (start + i) % keep_lines;
+        if (!ring[idx]) {
+            continue;
+        }
+        fputs(ring[idx], f);
+        size_t len = strlen(ring[idx]);
+        if (len == 0 || ring[idx][len - 1] != '\n') {
+            fputc('\n', f);
+        }
+    }
+    fclose(f);
+    free_line_ring(ring, keep_lines);
+    ESP_LOGI(TAG, "Trimmed %s from %d to %d JSONL lines (%d overlong dropped)",
+             path, total, count, skipped_overlong);
+    return ESP_OK;
+}
 
 static uint64_t session_hash_chat_id(const char *chat_id)
 {
@@ -1006,6 +1119,32 @@ esp_err_t session_build_context_brief(const char *chat_id, char *buf, size_t siz
         (void)session_refresh_context_brief(chat_id);
     }
     return err;
+}
+
+esp_err_t session_trim_completed_task_context(const char *chat_id)
+{
+    if (!chat_id || chat_id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char history_path[128];
+    char trace_path[128];
+    session_path(chat_id, history_path, sizeof(history_path));
+    session_trace_path(chat_id, trace_path, sizeof(trace_path));
+
+    esp_err_t history_err = trim_jsonl_tail(history_path, ESPAGENT_SESSION_TRIM_MAX_MSGS);
+    esp_err_t trace_err = trim_jsonl_tail(trace_path, ESPAGENT_TRACE_TRIM_MAX_EVENTS);
+
+    if (history_err == ESP_OK || trace_err == ESP_OK) {
+        (void)session_refresh_context_brief(chat_id);
+    }
+
+    bool history_ok = (history_err == ESP_OK || history_err == ESP_ERR_NOT_FOUND);
+    bool trace_ok = (trace_err == ESP_OK || trace_err == ESP_ERR_NOT_FOUND);
+    if (history_ok && trace_ok) {
+        return ESP_OK;
+    }
+    return history_err != ESP_OK ? history_err : trace_err;
 }
 
 esp_err_t session_clear(const char *chat_id)

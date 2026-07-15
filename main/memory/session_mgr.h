@@ -64,6 +64,7 @@ esp_err_t session_build_relevant_task_brief(const char *chat_id,
                                             const char *query,
                                             char *buf,
                                             size_t size);
+esp_err_t session_trim_completed_task_context(const char *chat_id);
 
 /**
  * Clear a session (delete the file).
