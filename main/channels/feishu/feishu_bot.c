@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -36,6 +37,8 @@ static const char *TAG = "feishu";
 #define FEISHU_WS_CONFIG_MIN_INTERNAL_FREE (24 * 1024)
 #define FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL (8 * 1024)
 #define FEISHU_WS_LOW_MEM_BACKOFF_MS 30000
+#define FEISHU_ACK_QUEUE_DEPTH 2
+#define FEISHU_ACK_HEADER_LIMIT 4
 
 /* ── Credentials & token state ─────────────────────────────── */
 static char s_app_id[64] = ESPAGENT_SECRET_FEISHU_APP_ID;
@@ -64,6 +67,8 @@ static int clamp_ws_reconnect_ms(int value_ms)
     return value_ms;
 }
 static bool s_ws_connected = false;
+static QueueHandle_t s_ack_queue = NULL;
+static TaskHandle_t s_ack_task = NULL;
 
 static void handle_message_event(cJSON *event);
 
@@ -153,7 +158,12 @@ typedef struct {
 } ws_frame_t;
 
 typedef struct {
-    ws_frame_t frame;
+    uint64_t seq_id;
+    uint64_t log_id;
+    int32_t service;
+    int32_t method;
+    ws_header_t headers[FEISHU_ACK_HEADER_LIMIT];
+    size_t header_count;
     int code;
 } feishu_ws_ack_t;
 
@@ -337,48 +347,113 @@ static int ws_send_frame(const ws_frame_t *f, const uint8_t *payload, size_t pay
     return esp_websocket_client_send_bin(s_ws_client, (const char *)out, pos, timeout_ms);
 }
 
-static void feishu_ws_ack_task(void *arg)
+static void feishu_ws_ack_worker(void *arg)
 {
-    feishu_ws_ack_t *ack_item = (feishu_ws_ack_t *)arg;
-    if (!ack_item) {
-        vTaskDelete(NULL);
-        return;
-    }
+    (void)arg;
+    feishu_ws_ack_t ack_item;
 
-    char ack[32];
-    int ack_len = snprintf(ack, sizeof(ack), "{\"code\":%d}", ack_item->code);
-    if (s_ws_client && s_ws_connected) {
-        int sent = ws_send_frame(&ack_item->frame, (const uint8_t *)ack, (size_t)ack_len, 1000);
-        if (sent < 0) {
-            ESP_LOGW(TAG, "Feishu WS async ACK send failed");
+    while (true) {
+        if (!s_ack_queue ||
+            xQueueReceive(s_ack_queue, &ack_item, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        ws_frame_t frame = {0};
+        frame.seq_id = ack_item.seq_id;
+        frame.log_id = ack_item.log_id;
+        frame.service = ack_item.service;
+        frame.method = ack_item.method;
+        frame.header_count = ack_item.header_count;
+        if (frame.header_count > 16) {
+            frame.header_count = 16;
+        }
+        for (size_t i = 0; i < frame.header_count; i++) {
+            frame.headers[i] = ack_item.headers[i];
+        }
+
+        char ack[32];
+        int ack_len = snprintf(ack, sizeof(ack), "{\"code\":%d}", ack_item.code);
+        if (s_ws_client && s_ws_connected) {
+            int sent = ws_send_frame(&frame, (const uint8_t *)ack, (size_t)ack_len, 1000);
+            if (sent < 0) {
+                ESP_LOGW(TAG, "Feishu WS async ACK send failed");
+            }
         }
     }
+}
 
-    free(ack_item);
-    vTaskDelete(NULL);
+static esp_err_t feishu_start_ack_worker(void)
+{
+    if (!s_ack_queue) {
+        s_ack_queue = xQueueCreate(FEISHU_ACK_QUEUE_DEPTH, sizeof(feishu_ws_ack_t));
+        if (!s_ack_queue) {
+            ESP_LOGW(TAG, "Feishu WS ACK queue create failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    if (s_ack_task) {
+        return ESP_OK;
+    }
+
+    BaseType_t ok = pdFAIL;
+#if CONFIG_SPIRAM_ALLOW_STACK_EXTERNAL_MEMORY
+    ok = xTaskCreatePinnedToCoreWithCaps(
+        feishu_ws_ack_worker,
+        "feishu_ack",
+        ESPAGENT_FEISHU_ACK_STACK,
+        NULL,
+        4,
+        &s_ack_task,
+        ESPAGENT_FEISHU_POLL_CORE,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (ok == pdPASS) {
+        ESP_LOGI(TAG, "Feishu WS ACK worker created with PSRAM stack=%u",
+                 (unsigned)ESPAGENT_FEISHU_ACK_STACK);
+        return ESP_OK;
+    }
+#endif
+    ok = xTaskCreatePinnedToCore(
+        feishu_ws_ack_worker,
+        "feishu_ack",
+        ESPAGENT_FEISHU_ACK_STACK,
+        NULL,
+        4,
+        &s_ack_task,
+        ESPAGENT_FEISHU_POLL_CORE);
+    if (ok != pdPASS) {
+        s_ack_task = NULL;
+        ESP_LOGW(TAG, "Feishu WS ACK worker create failed");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 static void feishu_send_ack_async(const ws_frame_t *frame, int code)
 {
-    feishu_ws_ack_t *ack_item = calloc(1, sizeof(*ack_item));
-    if (!ack_item) {
-        ESP_LOGW(TAG, "Feishu WS ACK allocation failed");
+    if (!frame) {
         return;
     }
-    ack_item->frame = *frame;
-    ack_item->frame.payload = NULL;
-    ack_item->frame.payload_len = 0;
-    ack_item->code = code;
+    if (!s_ack_queue) {
+        ESP_LOGW(TAG, "Feishu WS ACK queue unavailable");
+        return;
+    }
 
-    BaseType_t ok = xTaskCreate(feishu_ws_ack_task,
-                                "feishu_ack",
-                                ESPAGENT_FEISHU_ACK_STACK,
-                                ack_item,
-                                4,
-                                NULL);
-    if (ok != pdPASS) {
-        ESP_LOGW(TAG, "Feishu WS ACK task create failed");
-        free(ack_item);
+    feishu_ws_ack_t ack_item = {0};
+    ack_item.seq_id = frame->seq_id;
+    ack_item.log_id = frame->log_id;
+    ack_item.service = frame->service;
+    ack_item.method = frame->method;
+    ack_item.header_count = frame->header_count;
+    if (ack_item.header_count > FEISHU_ACK_HEADER_LIMIT) {
+        ack_item.header_count = FEISHU_ACK_HEADER_LIMIT;
+    }
+    for (size_t i = 0; i < ack_item.header_count; i++) {
+        ack_item.headers[i] = frame->headers[i];
+    }
+    ack_item.code = code;
+
+    if (xQueueSend(s_ack_queue, &ack_item, pdMS_TO_TICKS(20)) != pdTRUE) {
+        ESP_LOGW(TAG, "Feishu WS ACK queue full");
     }
 }
 
@@ -1035,6 +1110,9 @@ esp_err_t feishu_bot_start(void)
     if (s_ws_task) {
         ESP_LOGW(TAG, "Feishu WebSocket task already running");
         return ESP_OK;
+    }
+    if (feishu_start_ack_worker() != ESP_OK) {
+        return ESP_FAIL;
     }
     BaseType_t ok = xTaskCreatePinnedToCore(
         feishu_ws_task,

@@ -44,6 +44,11 @@ static bool extract_explicit_subagent_task(const char *message,
 static const char *find_substr_ci_ascii(const char *haystack,
                                         const char *needle);
 static bool starts_with_ci_ascii(const char *text, const char *prefix);
+static bool message_is_skill_or_knowledge_query(const char *message);
+static bool append_exact_runtime_skill_context(char *prompt,
+                                               size_t size,
+                                               const char *message,
+                                               bool tight_mode);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -1575,6 +1580,7 @@ static bool try_execute_deterministic_task_list_request(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !message_requests_task_list(msg->content) ||
       !message_mentions_managed_task(msg->content)) {
     return false;
@@ -1641,6 +1647,7 @@ static bool try_execute_deterministic_task_remove_request(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !message_requests_task_removal(msg->content)) {
     return false;
   }
@@ -1720,6 +1727,14 @@ static void strip_skill_md_suffix(char *name) {
   }
 }
 
+static bool token_looks_like_runtime_skill_name(const char *token) {
+  if (!token || token[0] == '\0') {
+    return false;
+  }
+  return starts_with_ci_ascii(token, "runtime-") ||
+         contains_substr_ci(token, ".md");
+}
+
 static bool extract_skill_name_from_message(const char *message, char *out,
                                             size_t out_size) {
   if (!message || !out || out_size < 2) {
@@ -1756,6 +1771,11 @@ static bool extract_skill_name_from_message(const char *message, char *out,
       snprintf(out, out_size, "%s", token);
       return out[0] != '\0';
     }
+    if (token_looks_like_runtime_skill_name(token)) {
+      strip_skill_md_suffix(token);
+      snprintf(out, out_size, "%s", token);
+      return out[0] != '\0';
+    }
     p = q;
     if (!*p) {
       break;
@@ -1763,6 +1783,126 @@ static bool extract_skill_name_from_message(const char *message, char *out,
   }
 
   return false;
+}
+
+static bool message_requests_skill_file_read(const char *message) {
+  if (!message) {
+    return false;
+  }
+
+  if (contains_substr_ci(message, "/skills_show") ||
+      contains_substr_ci(message, "/spiffs/skills/")) {
+    return true;
+  }
+
+  static const char *const ascii_words[] = {
+      "read", "show", "display", "open", "content", "contents",
+      "source", "raw", "full", "summary", "summarize", "purpose",
+  };
+  static const char *const cjk_keywords[] = {
+      "读取", "查看", "展示", "打开", "内容", "原文",
+      "全文", "文件", "总结", "概括", "用途", "说明",
+  };
+
+  return message_has_any_ascii_word(
+             message, ascii_words,
+             sizeof(ascii_words) / sizeof(ascii_words[0])) ||
+         message_has_any_keyword(message, cjk_keywords,
+                                 sizeof(cjk_keywords) /
+                                     sizeof(cjk_keywords[0]));
+}
+
+static bool message_is_skill_or_knowledge_query(const char *message) {
+  if (!message || message[0] == '\0') {
+    return false;
+  }
+
+  if (contains_substr_ci(message, "/spiffs/skills/") ||
+      contains_substr_ci(message, ".md") ||
+      contains_substr_ci(message, "技能")) {
+    return true;
+  }
+
+  static const char *const ascii_words[] = {
+      "skill", "skills", "profile", "preference", "preferences",
+  };
+  if (message_has_any_ascii_word(
+          message, ascii_words,
+          sizeof(ascii_words) / sizeof(ascii_words[0]))) {
+    return true;
+  }
+
+  char skill_name[96] = {0};
+  return extract_skill_name_from_message(message, skill_name,
+                                         sizeof(skill_name));
+}
+
+static bool read_exact_skill_snippet(const char *message,
+                                     char *skill_name,
+                                     size_t skill_name_size,
+                                     char *snippet,
+                                     size_t snippet_size) {
+  if (!message || !skill_name || skill_name_size == 0 || !snippet ||
+      snippet_size < 2) {
+    return false;
+  }
+  skill_name[0] = '\0';
+  snippet[0] = '\0';
+
+  if (!extract_skill_name_from_message(message, skill_name,
+                                       skill_name_size)) {
+    return false;
+  }
+
+  char path[256] = {0};
+  int n = snprintf(path, sizeof(path), "%s%s.md", ESPAGENT_SKILLS_PREFIX,
+                   skill_name);
+  if (n <= 0 || n >= (int)sizeof(path)) {
+    return false;
+  }
+
+  FILE *f = fopen(path, "r");
+  if (!f) {
+    return false;
+  }
+  size_t read = fread(snippet, 1, snippet_size - 1, f);
+  fclose(f);
+  snippet[read] = '\0';
+  terminate_at_utf8_boundary(snippet, read);
+  return snippet[0] != '\0';
+}
+
+static bool append_exact_runtime_skill_context(char *prompt,
+                                               size_t size,
+                                               const char *message,
+                                               bool tight_mode) {
+  if (!prompt || size == 0 || !message_is_skill_or_knowledge_query(message)) {
+    return false;
+  }
+
+  char skill_name[96] = {0};
+  char *snippet = heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!snippet) {
+    ESP_LOGW(TAG, "Runtime skill exact context skipped: no PSRAM buffer");
+    return false;
+  }
+
+  bool ok = read_exact_skill_snippet(message, skill_name, sizeof(skill_name),
+                                     snippet, 1024);
+  if (ok) {
+    append_prompt_format(
+        prompt, size,
+        "\n## Exact Runtime Skill Context\n\n"
+        "Skill file: %s.md\n"
+        "Use these runtime facts when answering this turn. Do not call sensor, cron, or hardware tools merely because the skill text mentions device words.\n\n"
+        "%.900s\n",
+        skill_name, snippet);
+    ESP_LOGI(TAG, "Injected exact runtime skill context: %s tight=%d",
+             skill_name, tight_mode ? 1 : 0);
+  }
+
+  free(snippet);
+  return ok;
 }
 
 static bool message_requests_skill_summary(const char *message) {
@@ -1856,6 +1996,9 @@ static bool try_execute_deterministic_skill_read_request(
   if (message_requests_skill_mutation_or_tool_execution(msg->content)) {
     return false;
   }
+  if (!message_requests_skill_file_read(msg->content)) {
+    return false;
+  }
 
   char skill_name[96] = {0};
   if (!extract_skill_name_from_message(msg->content, skill_name,
@@ -1913,6 +2056,7 @@ static bool try_execute_deterministic_condition_rule_request(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !message_has_condition_rule_marker(msg->content)) {
     return false;
   }
@@ -2046,6 +2190,7 @@ static bool try_execute_deterministic_fixed_device_duration_workflow(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !message_requests_on_then_off(msg->content)) {
     return false;
   }
@@ -2122,6 +2267,7 @@ static bool try_execute_deterministic_temperature_fan_rule(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       detect_fixed_gpio_device(msg->content) != FIXED_DEVICE_FAN ||
       !message_has_condition_rule_marker(msg->content)) {
     return false;
@@ -2234,6 +2380,7 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       message_has_condition_rule_marker(msg->content) ||
       !tool_guard_match_light_request(msg->content) ||
       !message_has_sequence_marker(msg->content)) {
@@ -2442,6 +2589,7 @@ static bool try_execute_deterministic_mixed_control_workflow(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       message_has_condition_rule_marker(msg->content) ||
       !message_has_sequence_marker(msg->content)) {
     return false;
@@ -2636,6 +2784,7 @@ static bool try_execute_deterministic_scheduled_light_request(
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !tool_guard_match_light_request(msg->content)) {
     return false;
   }
@@ -2745,6 +2894,7 @@ static bool try_execute_deterministic_cron_clarification(
   if (!msg || !msg->content || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       !tool_guard_match_cron_request(msg->content) ||
       message_has_explicit_schedule_time(msg->content)) {
     return false;
@@ -2768,6 +2918,12 @@ static bool is_mesh_related_tool_name(const char *name) {
   return name &&
          (strcmp(name, "mesh_send_command") == 0 ||
           strcmp(name, "read_temperature_humidity") == 0 ||
+          strcmp(name, "read_environment") == 0 ||
+          strcmp(name, "read_air_quality") == 0 ||
+          strcmp(name, "sgp30_read_air_quality") == 0 ||
+          strcmp(name, "read_light_level") == 0 ||
+          strcmp(name, "read_presence") == 0 ||
+          strcmp(name, "hc_sr05_read_distance") == 0 ||
           strcmp(name, "set_status_light") == 0 ||
           strcmp(name, "ws2812_set") == 0 ||
           strcmp(name, "set_humidifier") == 0 ||
@@ -2778,12 +2934,25 @@ static bool is_mesh_related_tool_name(const char *name) {
           strcmp(name, "servo_write") == 0);
 }
 
+static bool is_runtime_skill_qa_blocked_tool_name(const char *name) {
+  return is_mesh_related_tool_name(name) ||
+         (name &&
+          (strcmp(name, "cron_add") == 0 ||
+           strcmp(name, "cron_list") == 0 ||
+           strcmp(name, "cron_remove") == 0 ||
+           strcmp(name, "automation_create_workflow") == 0 ||
+           strcmp(name, "automation_create_rule") == 0 ||
+           strcmp(name, "automation_list") == 0 ||
+           strcmp(name, "automation_remove") == 0));
+}
+
 static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
                                                    char *tool_output,
                                                    size_t tool_output_size,
                                                    char **final_text) {
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_is_skill_or_knowledge_query(msg->content) ||
       message_has_local_marker(msg->content)) {
     return false;
   }
@@ -2856,6 +3025,16 @@ static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *
   const char *message = msg->content;
   bool allowed = true;
   const char *expected = NULL;
+
+  if (message_is_skill_or_knowledge_query(message) &&
+      is_runtime_skill_qa_blocked_tool_name(tool_name)) {
+    snprintf(output, output_size,
+             "Guard blocked tool '%s': this is a runtime skill/knowledge question. Use the injected skill context and answer directly without sensor, cron, automation, or hardware tools.",
+             tool_name);
+    ESP_LOGW(TAG, "Tool guard blocked %s for runtime skill QA: %s",
+             tool_name, message);
+    return false;
+  }
 
   if (strcmp(tool_name, "read_environment") == 0) {
     allowed = tool_guard_match_environment_request(message);
@@ -3830,12 +4009,18 @@ static void agent_loop_task(void *arg) {
         espagent_role_is_coordinator() &&
         !project_explanation_turn &&
         message_is_general_qa_turn(msg.content);
+    bool runtime_skill_qa_turn =
+        espagent_role_is_coordinator() &&
+        message_is_skill_or_knowledge_query(msg.content) &&
+        !message_requests_skill_file_read(msg.content) &&
+        !message_requests_skill_mutation_or_tool_execution(msg.content);
     bool coordinator_transport_tight =
         espagent_role_is_coordinator() && llm_transport_heap_is_tight();
     bool prefer_direct_reply = message_prefers_direct_reply_no_tools(
                                    msg.content) ||
                                smalltalk_turn || general_qa_turn ||
-                               project_explanation_turn;
+                               project_explanation_turn ||
+                               runtime_skill_qa_turn;
     bool use_lightweight_direct_prompt =
         espagent_role_is_coordinator() && prefer_direct_reply;
     int history_limit =
@@ -3867,6 +4052,9 @@ static void agent_loop_task(void *arg) {
     }
     ESP_LOGI(TAG, "LLM turn context: channel=%s chat_id=%s", msg.channel,
              msg.chat_id);
+    bool exact_runtime_skill_context = append_exact_runtime_skill_context(
+        system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, msg.content,
+        coordinator_transport_tight);
 
     /* 2. Load session history into cJSON array */
     session_get_history_json(msg.chat_id, history_json,
@@ -3930,8 +4118,13 @@ static void agent_loop_task(void *arg) {
                                           ESPAGENT_CONTEXT_BUF_SIZE,
                                           history_json);
     } else if (coordinator_transport_tight) {
+      if (exact_runtime_skill_context) {
+        ESP_LOGI(TAG,
+                 "Coordinator transport heap is tight; injected exact runtime skill context only");
+      } else {
       ESP_LOGW(TAG,
                "Coordinator transport heap is tight; skipping skill/memory context expansion for this turn");
+      }
     }
 
     cJSON *messages = cJSON_Parse(history_json);
