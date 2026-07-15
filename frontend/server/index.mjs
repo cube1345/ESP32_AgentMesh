@@ -769,7 +769,7 @@ const server = http.createServer((req, res) => {
           });
         })
         .catch((error) => {
-          sendJson(res, 502, {
+          sendJson(res, 200, {
             skills: listRuntimeSkills(),
             source: 'proxy',
             error: error instanceof Error ? error.message : 'upstream runtime list failed'
@@ -787,7 +787,7 @@ const server = http.createServer((req, res) => {
           });
         })
         .catch((error) => {
-          sendJson(res, 502, {
+          sendJson(res, 200, {
             skills: listRuntimeSkills(),
             source: 'serial',
             error: error instanceof Error ? error.message : 'serial runtime list failed'

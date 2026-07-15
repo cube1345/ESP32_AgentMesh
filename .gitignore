@@ -17,6 +17,10 @@ dependencies.lock
 components/
 managed_components/
 
+# Frontend source components are application code, not ESP-IDF dependencies.
+!frontend/src/components/
+!frontend/src/components/**
+
 # Generated headers
 main/assets/lang_config.h
 main/mmap_generate_emoji.h

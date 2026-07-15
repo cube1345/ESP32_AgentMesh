@@ -67,6 +67,7 @@ export interface RuntimeSkillRecord {
 export interface RuntimeSkillListResponse {
   skills: RuntimeSkillRecord[];
   source: 'local_mock' | 'proxy' | 'serial';
+  error?: string;
 }
 
 export interface RuntimeSkillInstallResponse {
