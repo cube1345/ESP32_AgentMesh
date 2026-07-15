@@ -12,6 +12,8 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "cJSON.h"
 
 static const char *TAG = "session";
@@ -22,8 +24,28 @@ static const char *TAG = "session";
 #define SESSION_BRIEF_MAX_TASKS 3
 #define SESSION_BRIEF_ITEM_CHARS 160
 #define SESSION_TRIM_LINE_MAX 4096
+#define SESSION_LOCK_TIMEOUT_MS 5000
 
 static esp_err_t remove_if_exists(const char *path, bool *removed);
+
+static SemaphoreHandle_t s_session_lock;
+
+static esp_err_t session_lock_take(void)
+{
+    if (!s_session_lock) {
+        return ESP_OK;
+    }
+    return xSemaphoreTake(s_session_lock, pdMS_TO_TICKS(SESSION_LOCK_TIMEOUT_MS)) == pdTRUE
+               ? ESP_OK
+               : ESP_ERR_TIMEOUT;
+}
+
+static void session_lock_give(void)
+{
+    if (s_session_lock) {
+        xSemaphoreGive(s_session_lock);
+    }
+}
 
 static char *session_strdup_line(const char *line)
 {
@@ -365,6 +387,12 @@ static esp_err_t clear_matching_session_store_files(void)
 
 esp_err_t session_mgr_init(void)
 {
+    if (!s_session_lock) {
+        s_session_lock = xSemaphoreCreateMutex();
+        if (!s_session_lock) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
     ESP_LOGI(TAG, "Session manager initialized at %s", ESPAGENT_SPIFFS_SESSION_DIR);
     return ESP_OK;
 }
@@ -382,13 +410,24 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
         return ESP_FAIL;
     }
 
+    esp_err_t err = session_lock_take();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     FILE *f = fopen(path, "a");
     if (!f) {
         ESP_LOGE(TAG, "Cannot open session file %s", path);
+        session_lock_give();
         return ESP_FAIL;
     }
 
     cJSON *obj = cJSON_CreateObject();
+    if (!obj) {
+        fclose(f);
+        session_lock_give();
+        return ESP_ERR_NO_MEM;
+    }
     cJSON_AddStringToObject(obj, "role", role);
     cJSON_AddStringToObject(obj, "content", content);
     cJSON_AddNumberToObject(obj, "ts", (double)time(NULL));
@@ -396,13 +435,15 @@ esp_err_t session_append(const char *chat_id, const char *role, const char *cont
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
 
+    bool wrote = line != NULL;
     if (line) {
         fprintf(f, "%s\n", line);
         free(line);
     }
 
     fclose(f);
-    return ESP_OK;
+    session_lock_give();
+    return wrote ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t session_append_trace(const char *chat_id,
@@ -417,15 +458,22 @@ esp_err_t session_append_trace(const char *chat_id,
         return ESP_FAIL;
     }
 
+    esp_err_t err = session_lock_take();
+    if (err != ESP_OK) {
+        return err;
+    }
+
     FILE *f = fopen(path, "a");
     if (!f) {
         ESP_LOGE(TAG, "Cannot open trace file %s", path);
+        session_lock_give();
         return ESP_FAIL;
     }
 
     cJSON *obj = cJSON_CreateObject();
     if (!obj) {
         fclose(f);
+        session_lock_give();
         return ESP_ERR_NO_MEM;
     }
 
@@ -445,13 +493,15 @@ esp_err_t session_append_trace(const char *chat_id,
     char *line = cJSON_PrintUnformatted(obj);
     cJSON_Delete(obj);
 
+    bool wrote = line != NULL;
     if (line) {
         fprintf(f, "%s\n", line);
         free(line);
     }
 
     fclose(f);
-    return ESP_OK;
+    session_lock_give();
+    return wrote ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 esp_err_t session_get_history_json(const char *chat_id, char *buf, size_t size, int max_msgs)
@@ -1129,15 +1179,25 @@ esp_err_t session_trim_completed_task_context(const char *chat_id)
 
     char history_path[128];
     char trace_path[128];
+    char brief_path[128];
     session_path(chat_id, history_path, sizeof(history_path));
     session_trace_path(chat_id, trace_path, sizeof(trace_path));
+    session_brief_path(chat_id, brief_path, sizeof(brief_path));
 
+    esp_err_t lock_err = session_lock_take();
+    if (lock_err != ESP_OK) {
+        return lock_err;
+    }
     esp_err_t history_err = trim_jsonl_tail(history_path, ESPAGENT_SESSION_TRIM_MAX_MSGS);
     esp_err_t trace_err = trim_jsonl_tail(trace_path, ESPAGENT_TRACE_TRIM_MAX_EVENTS);
-
-    if (history_err == ESP_OK || trace_err == ESP_OK) {
-        (void)session_refresh_context_brief(chat_id);
+    if ((history_err == ESP_OK || trace_err == ESP_OK) && brief_path[0] != '\0') {
+        bool removed = false;
+        (void)remove_if_exists(brief_path, &removed);
+        if (removed) {
+            ESP_LOGI(TAG, "Removed stale brief after trimming %s", brief_path);
+        }
     }
+    session_lock_give();
 
     bool history_ok = (history_err == ESP_OK || history_err == ESP_ERR_NOT_FOUND);
     bool trace_ok = (trace_err == ESP_OK || trace_err == ESP_ERR_NOT_FOUND);
