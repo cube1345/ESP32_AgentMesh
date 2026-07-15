@@ -39,6 +39,7 @@ set(ESPAGENT_MESH_ROLE_SRCS
     "roles/guardian_node.c"
     "guardian/approval_queue.c"
     "control/command_queue.c"
+    "sensors/sensor_history.c"
     "sensors/sensor_mqtt.c"
     "espnow/espnow_sender.c"
 )
@@ -71,6 +72,7 @@ set(ESPAGENT_TOOL_SRCS
     "tools/tool_mesh_command.c"
     "tools/tool_virtual_device.c"
     "tools/tool_subagent.c"
+    "tools/tool_sensor_history.c"
     "tools/gpio_policy.c"
     "tools/tool_gpio.c"
     "tools/tool_servo.c"

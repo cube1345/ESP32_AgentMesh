@@ -77,10 +77,13 @@ Feishu App (User)
 3. Message pushed to Inbound Queue (FreeRTOS xQueue)
 4. Agent Loop (Core 1) pops message:
    a0. If the message starts with a supported slash command, run slash parsing:
-       - `/help` or invalid slash -> immediate direct reply
+       - `/help`, `/init`, `/doctor`, `/mcp`, `/compact`, context/skill actions,
+         or invalid slash -> immediate direct reply
        - `/sensor ...`, `/control ...`, `/guardian ...`, `/subagent ...`,
-         `/workflow ...`, `/rule ...`, `/local ...` -> rewrite to a stronger
-         constrained prompt, then continue
+         `/workflow ...`, `/rule ...`, `/local ...`, `/mesh ...`, `/status ...`,
+         `/stop ...`, `/resume ...`, `/device ...`, `/profile ...`,
+         `/skills ...`, `/privacy ...`, `/lua ...`, `/trace ...` -> rewrite to a
+         stronger constrained prompt, then continue
    a. Build system prompt (SOUL.md + USER.md + MEMORY.md + recent notes + tool guidance)
    b. Add current turn context (source channel + chat target)
    c. Load session history from SPIFFS (JSONL)
@@ -134,6 +137,13 @@ ESPAgent now has a small pre-LLM routing layer in `main/agent/slash_command.c`.
 Supported commands:
 
 - `/help`
+- `/init`
+- `/doctor`
+- `/mcp`
+- `/compact`
+- `/context_status`
+- `/skills_list`
+- `/skills_show <skill_name>`
 - `/sensor <task>`
 - `/control <task>`
 - `/guardian <task>`
@@ -141,10 +151,21 @@ Supported commands:
 - `/workflow <task>`
 - `/rule <task>`
 - `/local <task>`
+- `/mesh <task>`
+- `/status <task>`
+- `/stop <task>`
+- `/resume <task>`
+- `/device <task>`
+- `/profile <task>`
+- `/skills <task>`
+- `/privacy <task>`
+- `/lua <task>`
+- `/trace <task>`
 
 Behavior:
 
-- `/help`, unknown slash commands, and missing-task cases do not enter the LLM.
+- `/help`, `/init`, `/doctor`, `/mcp`, `/compact`, context/skill actions,
+  unknown slash commands, and missing-task cases do not enter the LLM.
 - Routing slash commands rewrite the trailing natural language into a stronger
   role- or execution-scoped instruction, then pass the rewritten text into the
   ordinary `agent_loop`.
@@ -179,11 +200,11 @@ MQTT topics:
 | `espagent/alerts` | subscribe | Logs alert messages |
 | `espagent/agent/timeline` | publish/subscribe | Receives Feishu inbound/outbound timeline events, ReAct tool events, structured OutputMessages, and Guardian audit inputs |
 
-This is intentionally not a full distributed multi-agent runtime yet. Feishu, WebSocket, cron, proactive checks, automation callbacks, and injected async results still converge on the same message bus and the same serial `agent_loop`. `mesh_send_command` now publishes `espagent.policy_check.v1` before the real Mesh command, waits for Guardian's `espagent.policy_decision.v1`, and only continues when `decision=allow`; with `require_ack=true` it defaults to async mode, returns an `async_task_id`, waits for the matching structured `espagent.output.v1` OutputMessage in a background task, and injects that result back into `message_bus` for the LLM to summarize. Sensor role currently supports the whitelisted `read_temperature_humidity` command; Control role supports low/medium-risk whitelisted actuator commands and verifies a local cached Guardian allow decision before execution. Guardian also observes timeline events, publishes `espagent.guardian.audit.v1` audit records, and maintains a lightweight StateBoard.
+The focused branch now supports one role-scoped local `agent_loop` per ESP32-S3 role. Feishu and WebSocket still enter primarily through Coordinator, while Sensor, Control, and Guardian can receive Mesh `agent_task` subtasks and reason with their own role-visible capability profile. `mesh_send_command` now publishes `espagent.policy_check.v1` before the real Mesh command, waits for Guardian's `espagent.policy_decision.v1`, and only continues when `decision=allow`; with `require_ack=true` it defaults to async mode, returns an `async_task_id`, waits for the matching structured `espagent.output.v1` OutputMessage in a background task, and injects that result back into `message_bus` for the LLM to summarize. Sensor role supports whitelisted environment reads plus bounded local history tools (`env_history_summary`, `env_history_recent`); Control role supports low/medium-risk whitelisted actuator commands and verifies a local cached Guardian allow decision before execution. Guardian also observes timeline events, publishes `espagent.guardian.audit.v1` audit records, and maintains a lightweight StateBoard.
 
-Persistent automation is the first runtime layer for multi-step and always-on conditional behavior. The LLM creates a deterministic workflow/rule through `automation_create_workflow` or `automation_create_rule`; the firmware stores rules in `/spiffs/automation.json`, and the FreeRTOS `automation` task periodically reads Sensor data through Mesh and triggers Control actions through the same Guardian-gated Mesh path. This is how tasks such as "red now, blue after 10 seconds" or "if humidity is above 40%, set the WS2812 red, otherwise blue" continue without keeping the LLM turn open.
+Automation is the first runtime layer for multi-step and conditional behavior. The LLM creates a deterministic workflow/rule through `automation_create_workflow` or `automation_create_rule`; pending condition rules are stored in `/spiffs/automation.json` only while waiting for their first trigger, and the FreeRTOS `automation` task periodically reads Sensor data through Mesh and triggers Control actions through the same Guardian-gated Mesh path. This is how tasks such as "red now, blue after 10 seconds" or "if humidity is above 40%, set the WS2812 red, otherwise blue" continue without keeping the LLM turn open.
 
-Automation has two execution paths. Condition-action rules are handled by one long-lived `rule_task`, which scans up to `ESPAGENT_AUTOMATION_MAX_RULES` active rules, respects each rule's `interval_s`, `cooldown_s`, and hysteresis, then runs Sensor/Control Mesh calls serially. Ordered/delayed workflows do not run inside `rule_task`: every accepted workflow starts a temporary `workflow_task`, executes up to `ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS` steps in order, then marks itself complete. Current limits are 8 rules, 8 workflow slots, and 8 steps per workflow. Rules are persisted across reboot; workflow tasks are currently one-shot runtime work and are not restored after reboot.
+Automation has two execution paths. Condition-action rules are handled by one long-lived `rule_task`, which scans up to `ESPAGENT_AUTOMATION_MAX_RULES` active rules, respects each rule's `interval_s`, `cooldown_s`, and hysteresis, then runs Sensor/Control Mesh calls serially. After the first above/below branch action attempt, the rule is removed from memory and persisted out of `/spiffs/automation.json`. Ordered/delayed workflows do not run inside `rule_task`: every accepted workflow starts a temporary `workflow_task`, executes up to `ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS` steps in order, then releases its workflow slot. Current limits are 8 pending rules, 8 workflow slots, and 8 steps per workflow.
 
 ## esp-claw-Inspired Runtime Direction
 
@@ -676,4 +697,4 @@ The CLI provides debug and maintenance commands only. All configuration is done 
 | Agent runtime | `agent/`, `llm/`, `tools/` | Build prompts, call the LLM, parse tool-use blocks, execute tools, and return final text |
 | Persistence | `memory/`, `cache/`, `skills/`, `spiffs_data/` | Store sessions, long-term memory, daily notes, skill summaries, and cached prompt fragments |
 | Hardware access | `drivers/`, `tools/`, `sensors/`, `espnow/` | Keep sensor/peripheral I/O bounded and expose narrow AI-callable tools |
-| Operations | `cli/`, `onboard/`, `ota/`, `proxy/` | Support local setup, diagnostics, OTA updates, and proxied HTTPS access |
+| Operations | `cli/`, `onboard/`, `proxy/` | Support local setup, diagnostics, status/skills management, and proxied HTTPS access |

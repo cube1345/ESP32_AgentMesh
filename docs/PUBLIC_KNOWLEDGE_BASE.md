@@ -112,6 +112,13 @@ esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audi
 - Coordinator 现在对常见飞书 Mesh 指令有确定性路由：普通 `读取温湿度` 直接转 `sensor_agent/read_temperature_humidity`，远程/控制板 WS2812 状态灯颜色请求直接转 `control_agent/set_status_light`，不再完全依赖 LLM 自己选择工具。
 - Coordinator 新增一层显式 slash command：
   - `/help`
+  - `/init`
+  - `/doctor`
+  - `/mcp`
+  - `/compact`
+  - `/context_status`
+  - `/skills_list`
+  - `/skills_show <skill_name>`
   - `/sensor <task>`
   - `/control <task>`
   - `/guardian <task>`
@@ -119,7 +126,17 @@ esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audi
   - `/workflow <task>`
   - `/rule <task>`
   - `/local <task>`
-- 其中 `/help`、未知命令、缺少任务参数会直接返回文本；其它 slash 命令会把后续自然语言改写成更强的角色/执行约束，再进入原有 ReAct/tool 流程。
+  - `/mesh <task>`
+  - `/status <task>`
+  - `/stop <task>`
+  - `/resume <task>`
+  - `/device <task>`
+  - `/profile <task>`
+  - `/skills <task>`
+  - `/privacy <task>`
+  - `/lua <task>`
+  - `/trace <task>`
+- 其中 `/help`、`/init`、`/doctor`、`/mcp`、`/compact`、`/context_status`、`/skills_list`、`/skills_show`、未知命令和缺少任务参数会直接返回文本；其它 slash 命令会把后续自然语言改写成更强的角色/执行约束，再进入原有 ReAct/tool 流程。
 - 2026-07-05 USB0 板端已验证 slash 闭环：`/help` 直接回复成功；`/control set status light blue` 已确认走 `mesh_send_command -> policy_check -> policy_decision -> control_agent -> OutputMessage -> final reply`。
 - Sensor 节点当前日志中可见 `DHT22=ESP_ERR_TIMEOUT` 和 `MH-Z19=ESP_FAIL`，表示节点在线但这些具体传感器在当前接线/配置下未读到数据。
 - 当前控制类远程执行已支持 WS2812/status-light/servo/GPIO/virtual_device_control 白名单验证；Coordinator 下发前会先经过 Guardian `policy_check/policy_decision`，执行结果会发布结构化 `espagent.output.v1` OutputMessage。Control Agent 已新增轻量 command queue，支持重复 command_id 拦截、TTL 检查、单执行器互锁、emergency stop latch 和 actuator state snapshot。Guardian 已具备人工确认队列，`approval_confirm` 后可通过一次性 `approval_id` 让同 action/role 的高风险控制重试获得 allow。固件也支持可选硬件 interlock GPIO 和 Mesh command HMAC 当前/previous key 验证；生产 broker ACL/TLS、真实互锁接线和密钥轮换流程仍需部署验证。
@@ -129,19 +146,17 @@ esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audi
 - Sensor 角色已补充 `read_temperature_humidity` command 白名单：收到命令后可调用 AHT10/AHT20 工具并发布结构化 `espagent.output.v1` OutputMessage 到 events/timeline。
 - 2026-06-18 实测 USB1 `sensor_agent` 上 AHT20 已正确识别并读取，典型读数为 `temperature=27.4 C`、`humidity=45.2%`；Sensor telemetry 已发布到 `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`，payload 包含 `temp`、`humidity`、`sensor:"AHT20"` 和 `status`。
 - Coordinator 的 `mesh_send_command` 工具现在会先向 Guardian 发起 `policy_check`，收到 `decision=allow` 后才发布真正的 Sensor/Control command；随后在 `require_ack=true` 时等待同一 `command_id` 的 OutputMessage。等待成功时，工具结果会包含 `output_message={...}` 并进入下一轮 LLM 上下文，让跨节点 ReAct 从“只下发命令”推进到“裁决、下发、等待、观察结果、再推理”。
-- Coordinator 已新增 automation runtime：`automation_create_workflow` 用于顺序/延迟动作，`automation_create_rule` 用于持续条件监控，规则持久化到 `/spiffs/automation.json`，由 FreeRTOS `automation` task 后台轮询执行，不依赖当前对话回合持续占用 `agent_loop`。
-- Automation 当前分两条执行路径：条件规则由一个常驻 `rule_task` 串行扫描 `s_rules[]`，多步/延迟任务由每个 workflow 自己启动一个临时 `workflow_task`。默认上限为 8 条规则、8 个 workflow 槽位、每个 workflow 8 步。
+- Coordinator 已新增 automation runtime：`automation_create_workflow` 用于顺序/延迟动作，`automation_create_rule` 用于一次性条件监控；待触发规则暂存到 `/spiffs/automation.json`，触发任一分支动作后自动删除并写回，不依赖当前对话回合持续占用 `agent_loop`。
+- Automation 当前分两条执行路径：条件规则由一个常驻 `rule_task` 串行扫描 `s_rules[]`，触发后自动清除；多步/延迟任务由每个 workflow 自己启动一个临时 `workflow_task`，执行完成后释放槽位。默认上限为 8 条待触发规则、8 个 workflow 槽位、每个 workflow 8 步。
 - 2026-06-18 已完成湿度条件自动化验证：USB0 创建 `humidity_percent > 40` 规则，USB1 AHT20 返回湿度约 `46.0%`，USB0 经 Guardian policy 下发 `set_status_light`，USB2 `control_agent` 执行 WS2812 `rgb=(255,0,0)`；测试规则随后已通过 `automation_remove` 删除。
 - Guardian 角色已接入 policy 第二层：启动时声明 policy/privacy/audit/stateboard/watchdog 边界；订阅 `espagent/cube1345/security/policy_check` 后按白名单、安全等级和部分参数级规则返回 `espagent.policy_decision.v1` 到 `espagent/cube1345/security/decision`；对 `virtual_device_control` 会检查 `device`、`duration_ms` 和持久 relay `confirmed=true` 要求；订阅 timeline 后对 `tool_use`、`tool_result`、`mesh_command_queued`、`mesh_command_result`、`final_reply`、`error` 等关键事件生成 `espagent.guardian.audit.v1` 审计事件，错误事件会同步发布到 alerts。
 
-Gateway / 管理后台状态：
+管理后台状态：
 
-- 2026-06-21 已参考 Ai-Thinker BLE Mesh Gateway 的思路，把“网关”作为 ESPAgent 的能力层接入，而不是把外部项目整套替换进来。
-- 新增 `device_registry`：本地维护已知 MQTT Mesh 节点和外部网关设备，持久化到 `/spiffs/device_registry.json`；本节点启动时自动注册自己，收到 `nodes/+/state` 或 `nodes/+/telemetry` 后会更新远端节点在线状态、角色、能力和最近出现时间。
-- 新增本地管理 API：`GET /status`、`GET /devices`、`POST /gateway/ble_mesh/register`、`POST /ota/plan`；`onboard_html` 已加入 Gateway Status、BLE Mesh Device、OTA Gateway Plan 三个管理区块。
-- 新增 LLM/CLI 可调用工具：`gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`，并接入 sandbox、capability family、role-visible profile 和 `context_builder` 提示词。
-- BLE Mesh 目前是 bridge boundary：可以注册设备、生成事件、把 BLE Mesh command 意图发布到 node events 和全局 timeline；但真实 BLE Mesh Provisioner / model send 后端尚未链接，工具会返回 `ESP_ERR_NOT_SUPPORTED` / `not_linked`，不能声称已经物理控制 BLE Mesh 设备。
-- OTA Gateway 当前是 plan-only：Coordinator/管理页/CLI 可以生成结构化升级计划并发布到 timeline，便于 P4/Android 展示；真实升级仍通过串口 `ota_update <https_url>`，远程 OTA 执行还需要 Guardian 审批、镜像来源校验、目标角色校验和进度回传后再开放。
+- 当前 focused Agent collaboration 分支已移除 BLE Mesh Gateway、RPi 网关和 OTA planning 作为展示链路，避免占用 MCU 固件空间和运行时内存。
+- 保留的本地管理面以 Wi-Fi onboarding/admin、`/status`、`/devices` 和 runtime skills 管理为主，用于查看板端状态、节点记录和动态 skill 装载。
+- `device_registry` 只作为 MQTT Mesh 节点状态记录与展示辅助，不再宣传外部 BLE Mesh 设备注册或网关控制能力。
+- `/mcp` slash 命令仅说明 MCU 不直接承载 Claude Code 风格 MCP host/server；若未来需要 MCP，应由上位机/服务器桥接到现有 Mesh 或 Web/admin API，而不是作为当前 S3 固件功能。
 
 MQTT Mesh topic：
 
@@ -156,7 +171,7 @@ espagent/agent/timeline
 espagent/alerts
 ```
 
-当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单 `read_temperature_humidity` 做受限执行并发布 `mesh_command_result`；Control 角色已支持 WS2812/status-light 这类低风险白名单命令并发布结果。Gateway 侧 BLE Mesh command 当前只登记/发布意图，不做真实 BLE 执行。其它 node/role command 仍以校验和 dry-run 日志为主，不直接执行硬件动作。
+当前 MQTT command / dispatch 的执行边界是：Sensor 角色只对白名单感知动作做受限执行并发布 `mesh_command_result`；Control 角色已支持 WS2812/status-light、GPIO、风扇、加湿器、舵机等白名单动作并发布结果。其它 node/role command 仍以校验、白名单和 Guardian policy 为边界，不允许绕过工具层直接执行硬件动作。
 
 Feishu/LLM 通信板的 MQTT 桥接已经进入可编译状态：
 
@@ -184,6 +199,13 @@ Slash command 状态：
 - 当前设计不是给 MCU 做一个通用 shell，而是在 `agent_loop` 前增加一层固定命令语义入口。
 - 已支持的固定命令：
   - `/help`
+  - `/init`
+  - `/doctor`
+  - `/mcp`
+  - `/compact`
+  - `/context_status`
+  - `/skills_list`
+  - `/skills_show`
   - `/sensor`
   - `/control`
   - `/guardian`
@@ -191,16 +213,26 @@ Slash command 状态：
   - `/workflow`
   - `/rule`
   - `/local`
+  - `/mesh`
+  - `/status`
+  - `/stop`
+  - `/resume`
+  - `/device`
+  - `/profile`
+  - `/skills`
+  - `/privacy`
+  - `/lua`
+  - `/trace`
 - 当前行为：
-  - `/help` 和错误命令直接回复
+  - `/help`、`/init`、`/doctor`、`/mcp`、`/compact`、`/context_status`、`/skills_list`、`/skills_show` 和错误命令直接回复
   - 其它命令把后续自然语言重写成强约束提示，再复用现有 LLM ReAct/tool/runtime
 
 四角色资源占用快照：
 
-- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像，但会在烧录前写入不同 `node_id` / `role` / capabilities；2026-06-21 加入 Gateway/device_registry/管理 API 后构建 app 二进制约 `0x195920`，2MB app 分区剩余 `0x6a6e0`，约 21%。
+- Flash 尚未按角色裁剪，四个角色仍使用同一固件镜像，但会在烧录前写入不同 `node_id` / `role` / capabilities；当前 focused 分支已移除 BLE Mesh Gateway、OTA planning 和语音链路，本轮构建 `ESPAgent.bin=0x1ab210`，最小 app 分区剩余 `0x54df0`，约 17%。
 - Coordinator 是当前最重角色，承担 LLM、Feishu WebSocket、WebSocket server、MQTT、SNTP、cron/proactive、session/context 和临时 subagent。USB0 启动日志显示 PSRAM 约 8MB 可用；完成一次 ReAct 验证后 PSRAM 仍约 8.25MB 可用。
-- Sensor 当前承担 sensor sampling、environment/presence monitor、MQTT telemetry 和串口 CLI，不运行 LLM/Feishu。
-- Control 当前承担控制边界、MQTT command 接收、本地执行器工具和 boot servo demo，不运行 LLM/Feishu。
+- Sensor 当前承担 sensor sampling、environment/presence monitor、MQTT telemetry、串口 CLI 和受限本地 LLM loop；不运行 Feishu 入口，只处理感知和历史分析任务。
+- Control 当前承担控制边界、MQTT command 接收、本地执行器工具、boot servo demo 和受限本地 LLM loop；不运行 Feishu 入口，只处理执行器职责内任务。
 - Display 当前由 ESP32-P4+C6 和 Android 方向承担；USB3 ESP32-S3 从旧 Display 方案调整为 Guardian。ESP32-P4+C6 工程 `/home/cube/WorkSpace/ESP/lvgl_traffic_control` 已新增真实 LVGL `AgentMesh` 页面和 MQTT timeline/state/telemetry/alerts 订阅，并已烧录到 `/dev/ttyACM0`。当前 P4 板端已确认 Wi-Fi 和 MQTT 订阅成功，四板联动与屏幕动态刷新仍需继续实机验证。
 - P4 已订阅 `nodes/+/telemetry`，因此 AHT20 温湿度 telemetry 能进入 Display Terminal 数据流；但现有 Environment Monitor 温湿度卡片仍需进一步做动态绑定，当前不能夸大为所有 UI 卡片都已实时刷新。
 - Android Display Agent 交接方案已新增到 `docs/ANDROID_AGENTMESH_HANDOFF.md`：定位为 ESP32-P4+C6 的移动增强版展示终端，使用 Java Android + MQTT 订阅 `timeline/state/telemetry/alerts`，在本地维护类似 Stage `StateBoard` 的状态源，用于展示 AI 推理、Mesh 通信、节点状态、传感器数据和最终用户结果。
@@ -293,15 +325,16 @@ Feishu WebSocket 稳定性状态：
 地位：
 
 - Sensor 是多节点系统的感知层，负责把真实环境变成可靠、短小、带时间戳的数据。
-- 它不跑主 LLM，也不直接执行高风险控制动作。
-- 它的价值在于长时间稳定采样、滤波、缓存和上报。
+- 它运行角色受限的本地 LLM，只处理感知、历史趋势和传感器诊断相关任务，不直接执行高风险控制动作。
+- 它的价值在于长时间稳定采样、滤波、缓存、上报，并为本地 LLM 提供可分析的环境历史。
 
 当前职责：
 
 - 读取 AHT10/AHT20 温湿度、SGP30 eCO2/TVOC、BH1750/GY-30 光照、人体存在/距离等环境数据。
 - 周期发布 telemetry。
+- 每 5 分钟把综合环境样本追加到 `/spiffs/env/*.jsonl`，保留约 14 天，并通过 `env_history_summary` / `env_history_recent` 提供摘要读取。
 - 通过 MQTT/ESP-NOW 把传感器快照给 Coordinator 和 Display。
-- 后续做阈值判断，例如湿度过低、空气质量变差、光照异常。
+- 执行阈值判断，例如湿度过低、空气质量变差、光照异常。
 
 输入：
 
@@ -321,6 +354,7 @@ Feishu WebSocket 稳定性状态：
 - 环境监测任务已存在，能读取综合环境数据并通过 ESP-NOW 发送。
 - MQTT telemetry/state/event 框架已存在。
 - MQTT 收到 `read_temperature_humidity` command 时，Sensor 角色可执行 AHT10/AHT20 温湿度读取，并发布 `mesh_command_result`。
+- Sensor 本地环境历史已接入工具面，LLM 做趋势分析时优先调用 `env_history_summary`，需要少量原始样本时调用 `env_history_recent`，避免直接读取全量历史文件。
 - 2026-06-18 USB1 AHT20 已实测通过，I2C 地址 `0x38`，典型读数 `27.4 C / 45.2%RH`；Sensor Agent 的周期 telemetry 已改为优先发布 AHT20 温湿度 JSON，而不是继续依赖未接入的 DHT22/MH-Z19。
 
 当前限制：
@@ -386,7 +420,7 @@ Feishu WebSocket 稳定性状态：
 地位：
 
 - Display 是可视化与状态监督层，可运行在 ESP32-S3 简易显示节点，也可以迁移到 ESP32-P4 或 Android App。
-- 它不承担主 LLM，也不直接控制危险硬件。
+- 它不承担 Feishu 主入口，也不直接控制危险硬件。
 - 它负责让多 Agent 调度过程“看得见”：谁发起、谁执行、结果如何、哪里异常。
 
 当前职责：
@@ -493,7 +527,7 @@ if (role_is_display()) display_node_start();
 | 节点 | 主要吃满的资源 | 设计重点 |
 |------|----------------|----------|
 | Coordinator | Wi-Fi/HTTPS、TLS buffer、LLM JSON、PSRAM、会话上下文 | 保留 Feishu/WebSocket/LLM/search/weather/cron/proactive，负责理解、拆解、调度、通知。 |
-| Sensor | I2C/UART/GPIO 输入、采样任务、滤波缓存、MQTT/ESP-NOW 上报 | 持续采集环境数据，做本地阈值判断和短期统计，不跑 LLM。 |
+| Sensor | I2C/UART/GPIO 输入、采样任务、滤波缓存、MQTT/ESP-NOW 上报、本地环境历史 | 持续采集环境数据，做本地阈值判断、短期统计和历史摘要分析；LLM 只暴露 Sensor 角色能力。 |
 | Control | GPIO/PWM/I2S/继电器/舵机、命令队列、安全互锁、状态机 | 只执行白名单动作，所有远程命令先入队、校验、限流、审计，不直接从 MQTT 调 GPIO。 |
 | Display | PSRAM/屏幕 buffer、timeline 缓存、状态订阅、watchdog | 订阅 state/telemetry/timeline/alerts，展示调度过程和异常状态，不承担主 LLM。 |
 
@@ -617,11 +651,10 @@ ESPAgent/
 |------|------|
 | `main/channels/feishu/feishu_bot.c/.h` | Feishu/Lark WebSocket 接入、事件解析、消息入队、回复发送。 |
 | `main/gateway/ws_server.c/.h` | 本地 WebSocket chat gateway，默认端口 `18789`。 |
-| `main/gateway/ble_mesh_bridge.c/.h` | BLE Mesh bridge boundary：注册外部 BLE Mesh 设备、发布 BLE command 意图到 events/timeline；真实 BLE 后端未链接时返回 `not_linked`。 |
-| `main/device/device_registry.c/.h` | 本地 device registry：持久化已知 MQTT Mesh 节点和外部网关设备，供管理页、Gateway tool、P4/Android 展示使用。 |
+| `main/device/device_registry.c/.h` | 本地 device registry：持久化已知 MQTT Mesh 节点状态，供管理页和 P4/Android 展示使用。 |
 | `main/cli/serial_cli.c/.h` | USB serial CLI，提供配置、诊断、工具直调、注入消息、搜索测试、proactive 测试等命令。 |
-| `main/onboard/wifi_onboard.c/.h` | Wi-Fi onboarding/admin AP；当前也提供 `/status`、`/devices`、`/gateway/ble_mesh/register`、`/ota/plan` 管理 API。 |
-| `main/onboard/onboard_html.h` | 内嵌 onboarding/admin HTML 页面，包含 Wi-Fi/LLM/Feishu/Search/Gateway/BLE/OTA Plan 配置区。 |
+| `main/onboard/wifi_onboard.c/.h` | Wi-Fi onboarding/admin AP；当前提供 `/status`、`/devices` 与 runtime skills 管理接口。 |
+| `main/onboard/onboard_html.h` | 内嵌 onboarding/admin HTML 页面，包含 Wi-Fi/LLM/Feishu/Search、设备状态与 Skills 管理区。 |
 
 ### 存储、记忆、缓存、技能
 
@@ -647,7 +680,6 @@ ESPAgent/
 | `main/drivers/*.c/.h` | 底层驱动：SGP30、AHT10/AHT20、BH1750、MAX98357、INA I2S Mic 等。 |
 | `main/tools/*.c/.h` | AI-callable 工具实现。每个工具做参数解析、边界检查和具体硬件/服务调用。 |
 | `main/tools/tool_registry.c/.h` | 工具注册表、JSON schema 构建、按名字分发执行。 |
-| `main/tools/tool_gateway.c/.h` | Gateway 相关 AI-callable 工具：`gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`。 |
 | `main/tools/tool_subagent.c/.h` | `spawn_subagent` 工具：创建受限 FreeRTOS 子代理，执行独立短 ReAct loop 后同步返回结果。 |
 | `main/tools/gpio_policy.c/.h` | GPIO allowlist 和安全策略。 |
 | `main/sensors/sensor_mqtt.c/.h` | MQTT state/event/telemetry 发布，订阅 node/role command、dispatch、timeline、alerts、policy_check/decision；缓存 OutputMessage 和 policy decision，供 Coordinator 异步回注与 Control 本地校验使用。 |
@@ -656,7 +688,6 @@ ESPAgent/
 | `main/espnow/espnow_sender.c/.h` | ESP-NOW 广播文本遥测。 |
 | `main/wifi/wifi_manager.c/.h` | Wi-Fi STA 生命周期、事件处理、重连退避。 |
 | `main/proxy/http_proxy.c/.h` | HTTP CONNECT 代理，用于 Feishu/LLM/search 等 HTTPS 出口。 |
-| `main/ota/ota_manager.c/.h` | HTTPS OTA 更新封装；当前通过 Serial CLI 的 `ota_info` / `ota_update` 使用。 |
 | `benchmarks/skills/espagent_skill_benchmark.jsonl` | ESP32 运行时 skill benchmark 数据集，用 JSONL 描述 skill loading、Mesh routing、sandbox、privacy、prompt-injection 和 workflow 验证用例。 |
 | `tools/benchmark_skills_usb0_3.py` | ESP32-S3 四板 benchmark runner，默认只使用 `/dev/ttyUSB0-3`，通过串口 CLI / `inject_msg` 执行用例并基于日志打分。 |
 | `tools/manifest_lint.py` | 新硬件 manifest 开发者工具链，支持本地 lint 和 `--dry-run` 路由预演，不依赖外部 Python 包。 |
@@ -981,6 +1012,7 @@ Guardian 返回 `espagent.policy_decision.v1`，当前 Coordinator 只在 `decis
 | `spawn_subagent` | 为独立搜索、天气、时间、SPIFFS 文件读取/总结等任务创建受限临时子代理。 |
 | `read_temperature_humidity` | AHT10/AHT20 温湿度读取。 |
 | `read_environment` | AHT10/AHT20 + SGP30 + BH1750/GY-30 综合环境读取。 |
+| `env_history_summary` / `env_history_recent` | Sensor 本地环境历史摘要和最近样本读取，供角色本地 LLM 做趋势分析。 |
 | `read_presence` | 人体存在或 HC-SR05 超声波存在判断。 |
 | `hc_sr05_read_distance` | HC-SR05 低层距离读取。 |
 | `read_file` / `write_file` / `edit_file` / `list_dir` | SPIFFS 文件工具。 |
@@ -992,7 +1024,7 @@ Guardian 返回 `espagent.policy_decision.v1`，当前 Coordinator 只在 `decis
 | `read_light_level` | BH1750/GY-30 光照 lux。 |
 | `cron_add` / `cron_list` / `cron_remove` | 定时任务管理。 |
 | `automation_create_workflow` | 创建并启动确定性多步工作流，适合“先红色，等 10 秒，再蓝色”这类顺序/延迟动作。 |
-| `automation_create_rule` | 创建持久化条件动作规则，适合“湿度低于阈值就开灯/打开加湿器”这类后台监控。 |
+| `automation_create_rule` | 创建一次性条件动作规则，适合“湿度低于阈值就开灯/打开加湿器”这类后台监控；首次分支动作执行后自动清除。 |
 | `automation_list` / `automation_remove` | 查看或删除 workflow/rule。 |
 
 ### Agent Sandbox
@@ -1004,7 +1036,7 @@ ESP32-S3 上不能实现 Linux/Docker 容器，但当前固件已经加入第一
 - 沙箱按工具风险分为 `read_only`、`low_control`、`medium_control`、`high_control`、`privacy`、`system`。
 - 沙箱会检查当前 role/capability、受保护路径、Mesh TTL/safety/action、automation interval/cooldown、音频时长/音量，以及高影响动作是否带 `confirmed=true`。
 - `write_file` / `edit_file` 写 `/spiffs/config`、secrets 相关路径会被拒绝；修改 `/spiffs/skills` 需要显式 `confirmed=true`。
-- `automation_create_rule` 被视为高影响持久动作，默认需要 `confirmed=true`，避免 LLM 在没有用户确认时创建长期后台规则。
+- `automation_create_rule` 被视为后台高影响动作，默认需要 `confirmed=true`，避免 LLM 在没有用户确认时创建条件监控。
 - 该 sandbox 不是替代 Guardian，而是 Guardian 前面的本地确定性工具边界；当前已补人工确认 token 和 Mesh command HMAC，后续还应继续补决策消息认证、生产密钥轮换流程和更细的 per-tool capability token。
 
 ### 硬件能力
@@ -1023,7 +1055,7 @@ ESP32-S3 上不能实现 Linux/Docker 容器，但当前固件已经加入第一
 ### 主动性
 
 - `cron_add` 支持 recurring、one-shot、daily。
-- `automation_create_rule` 支持把温湿度阈值联动注册为后台默认任务，规则存入 `/spiffs/automation.json`，即使当前对话切换到其它任务，automation task 仍会按 interval/cooldown 继续监控和触发。
+- `automation_create_rule` 支持把温湿度阈值联动注册为一次性后台任务，规则等待触发期间存入 `/spiffs/automation.json`；首次 above/below 动作尝试后自动从内存和文件中清除。
 - `automation_create_workflow` 支持多个一次性顺序/延迟任务；每个 workflow 创建独立临时 `workflow_task`，执行完成后释放，不属于重启恢复型持久任务。
 - `proactive_service` 可周期性触发自检，必要时主动发消息。
 - 天气主动提醒应优先使用 `get_weather`。
@@ -1059,25 +1091,21 @@ Flash 配置为 16MB，自定义分区表：
 | `nvs` | 24KB | Wi-Fi、LLM、Feishu、搜索、proactive、Amap 等 NVS 配置。 |
 | `ota_0` | 2MB | OTA app slot A。 |
 | `ota_1` | 2MB | OTA app slot B。 |
-| `spiffs` | 约 11.8MB | memory、sessions、skills、cron、automation、config 文件。 |
+| `spiffs` | 4MB | memory、sessions、skills、cron、automation、config 和 Sensor 环境历史文件。 |
 | `coredump` | 64KB | 预留 coredump，当前 sdkconfig 禁用 flash coredump。 |
 
 最近构建结果：
 
-- 2026-06-21 加入 Gateway/device_registry/管理 API 后，`build/ESPAgent.bin` 约 `0x195920`。
-- 最小 app 分区剩余约 `0x6a6e0`，约 21%。
-- `0x1902c0` - `0x191d40` / 约 22% 剩余是 Lua runtime 和多节点必要性增强阶段的历史构建结果，不代表 Gateway 合入后的当前体积。
+- 本轮 agent-update 分支构建通过，`build/ESPAgent.bin` 为 `0x1ab210`。
+- 最小 app 分区剩余 `0x54df0`，约 17%。
+- 当前 `spiffs_data` 约 228KB；SPIFFS 分区 4MB，Sensor history 未同步时间文件额外限制为 256KB，避免长期离线运行顶满存储。
 
 OTA 状态：
 
 - 分区表已经是双 app slot：`ota_0` / `ota_1` 各 2MB，`otadata` 记录启动状态。
-- 2026-06-17 已把 `main/ota/ota_manager.c` 编入固件，并在串口 CLI 增加 `ota_info` 和 `ota_update <https_url_to_ESPAgent.bin>`。
-- 2026-06-21 已新增 `ota_gateway_plan` 工具和 `/ota/plan` 管理 API，用于创建结构化 OTA 运维计划并发布到 timeline，供 P4/Android 展示和 Guardian 后续审批链路使用。
-- `ota_update` 只接受 HTTPS URL，使用 ESP-IDF `esp_https_ota` 和系统证书包下载 app `.bin`，成功后自动重启到新分区。
-- OTA 当前不暴露为 LLM/Feishu tool。后续如果要远程触发，必须经过 Guardian policy、人工确认、镜像来源校验和版本/角色校验。
-- Agent 在 OTA 中的定位不是“写新固件代码”或“在 MCU 上编译固件”，而是升级运维编排：开发者或 CI 先准备好 `ESPAgent.bin`，Agent 后续可以负责发现版本、匹配角色、请求 Guardian 审批、询问用户确认、下发 OTA 任务、观察重启和汇总升级结果。
-- 如果没有公网服务器，当前代码仍需要 ESP32 可访问的 HTTPS app bin URL；局域网 HTTP、本机上传、串口传输和自签名 HTTPS 还没有实现。
-- 当前四个 S3 角色仍使用同一代码但不同 build-time profile；如果 OTA 镜像内写死了另一个 `NODE_ID` / `NODE_ROLE`，升级后会改变板子的角色。后续更推荐把角色身份迁移到 NVS，再让同一个 OTA 镜像适配四块板。
+- 当前 focused 分支不把 MCU-side OTA 作为展示或运行时能力，相关 Serial CLI 命令、LLM 工具和 OTA plan API 已从当前源码面移除。
+- 固件更新回到开发机侧烧录流程，避免在 S3 上保留额外 HTTPS OTA 运维链路。
+- 后续若恢复 OTA，应先把角色身份迁移到 NVS，并重新设计 Guardian 审批、镜像来源校验和版本/角色校验。
 
 ## 运行时任务
 
@@ -1089,7 +1117,7 @@ OTA 状态：
 - `serial_cli`: Core 0，串口 REPL。
 - `cron`: 定时任务轮询。
 - `proactive`: 主动检查。
-- `automation`: Core 0，后台执行持久化条件规则，周期读取 Sensor 并触发 Control。
+- `automation`: Core 0，后台执行待触发条件规则，周期读取 Sensor 并触发 Control；首次分支动作尝试后自动清除。
 - `sensor_mqtt`: MQTT state/event/telemetry。
 - ESP-IDF 内部 Wi-Fi/httpd/TLS 任务。
 
@@ -1116,7 +1144,7 @@ OTA 状态：
 - prompt 安全边界和 execution-side tool guard。
 - SPIFFS memory、daily notes、sessions、skills。
 - Cron daily proactive 和 periodic proactive service。
-- Automation runtime：`automation_create_workflow` 支持顺序/延迟 Mesh 动作，`automation_create_rule` 支持持久化条件联动，`automation_list`/`automation_remove` 支持查询和删除。
+- Automation runtime：`automation_create_workflow` 支持顺序/延迟 Mesh 动作，`automation_create_rule` 支持一次性条件联动，`automation_list`/`automation_remove` 支持查询和删除。
 - Automation 并发边界已明确：`rule_task` 只负责条件规则，所有规则在一个后台 task 中串行轮询；workflow 由独立 `workflow_task` 执行，当前不做重启恢复，且运行中 workflow 的强制取消能力还需要补。
 - 反问承接的启发式上下文提示。
 - Agent Mesh Phase 1：node identity、capabilities、responsibilities、MQTT state/telemetry/event、node/role command topic。
@@ -1136,10 +1164,9 @@ OTA 状态：
 - 2026-06-18 已完成 AHT20 实物验证：USB1 `esp32s3-sensor-01` 识别 AHT20，读数恢复到 `27.x C / 45-46%RH`；`read_temperature_humidity` 和 Sensor MQTT telemetry 均优先使用 AHT20 数据，topic 为 `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`。
 - 2026-06-18 已完成湿度条件自动化验证：创建 `humidity_percent > 40` 的 `automation_create_rule`，后台 `automation` task 周期读取 USB1 AHT20，触发 USB2 `control_agent` 执行 `set_status_light`，串口确认 WS2812 GPIO48 输出红色 `rgb=(255,0,0)`；验证后测试规则已删除。
 - 2026-06-18 已修复 automation task 栈溢出：`ESPAGENT_AUTOMATION_STACK` 提升到 `12 * 1024`，`automation_engine_start()` 创建 `automation` task 时使用该配置。
-- 2026-06-17 已新增 OTA 固件升级能力：`ota_manager` 正式参与构建，串口 CLI 支持 `ota_info` 查看 OTA 分区，`ota_update <https_url_to_ESPAgent.bin>` 从 HTTPS app bin 更新 inactive OTA slot 并成功后重启。该能力当前仅用于本地维护，不进入 LLM tool registry。
-- OTA 的 Agent 化规划已明确：不是让 ESP32 Agent 生成代码，而是把 OTA 作为多 Agent 运维闭环，由 Coordinator 发现/调度、Guardian 审批、安全确认、目标节点执行、P4/Android 展示进度和结果。
+- 2026-07 focused 分支为降低 MCU 内存和固件表面积，已移除语音链路、BLE Mesh Gateway、RPi 网关和 OTA planning 作为当前展示能力；比赛演示聚焦 subagent、sandbox、workflow、rule 和 runtime skills。
 - ESP32-P4+C6 显示端已在 `/home/cube/WorkSpace/ESP/lvgl_traffic_control` 中实现基础 Display Terminal：新增 LVGL `AgentMesh` tab、裸 TCP MQTT 订阅、事件队列、内存 timeline buffer、节点状态卡和最终结果显示；P4 构建通过并已烧录到 `/dev/ttyACM0`，Wi-Fi/MQTT connect/subscribe 已验证，实时收包和屏幕 timeline 实机验证仍需继续。
-- 新增 Agent Mesh / MCU edge AI 运行时 skills：`agent-mesh-coordination.md`、`mqtt-mesh-operations.md`、`mcu-edge-ai-boundaries.md`、`mesh-resource-planning.md`。这些文件把联网调研得到的边界固化进运行时 prompt：角色化 Agent Mesh 调度、MQTT pub/sub 协作、MCU 端 TinyML/小模型推理方向、以及“当前 ESP32-S3 不运行本地完整 LLM”的能力边界。
+- 新增 Agent Mesh / MCU edge AI 运行时 skills：`agent-mesh-coordination.md`、`mqtt-mesh-operations.md`、`mcu-edge-ai-boundaries.md`、`mesh-resource-planning.md`。这些文件把联网调研得到的边界固化进运行时 prompt：角色化 Agent Mesh 调度、MQTT pub/sub 协作、MCU 端 TinyML/小模型推理方向，以及“当前 ESP32-S3 通过云端 LLM API 运行角色受限 agent loop，而不是本地离线完整 LLM 模型”的能力边界。
 - 2026-06-19 已根据 OWASP LLM Top 10、NIST AI RMF、MCP/Agent 工具安全和 Agentic AI 安全资料补充三类安全运行时 skills：`agent-sandbox-permissions.md` 约束工具权限、风险分级、dry-run、TTL 和硬件互锁；`privacy-data-minimization.md` 约束家居隐私数据分级、本地脱敏、最小上下文和 MQTT/Display/Memory 边界；`tool-integrity-and-prompt-injection.md` 约束外部内容作为数据而非指令，防止 prompt injection、tool poisoning 和工具输出越权。
 - 2026-06-19 已完善 ESP32 平台 skills benchmark：`benchmarks/skills/espagent_skill_benchmark.jsonl` 定义运行时行为用例，`tools/benchmark_skills_usb0_3.py` 负责 `/dev/ttyUSB0-3` 四板串口执行、role 检查、自动生成全量 SPIFFS skill 可读性用例、剔除输入回显后的日志打分、资源快照和 artifact 输出；当前支持离线 `--validate-only` / `--list-cases`，也支持板端 skill loading、Mesh routing、sandbox、privacy、prompt-injection、workflow 和全量 skill 文件读取测试。本轮完整四板 run `fixed_full_20260619_210709` 为 23/24，唯一失败来自 prompt-injection `must_not` 规则过宽；修正后单项 run `fixed_prompt_20260619_212052` 为 1/1，串口确认无 `read_file` 执行、无 memory 泄露。
 - 2026-06-21 软件侧补齐 runtime hardware manifest 体系：固件强制 `manifest_version=1`、`permissions`、role/risk 边界和 SHA-256 sidecar；控制类 manifest 的 `duration_ms` 改为非阻塞后台 safe-state restore；`tools/manifest_lint.py` 增加 `--support-matrix`、`--init-template` 和签名更新；SPIFFS 示例扩展到 10 个 manifest，覆盖 read-only I2C/UART/Modbus/SPI/ADC/GPIO input 与 control GPIO/relay/PWM/LEDC。离线验证结果：manifest dry-run 10/10，benchmark validate-only 40/40，`idf.py build` PASS，`ESPAgent.bin=0x16f020`，app 分区剩余约 28%。
@@ -1150,7 +1177,6 @@ OTA 状态：
 - 2026-06-21 实机部署验证：按 USB0-3 顺序烧录四个 ESP32-S3，USB0=`coordinator_agent`，USB1=`sensor_agent`，USB2=`control_agent`，USB3=`guardian_agent`；`tools/verify_roles_usb0_3.py --echo` 四角色身份检查 PASS。USB0 执行 `tools/test_lua_usb0.py --echo`，在 SNTP 同步后 Lua runtime 完整 smoke 7/7 PASS，覆盖 runtime info、module list、script list、同步脚本、inline source、async job、job list。`tools/test_lua_roles_usb0_3.py` 对四个角色执行 `lua_runtime_info` 与 `lua_run_source`，结果 8/8 PASS，证明 Lua runtime 不只部署在 coordinator。
 - 2026-06-21 esp-claw 优势吸收策略：后续值得迁移的是工程化能力，而不是替换 ESPAgent 架构。优先级包括：Board Descriptor/Board Profile，用结构化方式记录每块 S3/P4 的 pins、sensors、actuators、safe ranges、dangerous actions 和 validation status；Lua package/layout，把 `/spiffs/scripts/builtin/`、`/spiffs/scripts/user/`、`/spiffs/skills/<skill>/scripts/` 区分为内置可信、用户上传和 skill 绑定脚本；Lua module/docs/skill 生成思想，形成“Lua script + manifest primitive + capability schema + skill 文档 + benchmark case”的开发者工具链；Capability lifecycle，为每个 capability 增加 init/start/health_check/stop/benchmark 状态；P4/Android Script Console，用于显示 Lua job、capability list、Guardian decision、benchmark 和 trace。禁止方向：不允许 Lua 裸控 GPIO/I2C/ADC/PWM/RMT/BLE/display/camera/audio 绕过 tool_registry/capability_registry；不允许脚本跳过 sandbox、Guardian、Mesh policy 或 Control interlock；不把 ESPAgent 做成 esp-claw 复制版，项目特色仍是多 ESP32 Agent Mesh、Guardian 权限治理、OutputMessage/ReAct 闭环和可视化推理链路。
 - 2026-06-21 多节点必要性增强第一轮已落地并完成四板实机回归：Sensor 不再只是“读一下传感器”，MQTT telemetry 增加最近采样 ring cache 与 EWMA 滤波输出 `temp_avg`、`humidity_avg`、`light_lux_avg`、`sample_count`，并基于默认阈值 `temperature>35.0C`、`humidity<35%`、`humidity>70%`、`light<10lux` 在状态变化时发布 `espagent.sensor_event.v1` 到 node events、全局 alerts 和 timeline；Control 在远程 actuator 命令执行后发布 `espagent.control_state.v1`，包含 busy、emergency_stop、interlock 和最近动作状态，便于 Android/P4 展示执行器状态；Guardian 的 `policy_decision` 增加 `risk_score` 与 `privacy_mode=metadata_only`，同时订阅 `espagent.../nodes/+/state` 和 `espagent.../nodes/+/telemetry` 聚合 `watchdog_node_state` / `watchdog_node_telemetry` 到 StateBoard。针对实机压测中暴露的 policy 回流拥塞，已补 Guardian watchdog StateBoard 节流、MQTT critical 队列调整和 Coordinator `policy_check` 幂等重试。最新 app 约 `0x191d40`，2MB app 分区剩余约 22%；四角色身份检查 PASS，连续两轮 5 轮 Mesh 压测 PASS。
-- 2026-06-21 参考 Ai-Thinker BLE Mesh Gateway 的强项完成 ESPAgent Gateway 软件侧第一版：新增 `main/device/device_registry.*` 持久化 MQTT Mesh 节点和外部设备；新增 `main/gateway/ble_mesh_bridge.*` 作为 BLE Mesh bridge boundary；新增 `main/tools/tool_gateway.*` 并注册 `gateway_status`、`gateway_register_ble_mesh_device`、`gateway_ble_mesh_send`、`ota_gateway_plan`；`wifi_onboard` 增加 `/status`、`/devices`、`/gateway/ble_mesh/register`、`/ota/plan` API，`onboard_html` 增加 Gateway/BLE/OTA 管理区。该轮 `idf.py build` PASS，`ESPAgent.bin=0x195920`，app 分区剩余 `0x6a6e0`，约 21%。当前 BLE Mesh 只完成设备登记和命令意图发布，未链接真实 BLE Provisioner 后端；OTA Gateway 只生成计划并发 timeline，未开放远程刷机执行。
 - Feishu 通信板时间同步已补齐：Wi-Fi 连接后启动 SNTP 校时，`get_current_time` 不再优先依赖 Google Date 头；天气工具仍使用高德 `get_weather`，默认南京市栖霞区。
 - 本地私有配置当前已设置为 Feishu/LLM 入口板：`esp32s3-coordinator-01` / `coordinator_agent` / `coordinator,communication,llm,dispatch,timeline,alerts`。
 - 已烧录 coordinator 固件到 `/dev/ttyUSB0`，目标 ESP32-S3 MAC 为 `14:c1:9f:2d:76:20`；串口日志确认 Feishu、LLM、agent_loop 和 coordinator role 均启动，本地 sensor monitor 与 boot servo demo 已按角色跳过。
@@ -1235,7 +1261,7 @@ OTA 状态：
 
 ### P1
 
-- 完善 role/capability/profile 的运行时管理：把角色身份迁移到 NVS，支持统一 OTA 镜像，并让 capability、Lua package 和 manifest 权限共享同一 profile。
+- 完善 role/capability/profile 的运行时管理：把角色身份迁移到 NVS，支持统一固件镜像，并让 capability、Lua package 和 manifest 权限共享同一 profile。
 - Coordinator Agent 最小实现：只做任务路由和只读查询，不直接绕过安全层。
 - 继续用四块 S3 的实时 MQTT 流量验证 ESP32-P4+C6 Display Terminal，确认屏幕能展示四个 S3 角色的 MQTT 状态、推理过程、数据通信过程和最终结果。
 - MQTT TLS/认证或内网/VPN 部署规范。
@@ -1244,7 +1270,7 @@ OTA 状态：
 
 ### P2
 
-- MCP Gateway：数据库、知识库、Home Assistant、云服务。
+- Host-side MCP bridge：数据库、知识库、Home Assistant、云服务等外部能力只在上位机/服务器侧桥接，当前不进入 MCU 固件展示链路。
 - Memory Agent：长期记忆压缩、用户偏好、skills 管理。
 - MCU edge AI：评估 TinyML / LiteRT Micro / ESP-DL / ESP-SR 类小模型路径，只在模型文件、驱动、工具 schema 和资源预算明确后再声明为已实现能力。
 - Android App：移动查看、调试、控制、调度时间线展示。

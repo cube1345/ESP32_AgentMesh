@@ -54,7 +54,8 @@ static const char *legacy_family_for_tool(const char *name)
     if (strstr(name, "file") || streq(name, "list_dir")) {
         return "file";
     }
-    if (starts_with(name, "read_") || strstr(name, "_read_") ||
+    if (starts_with(name, "read_") || starts_with(name, "env_history_") ||
+        strstr(name, "_read_") ||
         streq(name, "gpio_read") || streq(name, "gpio_read_all") ||
         streq(name, "virtual_device_read") || streq(name, "hc_sr05_read_distance")) {
         return "sensor";

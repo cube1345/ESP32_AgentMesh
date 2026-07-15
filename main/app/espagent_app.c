@@ -44,6 +44,7 @@
 #include "roles/guardian_node.h"
 #include "roles/role_config.h"
 #include "roles/sensor_node.h"
+#include "sensors/sensor_history.h"
 #include "sensors/sensor_mqtt.h"
 #include "skills/skill_loader.h"
 #include "time_sync/time_sync.h"
@@ -226,6 +227,10 @@ static void environment_monitor_task(void *arg)
             if (send_err != ESP_OK) {
                 ESP_LOGW(TAG, "Environment ESP-NOW send failed: %s", esp_err_to_name(send_err));
             }
+            esp_err_t hist_err = sensor_history_maybe_append(&values, status);
+            if (hist_err != ESP_OK && hist_err != ESP_ERR_NOT_FINISHED) {
+                ESP_LOGW(TAG, "Environment history append skipped: %s", esp_err_to_name(hist_err));
+            }
         } else {
             char payload[256] = {0};
             snprintf(payload, sizeof(payload),
@@ -351,6 +356,7 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(memory_v2_init(), TAG, "memory_v2_init failed");
     ESP_RETURN_ON_ERROR(cache_store_init(), TAG, "cache_store_init failed");
     ESP_RETURN_ON_ERROR(skill_loader_init(), TAG, "skill_loader_init failed");
+    ESP_RETURN_ON_ERROR(sensor_history_init(), TAG, "sensor_history_init failed");
     ESP_RETURN_ON_ERROR(dynamic_extension_init(), TAG, "dynamic_extension_init failed");
     ESP_RETURN_ON_ERROR(espagent_device_registry_init(), TAG, "device_registry_init failed");
     ESP_RETURN_ON_ERROR(session_mgr_init(), TAG, "session_mgr_init failed");

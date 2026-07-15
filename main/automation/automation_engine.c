@@ -516,6 +516,22 @@ static esp_err_t load_rules_locked(void)
     return ESP_OK;
 }
 
+static esp_err_t remove_rule_slot_locked(int slot, const char *reason)
+{
+    if (slot < 0 || slot >= AUTOMATION_MAX_RULES || !s_rules[slot].used) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    char id[sizeof(s_rules[slot].id)] = {0};
+    snprintf(id, sizeof(id), "%s", s_rules[slot].id);
+    memset(&s_rules[slot], 0, sizeof(s_rules[slot]));
+    esp_err_t err = persist_rules_locked();
+    ESP_LOGI(TAG, "Auto-removed automation rule %s after %s: %s",
+             id,
+             reason && reason[0] ? reason : "completion",
+             esp_err_to_name(err));
+    return err;
+}
+
 static void publish_rule_event(const automation_rule_t *rule,
                               const char *phase,
                               const char *status,
@@ -714,9 +730,21 @@ static void rule_task(void *arg)
                                action_output[0] ? action_output : "automation rule action executed");
             lock();
             if (s_rules[i].used && strcmp(s_rules[i].id, snapshot.id) == 0) {
-                s_rules[i].last_action_ms = now_ms;
-                s_rules[i].last_branch = current_branch;
+                esp_err_t remove_err = remove_rule_slot_locked(i, "first branch action");
+                if (remove_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to persist auto-remove for rule %s: %s",
+                             snapshot.id,
+                             esp_err_to_name(remove_err));
+                }
             }
+            unlock();
+            publish_rule_event(&snapshot,
+                               "cleanup",
+                               "ok",
+                               action_err == ESP_OK
+                                   ? "automation rule completed and auto-removed"
+                                   : "automation rule action failed and auto-removed");
+            lock();
         }
         unlock();
     }

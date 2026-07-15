@@ -237,10 +237,19 @@ static bool is_sensor_action(const char *action)
             strcmp(action, "virtual_device_read") == 0);
 }
 
+static bool is_guardian_action(const char *action)
+{
+    return action &&
+           (strcmp(action, "guardian_approval_list") == 0 ||
+            strcmp(action, "guardian_approval_confirm") == 0 ||
+            strcmp(action, "guardian_approval_deny") == 0);
+}
+
 static bool is_allowed_mesh_action(const char *action)
 {
     return is_sensor_action(action) ||
            is_control_action(action) ||
+           is_guardian_action(action) ||
            (action && strcmp(action, "agent_task") == 0);
 }
 
@@ -295,6 +304,8 @@ static esp_err_t request_policy_decision(const char *command_id,
                                          const char *args_json,
                                          int safety_level,
                                          int ttl_ms,
+                                         const char *reply_channel,
+                                         const char *reply_chat_id,
                                          char *decision_json,
                                          size_t decision_json_size,
                                          char *reason,
@@ -315,6 +326,12 @@ static esp_err_t request_policy_decision(const char *command_id,
     cJSON_AddStringToObject(policy, "target_node", target_node ? target_node : "");
     cJSON_AddStringToObject(policy, "action", action);
     cJSON_AddStringToObject(policy, "args_json", args_json ? args_json : "{}");
+    if (reply_channel && reply_channel[0]) {
+        cJSON_AddStringToObject(policy, "reply_channel", reply_channel);
+    }
+    if (reply_chat_id && reply_chat_id[0]) {
+        cJSON_AddStringToObject(policy, "reply_chat_id", reply_chat_id);
+    }
     cJSON_AddNumberToObject(policy, "safety_level", safety_level);
     cJSON_AddNumberToObject(policy, "ttl_ms", ttl_ms);
     cJSON_AddNumberToObject(policy, "ts_ms", (double)ts_ms);
@@ -567,6 +584,9 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     } else if ((!target_node || !target_node[0]) && (!target_role || !target_role[0]) &&
                is_control_action(action)) {
         target_role = "control_agent";
+    } else if ((!target_node || !target_node[0]) && (!target_role || !target_role[0]) &&
+               is_guardian_action(action)) {
+        target_role = "guardian_agent";
     }
     if ((!target_node || !target_node[0]) && (!target_role || !target_role[0])) {
         cJSON_Delete(root);
@@ -587,6 +607,13 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
             cJSON_Delete(root);
             snprintf(output, output_size,
                      "Error: action=%s must target control_agent, got %s",
+                     action, target_role);
+            return ESP_ERR_INVALID_ARG;
+        }
+        if (is_guardian_action(action) && strcmp(target_role, "guardian_agent") != 0) {
+            cJSON_Delete(root);
+            snprintf(output, output_size,
+                     "Error: action=%s must target guardian_agent, got %s",
                      action, target_role);
             return ESP_ERR_INVALID_ARG;
         }
@@ -729,32 +756,40 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
 
     char policy_json[MESH_POLICY_JSON_SIZE] = {0};
     char policy_reason[160] = {0};
-    esp_err_t policy_err = request_policy_decision(command_id_copy,
-                                                   trace_id_copy,
-                                                   target_role_copy,
-                                                   target_node_copy,
-                                                   action_copy,
-                                                   sign_cmd.args_json,
-                                                   safety_level,
-                                                   ttl_ms,
-                                                   policy_json,
-                                                   sizeof(policy_json),
-                                                   policy_reason,
-                                                   sizeof(policy_reason));
-    if (policy_err != ESP_OK) {
-        snprintf(output, output_size,
-                 "Error: Guardian policy blocked mesh command action=%s command_id=%s reason=%s decision=%s",
-                 action_copy, command_id_copy, policy_reason, policy_json[0] ? policy_json : "(none)");
-        (void)sensor_mqtt_publish_timeline_event("policy",
-                                                 "policy_check",
-                                                 "blocked",
-                                                 output,
-                                                 command_id_copy,
-                                                 target_role_copy,
-                                                 target_node_copy,
-                                                 action_copy);
-        cJSON_free(payload);
-        return policy_err;
+    if (strcmp(action_copy, "control_emergency_stop") == 0) {
+        snprintf(policy_reason,
+                 sizeof(policy_reason),
+                 "emergency stop bypassed Guardian wait");
+    } else {
+        esp_err_t policy_err = request_policy_decision(command_id_copy,
+                                                       trace_id_copy,
+                                                       target_role_copy,
+                                                       target_node_copy,
+                                                       action_copy,
+                                                       sign_cmd.args_json,
+                                                       safety_level,
+                                                       ttl_ms,
+                                                       reply_channel_copy,
+                                                       reply_chat_id_copy,
+                                                       policy_json,
+                                                       sizeof(policy_json),
+                                                       policy_reason,
+                                                       sizeof(policy_reason));
+        if (policy_err != ESP_OK) {
+            snprintf(output, output_size,
+                     "Error: Guardian policy blocked mesh command action=%s command_id=%s reason=%s decision=%s",
+                     action_copy, command_id_copy, policy_reason, policy_json[0] ? policy_json : "(none)");
+            (void)sensor_mqtt_publish_timeline_event("policy",
+                                                     "policy_check",
+                                                     "blocked",
+                                                     output,
+                                                     command_id_copy,
+                                                     target_role_copy,
+                                                     target_node_copy,
+                                                     action_copy);
+            cJSON_free(payload);
+            return policy_err;
+        }
     }
 
     (void)sensor_mqtt_publish_timeline_event("policy",

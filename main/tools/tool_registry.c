@@ -15,6 +15,7 @@
 #include "tools/tool_environment.h"
 #include "tools/tool_hc_sr05.h"
 #include "tools/tool_servo.h"
+#include "tools/tool_sensor_history.h"
 #include "tools/tool_gree_ac.h"
 #include "tools/tool_max98357.h"
 #include "tools/tool_sgp30.h"
@@ -660,7 +661,7 @@ esp_err_t tool_registry_init(void)
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\",\"guardian_approval_list\",\"guardian_approval_confirm\",\"guardian_approval_deny\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop; guardian_approval_* actions resolve Guardian approval requests on the guardian_agent.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -723,7 +724,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "automation_create_rule",
-        .description = "Create a persistent condition-action automation rule. Use this when the user asks for ongoing monitoring or conditional linkage such as 'if temperature is above 35 set the light red, otherwise blue'. The runtime periodically reads sensor_agent telemetry and triggers control_agent actions with cooldown and hysteresis.",
+        .description = "Create a one-shot condition-action automation rule. Use this when the user asks for conditional linkage such as 'if temperature is above 35 set the light red, otherwise blue'. The runtime periodically reads sensor_agent telemetry, triggers one control_agent branch through MQTT Mesh and Guardian policy, then auto-removes the rule.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short rule name\"},"
@@ -732,7 +733,7 @@ esp_err_t tool_registry_init(void)
             "\"interval_s\":{\"type\":\"integer\",\"description\":\"Polling interval in seconds, defaults to 10\"},"
             "\"cooldown_s\":{\"type\":\"integer\",\"description\":\"Minimum seconds between triggered actions, defaults to 30\"},"
             "\"hysteresis_c\":{\"type\":\"number\",\"description\":\"Deadband around threshold to prevent flapping; also used for humidity units\"},"
-            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this persistent automation rule\"},"
+            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this background condition rule\"},"
             "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
             "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
             "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
@@ -744,7 +745,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "automation_list",
-        .description = "List active workflows and persistent automation rules.",
+        .description = "List active workflows and pending condition rules.",
         .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
         .execute = tool_automation_list_execute,
     });
@@ -786,6 +787,26 @@ esp_err_t tool_registry_init(void)
             "\"gy30_addr\":{\"type\":\"integer\",\"description\":\"Optional GY-30/BH1750 address, 0x23 by default or 0x5C when ADDR is high\"}},"
             "\"required\":[]}",
         .execute = tool_read_environment_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "env_history_summary",
+        .description = "Summarize Sensor local environment history stored as compact JSONL under /spiffs/env. Prefer this for trend, long-running, or historical environment analysis instead of reading raw files.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"hours\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":336,\"description\":\"Lookback window in hours, capped by firmware retention\"}},"
+            "\"required\":[]}",
+        .execute = tool_env_history_summary_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "env_history_recent",
+        .description = "Return compact recent Sensor environment samples from local /spiffs/env JSONL history. Use this when a few raw samples are needed for inspection or validation.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{\"limit\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":48,\"description\":\"Maximum recent samples to return\"}},"
+            "\"required\":[]}",
+        .execute = tool_env_history_recent_execute,
     });
 
     register_tool(&(espagent_tool_t){

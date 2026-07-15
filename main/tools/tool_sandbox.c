@@ -61,6 +61,8 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"read_temperature_humidity", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR | TOOL_CAP_MESH},
     {"virtual_device_read", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR | TOOL_CAP_MESH},
     {"read_environment", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
+    {"env_history_summary", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
+    {"env_history_recent", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
     {"read_air_quality", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
     {"sgp30_read_air_quality", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
     {"read_light_level", ESPAGENT_TOOL_RISK_READ_ONLY, TOOL_CAP_SENSOR},
@@ -251,8 +253,8 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         return false;
     }
     int safety_level = json_int_value(root, "safety_level", 1);
-    if (safety_level > 1) {
-        deny(reason, reason_size, "sandbox denied mesh_send_command: high-risk safety_level requires an explicit confirmation flow");
+    if (safety_level < 0 || safety_level > 2) {
+        deny(reason, reason_size, "sandbox denied mesh_send_command: safety_level must be 0..2");
         return false;
     }
     const char *action = json_string_value(root, "action");
@@ -272,7 +274,10 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "control_clear_emergency_stop") != 0 &&
         strcmp(action, "read_temperature_humidity") != 0 &&
         strcmp(action, "virtual_device_read") != 0 &&
-        strcmp(action, "agent_task") != 0) {
+        strcmp(action, "agent_task") != 0 &&
+        strcmp(action, "guardian_approval_list") != 0 &&
+        strcmp(action, "guardian_approval_confirm") != 0 &&
+        strcmp(action, "guardian_approval_deny") != 0) {
         deny(reason, reason_size, "sandbox denied mesh_send_command: unsupported action=%s", action);
         return false;
     }

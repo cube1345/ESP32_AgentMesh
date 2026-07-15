@@ -37,6 +37,8 @@ static bool is_sensor_tool(const espagent_capability_descriptor_t *cap)
     return is_family(cap, "sensor") ||
            is_name(cap, "read_temperature_humidity") ||
            is_name(cap, "read_environment") ||
+           is_name(cap, "env_history_summary") ||
+           is_name(cap, "env_history_recent") ||
            is_name(cap, "read_air_quality") ||
            is_name(cap, "sgp30_read_air_quality") ||
            is_name(cap, "read_light_level") ||

@@ -34,6 +34,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -147,6 +148,7 @@ static void stateboard_note_event(const char *event_type,
                                   const char *summary,
                                   const char *command_id);
 static bool mqtt_coordinator_background_housekeeping_allowed(const char *reason);
+static void maybe_forward_guardian_notice_payload(const char *payload, size_t payload_len);
 
 static size_t sensor_mqtt_pub_queue_depth_for_role(void)
 {
@@ -705,6 +707,159 @@ static double json_optional_number(cJSON *root, const char *key, double default_
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
     return cJSON_IsNumber(item) ? item->valuedouble : default_value;
+}
+
+static bool user_notice_channel_allowed(const char *channel)
+{
+    return channel &&
+           (strcmp(channel, ESPAGENT_CHAN_FEISHU) == 0 ||
+            strcmp(channel, ESPAGENT_CHAN_WEBSOCKET) == 0);
+}
+
+static const char *output_result_text(cJSON *root)
+{
+    cJSON *result = cJSON_GetObjectItem(root, "result");
+    if (!result || !cJSON_IsObject(result)) {
+        return "";
+    }
+    return json_optional_string(result, "text");
+}
+
+static void maybe_forward_guardian_notice_payload(const char *payload, size_t payload_len)
+{
+    if (!espagent_role_runs_chat_channels() || !payload || payload_len == 0) {
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(payload, payload_len);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *event = json_optional_string(root, "event");
+    if (!json_field_equals(root, "schema", "espagent.output.v1") ||
+        strcmp(event, "guardian_notice") != 0) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    const char *reply_channel = json_optional_string(root, "reply_channel");
+    const char *reply_chat_id = json_optional_string(root, "reply_chat_id");
+    const char *text = output_result_text(root);
+    if (!user_notice_channel_allowed(reply_channel) || !reply_chat_id[0] || !text[0]) {
+        cJSON_Delete(root);
+        return;
+    }
+
+    espagent_msg_t out = {0};
+    snprintf(out.channel, sizeof(out.channel), "%s", reply_channel);
+    snprintf(out.chat_id, sizeof(out.chat_id), "%s", reply_chat_id);
+    out.content = strdup(text);
+    cJSON_Delete(root);
+    if (!out.content) {
+        return;
+    }
+    if (message_bus_push_outbound(&out) != ESP_OK) {
+        free(out.content);
+    }
+}
+
+static void guardian_publish_policy_notice(const char *reply_channel,
+                                           const char *reply_chat_id,
+                                           const char *command_id,
+                                           const char *trace_id,
+                                           const char *action,
+                                           const char *target_role,
+                                           const char *decision,
+                                           const char *reason,
+                                           const char *approval_id,
+                                           int risk_score)
+{
+    if (!espagent_role_is_guardian() ||
+        !user_notice_channel_allowed(reply_channel) ||
+        !reply_chat_id || !reply_chat_id[0] ||
+        !decision || strcmp(decision, "allow") == 0) {
+        return;
+    }
+
+    char text[360] = {0};
+    if (approval_id && approval_id[0]) {
+        snprintf(text, sizeof(text),
+                 "Guardian 请求确认硬件动作。\n"
+                 "动作：%s -> %s\n"
+                 "风险：%d/100\n"
+                 "原因：%s\n"
+                 "回复 /approve %s 批准，或 /deny %s 取消。",
+                 action && action[0] ? action : "(unknown)",
+                 target_role && target_role[0] ? target_role : "(unknown)",
+                 risk_score,
+                 reason && reason[0] ? reason : "requires confirmation",
+                 approval_id,
+                 approval_id);
+    } else {
+        snprintf(text, sizeof(text),
+                 "Guardian 已拦截风险动作。\n"
+                 "动作：%s -> %s\n"
+                 "风险：%d/100\n"
+                 "原因：%s\n"
+                 "请改用安全工具或降低风险后重试。",
+                 action && action[0] ? action : "(unknown)",
+                 target_role && target_role[0] ? target_role : "(unknown)",
+                 risk_score,
+                 reason && reason[0] ? reason : "blocked by Guardian policy");
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *result = cJSON_CreateObject();
+    if (!root || !result) {
+        cJSON_Delete(root);
+        cJSON_Delete(result);
+        return;
+    }
+
+    int64_t ts_ms = esp_timer_get_time() / 1000;
+    char msg_id[96] = {0};
+    snprintf(msg_id, sizeof(msg_id), "guardian-notice-%s-%lld",
+             command_id && command_id[0] ? command_id : espagent_node_id(),
+             (long long)ts_ms);
+
+    cJSON_AddStringToObject(root, "schema", "espagent.output.v1");
+    cJSON_AddStringToObject(root, "msg_id", msg_id);
+    cJSON_AddStringToObject(root, "node_id", espagent_node_id());
+    cJSON_AddStringToObject(root, "role", espagent_node_role());
+    cJSON_AddStringToObject(root, "sender", espagent_node_role());
+    cJSON_AddStringToObject(root, "sender_node", espagent_node_id());
+    cJSON_AddStringToObject(root, "recipient", reply_channel);
+    cJSON_AddStringToObject(root, "reply_channel", reply_channel);
+    cJSON_AddStringToObject(root, "reply_chat_id", reply_chat_id);
+    cJSON_AddStringToObject(root, "type", "output");
+    cJSON_AddStringToObject(root, "event", "guardian_notice");
+    json_add_optional_string(root, "command_id", command_id);
+    json_add_optional_string(root, "trace_id", trace_id);
+    json_add_optional_string(root, "action", action);
+    json_add_optional_string(root, "approval_id", approval_id);
+    cJSON_AddStringToObject(root, "decision", decision);
+    cJSON_AddStringToObject(root, "status", "ok");
+    cJSON_AddStringToObject(root, "summary", approval_id && approval_id[0]
+                                      ? "Guardian approval required"
+                                      : "Guardian blocked command");
+    cJSON_AddNumberToObject(root, "risk_score", risk_score);
+    cJSON_AddStringToObject(root, "privacy_mode", "metadata_only");
+    cJSON_AddStringToObject(result, "text", text);
+    cJSON_AddItemToObject(root, "result", result);
+    cJSON_AddNullToObject(root, "error");
+    cJSON_AddNumberToObject(root, "ts_ms", (double)ts_ms);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return;
+    }
+
+    (void)sensor_mqtt_publish_text(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, json);
+    (void)sensor_mqtt_publish_text(ESPAGENT_MESH_TOPIC_TIMELINE, json);
+    cJSON_free(json);
 }
 
 static bool mqtt_topic_matches_filter(const uint8_t *topic, size_t topic_len, const char *filter)
@@ -1377,7 +1532,16 @@ static bool policy_is_control_action(const char *action)
             strcmp(action, "gpio_write") == 0 ||
             strcmp(action, "gree_ac_control") == 0 ||
             strcmp(action, "control_state") == 0 ||
-            strcmp(action, "control_emergency_stop") == 0);
+            strcmp(action, "control_emergency_stop") == 0 ||
+            strcmp(action, "control_clear_emergency_stop") == 0);
+}
+
+static bool policy_is_guardian_approval_action(const char *action)
+{
+    return action &&
+           (strcmp(action, "guardian_approval_list") == 0 ||
+            strcmp(action, "guardian_approval_confirm") == 0 ||
+            strcmp(action, "guardian_approval_deny") == 0);
 }
 
 static bool policy_is_agent_task_action(const char *action)
@@ -1491,6 +1655,8 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     const char *target_role = json_optional_string(root, "target_role");
     const char *target_node = json_optional_string(root, "target_node");
     const char *args_json = json_optional_string(root, "args_json");
+    const char *reply_channel = json_optional_string(root, "reply_channel");
+    const char *reply_chat_id = json_optional_string(root, "reply_chat_id");
     int safety_level = json_optional_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
 
     char command_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
@@ -1498,15 +1664,20 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     char action_copy[ESPAGENT_MESH_ACTION_MAX] = {0};
     char target_role_copy[ESPAGENT_MESH_ROLE_MAX] = {0};
     char target_node_copy[ESPAGENT_MESH_NODE_MAX] = {0};
+    char reply_channel_copy[16] = {0};
+    char reply_chat_id_copy[96] = {0};
     snprintf(command_id_copy, sizeof(command_id_copy), "%s", command_id);
     snprintf(trace_id_copy, sizeof(trace_id_copy), "%s", trace_id);
     snprintf(action_copy, sizeof(action_copy), "%s", action);
     snprintf(target_role_copy, sizeof(target_role_copy), "%s", target_role);
     snprintf(target_node_copy, sizeof(target_node_copy), "%s", target_node);
+    snprintf(reply_channel_copy, sizeof(reply_channel_copy), "%s", reply_channel);
+    snprintf(reply_chat_id_copy, sizeof(reply_chat_id_copy), "%s", reply_chat_id);
 
     const char *decision = "deny";
     const char *reason = "deny by default";
     char dynamic_reason[160] = {0};
+    char approval_id[32] = {0};
     bool allowed = false;
     int risk_score = safety_level * 20;
 
@@ -1547,6 +1718,16 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 reason = dynamic_reason;
                 risk_score += 30;
             }
+        }
+    } else if (policy_is_guardian_approval_action(action_copy)) {
+        risk_score += 5;
+        if (strcmp(target_role_copy, ESPAGENT_ROLE_GUARDIAN) == 0) {
+            decision = "allow";
+            reason = "allowed Guardian approval queue action";
+            allowed = true;
+        } else {
+            reason = "Guardian approval action must target guardian_agent";
+            risk_score += 30;
         }
     } else if (policy_is_control_action(action_copy)) {
         risk_score += 30;
@@ -1616,7 +1797,6 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 allowed = true;
             }
         } else {
-            char approval_id[32] = {0};
             if (guardian_approval_add(command_id_copy,
                                       trace_id_copy,
                                       action_copy,
@@ -1633,6 +1813,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                          prev_reason,
                          approval_id);
                 reason = dynamic_reason;
+                decision = "needs_confirmation";
             }
         }
     }
@@ -1662,6 +1843,9 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     cJSON_AddStringToObject(out, "decision", decision);
     cJSON_AddBoolToObject(out, "allowed", allowed);
     cJSON_AddStringToObject(out, "reason", reason);
+    json_add_optional_string(out, "approval_id", approval_id);
+    json_add_optional_string(out, "reply_channel", reply_channel_copy);
+    json_add_optional_string(out, "reply_chat_id", reply_chat_id_copy);
     cJSON_AddNumberToObject(out, "safety_level", safety_level);
     cJSON_AddNumberToObject(out, "risk_score", risk_score);
     cJSON_AddStringToObject(out, "privacy_mode", "metadata_only");
@@ -1684,6 +1868,18 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                                              target_role_copy,
                                              target_node_copy,
                                              action_copy);
+    if (!allowed) {
+        guardian_publish_policy_notice(reply_channel_copy,
+                                       reply_chat_id_copy,
+                                       command_id_copy,
+                                       trace_id_copy,
+                                       action_copy,
+                                       target_role_copy,
+                                       decision,
+                                       reason,
+                                       approval_id,
+                                       risk_score);
+    }
     ESP_LOGI(TAG, "Guardian policy decision: %s", json);
     cJSON_free(json);
 }
@@ -1712,6 +1908,40 @@ static void publish_mesh_command_result(const espagent_mesh_command_t *cmd,
                                              cmd->target_role,
                                              cmd->target_node,
                                              cmd->action);
+}
+
+static bool handle_guardian_approval_mesh_command(const espagent_mesh_command_t *cmd)
+{
+    if (!espagent_role_is_guardian() || !cmd) {
+        return false;
+    }
+    if (strcmp(cmd->action, "guardian_approval_list") != 0 &&
+        strcmp(cmd->action, "guardian_approval_confirm") != 0 &&
+        strcmp(cmd->action, "guardian_approval_deny") != 0) {
+        return false;
+    }
+
+    char result[768] = {0};
+    esp_err_t err = ESP_OK;
+    if (strcmp(cmd->action, "guardian_approval_list") == 0) {
+        err = guardian_approval_list_json(result, sizeof(result));
+    } else {
+        cJSON *args = cJSON_Parse(cmd->args_json[0] ? cmd->args_json : "{}");
+        const char *approval_id = args && cJSON_IsObject(args)
+                                      ? json_optional_string(args, "approval_id")
+                                      : "";
+        if (!approval_id[0]) {
+            snprintf(result, sizeof(result), "Error: approval_id is required");
+            err = ESP_ERR_INVALID_ARG;
+        } else {
+            bool approve = strcmp(cmd->action, "guardian_approval_confirm") == 0;
+            err = guardian_approval_resolve(approval_id, approve, result, sizeof(result));
+        }
+        cJSON_Delete(args);
+    }
+
+    publish_mesh_command_result(cmd, err, result);
+    return true;
 }
 
 static bool handle_agent_task_mesh_command(const espagent_mesh_command_t *cmd)
@@ -1885,6 +2115,11 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
         return false;
     }
 
+    if (strcmp(cmd->action, "control_emergency_stop") == 0) {
+        snprintf(reason, reason_size, "emergency stop bypasses Guardian wait");
+        return true;
+    }
+
     char decision_json[MQTT_POLICY_JSON_SIZE] = {0};
     esp_err_t err = sensor_mqtt_wait_policy_decision(cmd->command_id,
                                                      decision_json,
@@ -1937,6 +2172,51 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
     return allowed;
 }
 
+static void append_safe_output_status(char *summary,
+                                      size_t summary_size,
+                                      const char *label,
+                                      esp_err_t err)
+{
+    if (!summary || summary_size == 0 || !label) {
+        return;
+    }
+
+    size_t off = strnlen(summary, summary_size);
+    if (off >= summary_size - 1) {
+        return;
+    }
+
+    snprintf(summary + off,
+             summary_size - off,
+             "%s%s=%s",
+             off > 0 ? "," : "",
+             label,
+             err == ESP_OK ? "off" : "err");
+}
+
+static void force_control_safe_outputs(char *summary, size_t summary_size)
+{
+    if (summary && summary_size > 0) {
+        summary[0] = '\0';
+    }
+
+    char tmp[160] = {0};
+    esp_err_t err = tool_set_fan_execute("{\"state\":0}", tmp, sizeof(tmp));
+    append_safe_output_status(summary, summary_size, "fan", err);
+
+    tmp[0] = '\0';
+    err = tool_set_humidifier_execute("{\"state\":0}", tmp, sizeof(tmp));
+    append_safe_output_status(summary, summary_size, "humidifier", err);
+
+    tmp[0] = '\0';
+    err = tool_set_device_led_execute("{\"state\":0}", tmp, sizeof(tmp));
+    append_safe_output_status(summary, summary_size, "device_led", err);
+
+    tmp[0] = '\0';
+    err = tool_set_status_light_execute("{\"color\":\"off\"}", tmp, sizeof(tmp));
+    append_safe_output_status(summary, summary_size, "status_light", err);
+}
+
 static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd,
                                               void *ctx,
                                               char *result,
@@ -1957,6 +2237,17 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = control_command_queue_state_json(result, result_size);
     } else if (strcmp(cmd->action, "control_emergency_stop") == 0) {
         err = control_command_queue_emergency_stop(result, result_size);
+        if (err == ESP_OK) {
+            char safe_summary[128] = {0};
+            force_control_safe_outputs(safe_summary, sizeof(safe_summary));
+            size_t off = strnlen(result, result_size);
+            if (off < result_size - 1) {
+                snprintf(result + off,
+                         result_size - off,
+                         "; safe_off=%s",
+                         safe_summary[0] ? safe_summary : "none");
+            }
+        }
     } else if (strcmp(cmd->action, "control_clear_emergency_stop") == 0) {
         err = control_command_queue_clear_emergency_stop(result, result_size);
     } else if (strcmp(cmd->action, "set_status_light") == 0) {
@@ -2092,6 +2383,9 @@ static void handle_mesh_command(const char *source, const char *payload, size_t 
         return;
     }
 
+    if (handle_guardian_approval_mesh_command(&cmd)) {
+        return;
+    }
     if (handle_agent_task_mesh_command(&cmd)) {
         return;
     }
@@ -2191,6 +2485,7 @@ static void mqtt_poll_inbound(int fd)
                 ESP_LOGI(TAG, "Mesh alert received: %.*s", (int)msg_len, msg);
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_TIMELINE)) {
                 output_cache_maybe_store_payload(msg, msg_len);
+                maybe_forward_guardian_notice_payload(msg, msg_len);
                 guardian_audit_timeline_payload(msg, msg_len);
                 ESP_LOGI(TAG, "Mesh timeline received: %.*s", (int)msg_len, msg);
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_POLICY_CHECK)) {

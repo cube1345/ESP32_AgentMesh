@@ -15,9 +15,20 @@ static bool is_action_command(const char *command)
     return command &&
            (strcmp(command, "clear") == 0 ||
             strcmp(command, "clear_all_memory") == 0 ||
+            strcmp(command, "compact") == 0 ||
             strcmp(command, "context_status") == 0 ||
+            strcmp(command, "doctor") == 0 ||
+            strcmp(command, "init") == 0 ||
+            strcmp(command, "mcp") == 0 ||
             strcmp(command, "skills_list") == 0 ||
-            strcmp(command, "skills_show") == 0);
+            strcmp(command, "skills_show") == 0 ||
+            strcmp(command, "estop") == 0 ||
+            strcmp(command, "stop") == 0 ||
+            strcmp(command, "control_state") == 0 ||
+            strcmp(command, "resume_control") == 0 ||
+            strcmp(command, "resume") == 0 ||
+            strcmp(command, "approve") == 0 ||
+            strcmp(command, "deny") == 0);
 }
 
 static const slash_command_spec_t s_commands[] = {
@@ -32,8 +43,28 @@ static const slash_command_spec_t s_commands[] = {
         .template_text = NULL,
     },
     {
+        .name = "compact",
+        .usage = "/compact",
+        .template_text = NULL,
+    },
+    {
         .name = "context_status",
         .usage = "/context_status",
+        .template_text = NULL,
+    },
+    {
+        .name = "doctor",
+        .usage = "/doctor",
+        .template_text = NULL,
+    },
+    {
+        .name = "init",
+        .usage = "/init",
+        .template_text = NULL,
+    },
+    {
+        .name = "mcp",
+        .usage = "/mcp",
         .template_text = NULL,
     },
     {
@@ -44,6 +75,31 @@ static const slash_command_spec_t s_commands[] = {
     {
         .name = "skills_show",
         .usage = "/skills_show <skill_name>",
+        .template_text = NULL,
+    },
+    {
+        .name = "approve",
+        .usage = "/approve <approval_id>",
+        .template_text = NULL,
+    },
+    {
+        .name = "deny",
+        .usage = "/deny <approval_id>",
+        .template_text = NULL,
+    },
+    {
+        .name = "estop",
+        .usage = "/estop",
+        .template_text = NULL,
+    },
+    {
+        .name = "control_state",
+        .usage = "/control_state",
+        .template_text = NULL,
+    },
+    {
+        .name = "resume_control",
+        .usage = "/resume_control",
         .template_text = NULL,
     },
     {
@@ -84,7 +140,8 @@ static const slash_command_spec_t s_commands[] = {
         .usage = "/workflow <自然语言任务>",
         .template_text =
             "这是一个显式的 /workflow 指令。请优先把下面的请求实现为 deterministic 多步 workflow，"
-            "而不是只执行最后一步。优先考虑 automation_create_workflow。用户原始请求：%s",
+            "而不是只执行最后一步。Workflow step 应使用结构化 step 列表，每一步都可以调用 automation 白名单内的任意工具/动作，"
+            "并显式写出 action、args 和 delay_s；不要把能力限制为状态灯或单一设备。优先考虑 automation_create_workflow。用户原始请求：%s",
     },
     {
         .name = "rule",
@@ -120,20 +177,13 @@ static const slash_command_spec_t s_commands[] = {
     },
     {
         .name = "stop",
-        .usage = "/stop <自然语言任务>",
-        .template_text =
-            "这是一个显式的 /stop 指令。请把下面请求优先理解为停止、刹停、取消或进入安全状态。"
-            "若是停止第三角色的硬件动作或进入执行器锁定，优先调用 mesh_send_command 到 control_agent，"
-            "action=control_emergency_stop。若是停止 Lua 任务，优先使用 lua_stop_job。"
-            "若是停止 workflow/rule，优先使用 automation_list/automation_remove。用户原始请求：%s",
+        .usage = "/stop",
+        .template_text = NULL,
     },
     {
         .name = "resume",
-        .usage = "/resume <自然语言任务>",
-        .template_text =
-            "这是一个显式的 /resume 指令。请把下面请求优先理解为恢复、解锁或解除刹停。"
-            "若是恢复第三角色的硬件执行权限，优先调用 mesh_send_command 到 control_agent，"
-            "action=control_clear_emergency_stop。用户原始请求：%s",
+        .usage = "/resume",
+        .template_text = NULL,
     },
     {
         .name = "device",
@@ -195,23 +245,9 @@ static void build_help_text(espagent_slash_result_t *result)
 
     size_t off = 0;
     off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "Slash commands:\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/help - show slash command help\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/clear - clear current chat_id session/history/brief/trace\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/clear_all_memory - clear session + MEMORY/profile/skills/trace\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/context_status - show current chat_id history/brief/trace usage\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/skills_list - show all loaded skills\n");
-    off += snprintf(result->text + off, sizeof(result->text) - off,
-                    "/skills_show <skill_name> - show one skill content\n");
-    for (size_t i = 0; i < sizeof(s_commands) / sizeof(s_commands[0]) && off < sizeof(result->text); i++) {
-        off += snprintf(result->text + off, sizeof(result->text) - off,
-                        "%s - %s\n", s_commands[i].usage, s_commands[i].name);
-    }
+                    "Slash commands:\n"
+                    "Direct: /help /init /doctor /mcp /compact /clear /clear_all_memory /context_status /skills_list /skills_show <skill_name> /estop /stop /control_state /resume_control /resume /approve <approval_id> /deny <approval_id>\n"
+                    "Routing: /sensor /control /guardian /subagent /workflow /rule /local /mesh /status /device /profile /skills /privacy /lua /trace\n");
     snprintf(result->text + off, sizeof(result->text) - off,
              "Example: /control 把状态灯设为蓝色");
 }
@@ -258,11 +294,13 @@ bool espagent_slash_try_handle(const char *input, espagent_slash_result_t *resul
 
         snprintf(result->command, sizeof(result->command), "%s", command);
         if (is_action_command(command)) {
-            if (strcmp(command, "skills_show") == 0) {
+            if (strcmp(command, "skills_show") == 0 ||
+                strcmp(command, "approve") == 0 ||
+                strcmp(command, "deny") == 0) {
                 if (!p || p[0] == '\0') {
                     result->type = ESPAGENT_SLASH_ERROR;
                     snprintf(result->text, sizeof(result->text),
-                             "Missing skill name after /skills_show.\nUsage: /skills_show <skill_name>");
+                             "Missing argument after slash command.\nUsage: /skills_show <skill_name> or /approve <approval_id> or /deny <approval_id>");
                     return true;
                 }
                 result->type = ESPAGENT_SLASH_ACTION;

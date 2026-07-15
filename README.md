@@ -22,8 +22,11 @@ This is still an MCU-oriented runtime, not a Linux multi-process agent framework
 - Local WebSocket gateway on port `18789`
 - Local Wi-Fi onboarding/admin portal with device status, device registry, and runtime skills API
 - Serial CLI for diagnostics and local maintenance
-- Slash command layer for explicit routing: `/help`, `/sensor`, `/control`,
-  `/guardian`, `/subagent`, `/workflow`, `/rule`, and `/local`
+- Slash command layer for direct diagnostics and explicit routing: `/help`,
+  `/init`, `/doctor`, `/mcp`, `/compact`, `/skills_list`,
+  `/skills_show`, `/sensor`, `/control`, `/guardian`, `/subagent`,
+  `/workflow`, `/rule`, `/local`, `/mesh`, `/status`, `/stop`, `/resume`,
+  `/device`, `/profile`, `/skills`, `/privacy`, `/lua`, and `/trace`
 - ReAct-style agent loop with LLM tool use
 - Bounded `spawn_subagent` tool for focused search, weather/time, and SPIFFS file subtasks
 - esp-claw-like single-board runtime layer: capability registry, role-visible capability profiles, event/trace flow, Memory v2, dynamic extension catalog, and managed Lua scripting
@@ -54,7 +57,7 @@ This is still an MCU-oriented runtime, not a Linux multi-process agent framework
 - ESP-NOW environment telemetry sender
 - MQTT state, telemetry, events, dispatch, timeline, alerts, and security topics
 - SPIFFS-backed `device_registry` for MQTT Mesh nodes
-- Automation runtime for delayed workflows and persistent condition-action rules
+- Automation runtime for delayed workflows and one-shot condition-action rules
 - Four ESP32-S3 role profiles: `coordinator_agent`, `sensor_agent`, `control_agent`, and `guardian_agent`
 - Wi-Fi onboarding/admin AP under the `ESPAgent-XXXX` network name
 
@@ -71,6 +74,7 @@ Current verified highlights:
 - AHT20 on the Sensor role has been verified, with typical readings around `27.x C / 45-46%RH`.
 - Sensor telemetry publishes AHT20 data on `espagent/cube1345/nodes/esp32s3-sensor-01/telemetry`.
 - Sensor telemetry now includes local EWMA fields (`temp_avg`, `humidity_avg`, `light_lux_avg`) and sample counts, and Sensor can publish threshold events to `events`, `alerts`, and `agent/timeline`.
+- Sensor role now keeps bounded local environment history under `/spiffs/env/*.jsonl` at a 5-minute cadence, with `env_history_summary` / `env_history_recent` tools for role-local LLM trend analysis without loading raw files.
 - A humidity rule has been verified end to end: Coordinator automation reads Sensor AHT20 humidity, Guardian allows the action, and Control sets the WS2812 status light.
 - Control publishes `espagent.control_state.v1` snapshots after remote actuator commands, so Display Terminals can show busy state, emergency stop state, interlock config, and recent actuator results.
 - Guardian policy decisions include `risk_score` and `privacy_mode=metadata_only`; Guardian also subscribes to `nodes/+/state` and `nodes/+/telemetry` to build lightweight watchdog StateBoard updates.
@@ -116,21 +120,23 @@ tool_registry
 The ReAct loop is now a first-version cross-node loop: the Coordinator can reason, call a Mesh tool, wait asynchronously for the remote result, observe the structured OutputMessage, and then produce a user-facing answer.
 
 Before prompt construction, ordinary user text now passes through a lightweight
-slash-command parser in `main/agent/slash_command.c`. `/help` and invalid slash
-commands return immediate text replies. Routing commands such as `/control ...`
-or `/sensor ...` are rewritten into stronger role-constrained natural-language
-prompts and then continue through the normal `agent_loop`.
+slash-command parser in `main/agent/slash_command.c`. `/help`, `/init`,
+`/doctor`, `/mcp`, `/compact`, `/context_status`, `/skills_list`,
+`/skills_show`, and invalid slash commands return immediate text replies.
+Routing commands such as `/control ...`, `/workflow ...`, or `/sensor ...` are
+rewritten into stronger role-constrained natural-language prompts and then
+continue through the normal `agent_loop`.
 
 ## Automation Runtime
 
 ESPAgent has a deterministic automation layer for requests that should not depend on a single open LLM turn.
 
 - `automation_create_workflow`: creates one-shot ordered or delayed workflows, such as "turn red now, then blue after 10 seconds".
-- `automation_create_rule`: creates persistent condition-action rules, such as "if humidity is above 40%, set the light red".
+- `automation_create_rule`: creates one-shot condition-action rules, such as "if humidity is above 40%, set the light red"; the rule auto-removes after its first branch action attempt.
 - `automation_list`: lists active workflows and rules.
 - `automation_remove`: removes a workflow or rule.
 
-Rules are stored in `/spiffs/automation.json`. A background `rule_task` scans conditions, while one-shot workflows run in temporary `workflow_task` instances. The current default limits are 8 rules, 8 workflow slots, and 8 steps per workflow.
+Pending rules are stored in `/spiffs/automation.json` only while waiting for their first trigger. A background `rule_task` scans conditions and removes each rule after one branch action attempt, while ordered workflows run in temporary `workflow_task` instances and release their slot after completion. The current default limits are 8 rules, 8 workflow slots, and 8 steps per workflow.
 
 ## Repository Layout
 
@@ -264,7 +270,10 @@ esp32s3-control-01      control_agent      control,gpio,rgb,servo,relay,actuator
 esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audit,watchdog,stateboard
 ```
 
-At the moment, role identity is still mainly a build-time profile. If OTA is used with a firmware image compiled for a different role, the target board's role can change. A later improvement should move role identity into NVS so one OTA image can safely serve all four S3 roles.
+At the moment, role identity is still mainly a build-time profile. The focused
+Agent collaboration branch does not use MCU-side OTA as a showcase path; firmware
+updates should be handled from the development host until role identity is moved
+to NVS and a single image can safely serve all four S3 roles.
 
 ## MQTT Mesh Topics
 
