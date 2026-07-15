@@ -49,6 +49,8 @@ static bool append_exact_runtime_skill_context(char *prompt,
                                                size_t size,
                                                const char *message,
                                                bool tight_mode);
+static bool message_requests_skill_mutation_or_tool_execution(
+    const char *message);
 
 static bool agent_should_persist_trace(void) {
   return !espagent_role_is_coordinator();
@@ -1903,6 +1905,103 @@ static bool append_exact_runtime_skill_context(char *prompt,
 
   free(snippet);
   return ok;
+}
+
+static void append_family_pref_fact(char *reply, size_t reply_size,
+                                    const char *token) {
+  if (!reply || reply_size == 0 || !token || token[0] == '\0') {
+    return;
+  }
+
+  char user[16] = {0};
+  int start_hh = -1;
+  int start_mm = -1;
+  int end_hh = -1;
+  int end_mm = -1;
+  int humidity = -1;
+
+  if (sscanf(token, "%15[^_]_work_%2d%2d_home_%2d%2d",
+             user, &start_hh, &start_mm, &end_hh, &end_mm) == 5) {
+    append_prompt_format(reply, reply_size,
+                         "- %s：工作日 %d:%02d 出门上班，%d:%02d 回家。\n",
+                         user, start_hh, start_mm, end_hh, end_mm);
+    return;
+  }
+
+  if (sscanf(token, "%15[^_]_humidity_%d", user, &humidity) == 2) {
+    append_prompt_format(reply, reply_size,
+                         "- %s：偏好湿度为 %d%%。\n",
+                         user, humidity);
+    return;
+  }
+
+  if (sscanf(token, "%15[^_]_home_fan_on", user) == 1 &&
+      contains_substr_ci(token, "_home_fan_on")) {
+    append_prompt_format(reply, reply_size,
+                         "- %s：回家或在家时需要打开风扇。\n",
+                         user);
+    return;
+  }
+
+  append_prompt_format(reply, reply_size, "- %s\n", token);
+}
+
+static bool try_execute_deterministic_runtime_skill_fact_reply(
+    const espagent_msg_t *msg, char **final_text) {
+  if (!msg || !msg->content || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      !message_is_skill_or_knowledge_query(msg->content) ||
+      message_requests_skill_file_read(msg->content) ||
+      message_requests_skill_mutation_or_tool_execution(msg->content)) {
+    return false;
+  }
+
+  char skill_name[96] = {0};
+  char *snippet = heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!snippet) {
+    return false;
+  }
+
+  bool ok = read_exact_skill_snippet(msg->content, skill_name,
+                                     sizeof(skill_name), snippet, 1024);
+  if (!ok || !contains_substr_ci(snippet, "#FamilyPrefs")) {
+    free(snippet);
+    return false;
+  }
+
+  char *reply = heap_caps_calloc(1, 768, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!reply) {
+    free(snippet);
+    return false;
+  }
+
+  append_prompt_format(reply, 768,
+                       "根据 runtime skill `%s.md`，当前记录可解释为：\n",
+                       skill_name);
+
+  char *saveptr = NULL;
+  char *token = strtok_r(snippet, ";", &saveptr);
+  bool wrote_fact = false;
+  while ((token = strtok_r(NULL, ";", &saveptr)) != NULL) {
+    append_family_pref_fact(reply, 768, token);
+    wrote_fact = true;
+  }
+
+  if (!wrote_fact) {
+    append_prompt_format(reply, 768, "- %s\n", snippet);
+  }
+
+  append_prompt_format(reply, 768,
+                       "这些内容来自运行时写入的 skill 文件，没有触发传感器、定时任务或硬件工具。");
+
+  *final_text = strdup(reply);
+  ESP_LOGI(TAG, "=== CONV === Deterministic runtime skill route: %s",
+           skill_name);
+
+  free(reply);
+  free(snippet);
+  return *final_text != NULL;
 }
 
 static bool message_requests_skill_summary(const char *message) {
@@ -4148,6 +4247,7 @@ static void agent_loop_task(void *arg) {
 
     if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
         !try_execute_deterministic_skill_read_request(&msg, &final_text) &&
+        !try_execute_deterministic_runtime_skill_fact_reply(&msg, &final_text) &&
         !try_execute_deterministic_task_list_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_task_remove_request(

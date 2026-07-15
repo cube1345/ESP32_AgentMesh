@@ -81,16 +81,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--chat-id", default=DEFAULT_CHAT_ID)
     parser.add_argument("--text", default="你好")
+    parser.add_argument("--port", default=PORT)
     parser.add_argument("--send-timeout", type=int, default=25)
     parser.add_argument("--wait", type=float, default=35.0)
     parser.add_argument("--echo", action="store_true")
     args = parser.parse_args()
 
-    if not os.path.exists(PORT):
-        print(f"ERROR: missing {PORT}", file=sys.stderr)
+    if not os.path.exists(args.port):
+        print(f"ERROR: missing {args.port}", file=sys.stderr)
         return 2
 
-    fd = os.open(PORT, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    fd = os.open(args.port, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
     try:
         configure_serial(fd)
         try:
@@ -107,12 +108,17 @@ def main() -> int:
     finally:
         os.close(fd)
 
-    expected = [
+    common_expected = [
         "Processing message from feishu",
-        "Direct-reply heuristic enabled for this turn; first LLM call runs without tools",
-        "Calling LLM API with tools",
         "Queue final response to feishu",
         "Feishu send success",
+    ]
+    llm_expected = [
+        "Direct-reply heuristic enabled for this turn; first LLM call runs without tools",
+        "Calling LLM API with tools",
+    ]
+    deterministic_expected = [
+        "Deterministic runtime skill route",
     ]
     forbidden = [
         "抱歉，我这次处理请求时遇到了错误。",
@@ -121,11 +127,14 @@ def main() -> int:
         "LLM call failed",
     ]
 
+    path = "deterministic" if all(item in text for item in deterministic_expected) else "llm"
+    expected = common_expected + (deterministic_expected if path == "deterministic" else llm_expected)
     missing = [item for item in expected if item not in text]
     bad = [item for item in forbidden if item in text]
 
     print("===== greeting verification =====")
     print(f"prompt={args.text}")
+    print(f"path={path}")
     print(f"missing={missing}")
     print(f"forbidden={bad}")
     if missing or bad:
