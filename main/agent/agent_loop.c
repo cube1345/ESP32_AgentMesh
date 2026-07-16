@@ -1,16 +1,12 @@
 #include "agent_loop.h"
 #include "agent/context_builder.h"
 #include "agent/slash_command.h"
-#include "automation/automation_engine.h"
-#include "guardian/approval_queue.h"
 #include "bus/message_bus.h"
-#include "cache/cache_store.h"
 #include "llm/llm_proxy.h"
 #include "memory/memory_store.h"
 #include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "net/net_guard.h"
-#include "node/node_profile.h"
 #include "proactive/proactive_service.h"
 #include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
@@ -18,10 +14,8 @@
 #include "espagent_config.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_registry.h"
-#include "wifi/wifi_manager.h"
 
 #include "cJSON.h"
-#include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -3918,174 +3912,6 @@ static bool send_direct_text_reply(const espagent_msg_t *msg, const char *text) 
   return true;
 }
 
-static int count_nonempty_lines(const char *text) {
-  if (!text || !text[0]) {
-    return 0;
-  }
-  int count = 0;
-  bool in_line = false;
-  for (const char *p = text; ; p++) {
-    if (*p == '\0' || *p == '\n' || *p == '\r') {
-      if (in_line) {
-        count++;
-        in_line = false;
-      }
-      if (*p == '\0') {
-        break;
-      }
-      continue;
-    }
-    if (!isspace((unsigned char)*p)) {
-      in_line = true;
-    }
-  }
-  return count;
-}
-
-static void build_slash_init_reply(char *out, size_t out_size) {
-  if (!out || out_size == 0) {
-    return;
-  }
-
-  char skills[1536] = {0};
-  esp_err_t skills_err = skill_loader_build_index_text(skills, sizeof(skills));
-  int skill_count = skills_err == ESP_OK ? count_nonempty_lines(skills) : 0;
-
-  snprintf(out, out_size,
-           "ESPAgent 初始化摘要\n"
-           "- node_id: %s\n"
-           "- role: %s\n"
-           "- location: %s\n"
-           "- capabilities: %s\n"
-           "- WiFi: %s (%s)\n"
-           "- MQTT Mesh: %s\n"
-           "- skills: %d loaded\n"
-           "- slash direct: /help /init /doctor /mcp /compact /context_status /skills_list /skills_show /estop /stop /control_state /resume_control /resume\n"
-           "- slash routing: /sensor /control /guardian /subagent /workflow /rule /local /mesh /status /device /profile /skills /privacy /lua /trace\n"
-           "说明：/init 只做本地摘要，不触发硬件动作或 LLM 调用。",
-           espagent_node_id(),
-           espagent_node_role(),
-           espagent_node_location(),
-           espagent_node_capabilities(),
-           wifi_manager_is_connected() ? "connected" : "disconnected",
-           wifi_manager_get_ip(),
-           sensor_mqtt_is_connected() ? "connected" : "disconnected",
-           skill_count);
-}
-
-static void build_slash_mcp_reply(char *out, size_t out_size) {
-  if (!out || out_size == 0) {
-    return;
-  }
-
-  snprintf(out, out_size,
-           "MCP 边界\n"
-           "- MCU 端当前不直接运行 Claude Code 风格 MCP host/server。\n"
-           "- 当前稳定外部入口：Feishu、Serial CLI、本地 Web/admin、WebSocket/MQTT Mesh。\n"
-           "- 当前扩展面：Runtime Skills、Lua runtime、device manifest、SubAgent、Automation。\n"
-           "- 若后续需要 MCP，应由上位机/服务器侧桥接，再通过现有 Mesh 或 Web/admin API 调度 MCU；这不是当前 MCU 固件展示链路。\n"
-           "- 当前 Mesh: %s；WiFi: %s (%s)。",
-           sensor_mqtt_is_connected() ? "connected" : "disconnected",
-           wifi_manager_is_connected() ? "connected" : "disconnected",
-           wifi_manager_get_ip());
-}
-
-static void build_slash_doctor_reply(char *out, size_t out_size) {
-  if (!out || out_size == 0) {
-    return;
-  }
-
-  char skills[1536] = {0};
-  char automation[1024] = {0};
-  cache_stats_t stats = {0};
-  cache_stats(&stats);
-
-  esp_err_t skills_err = skill_loader_build_index_text(skills, sizeof(skills));
-  esp_err_t auto_err = automation_engine_list(automation, sizeof(automation));
-  int skill_count = skills_err == ESP_OK ? count_nonempty_lines(skills) : 0;
-  bool has_automation = auto_err == ESP_OK && strstr(automation, "- ") != NULL;
-
-  snprintf(out, out_size,
-           "ESPAgent doctor\n"
-           "- WiFi: %s ip=%s\n"
-           "- MQTT Mesh: %s\n"
-           "- heap_internal: free=%u largest=%u\n"
-           "- heap_psram: free=%u largest=%u\n"
-           "- skills: %s count=%d\n"
-           "- automation: %s\n"
-           "- cache: entries=%u bytes=%u hits=%u misses=%u evictions=%u\n"
-           "- node: %s role=%s\n"
-           "建议：若 Feishu 长时间无回复，优先看 WiFi/MQTT/heap_internal largest；若 skill 读取异常，跑 /skills_list 和 /skills_show。",
-           wifi_manager_is_connected() ? "ok" : "down",
-           wifi_manager_get_ip(),
-           sensor_mqtt_is_connected() ? "ok" : "down",
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-           (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-           skills_err == ESP_OK ? "ok" : esp_err_to_name(skills_err),
-           skill_count,
-           auto_err == ESP_OK ? (has_automation ? "has tasks" : "empty") : esp_err_to_name(auto_err),
-           (unsigned)stats.entries,
-           (unsigned)stats.bytes,
-           (unsigned)stats.hits,
-           (unsigned)stats.misses,
-           (unsigned)stats.evictions,
-           espagent_node_id(),
-           espagent_node_role());
-}
-
-static bool send_control_mesh_slash_action(const espagent_msg_t *msg,
-                                           const char *slash_command,
-                                           const char *mesh_action,
-                                           int safety_level) {
-  if (!msg || !slash_command || !mesh_action) {
-    return false;
-  }
-
-  char reply[512] = {0};
-  cJSON *root = cJSON_CreateObject();
-  cJSON *args = cJSON_CreateObject();
-  if (!root || !args) {
-    cJSON_Delete(root);
-    cJSON_Delete(args);
-    snprintf(reply, sizeof(reply), "内存不足，无法处理 /%s。", slash_command);
-    return send_direct_text_reply(msg, reply);
-  }
-
-  cJSON_AddStringToObject(root, "target_role", "control_agent");
-  cJSON_AddStringToObject(root, "action", mesh_action);
-  cJSON_AddNumberToObject(root, "safety_level", safety_level);
-  cJSON_AddNumberToObject(root, "ttl_ms", 8000);
-  cJSON_AddBoolToObject(root, "async", false);
-  cJSON_AddStringToObject(root, "reply_channel", msg->channel);
-  cJSON_AddStringToObject(root, "reply_chat_id", msg->chat_id);
-  cJSON_AddItemToObject(root, "args", args);
-
-  char *payload = cJSON_PrintUnformatted(root);
-  cJSON_Delete(root);
-  if (!payload) {
-    snprintf(reply, sizeof(reply), "内存不足，无法序列化 /%s 控制命令。", slash_command);
-    return send_direct_text_reply(msg, reply);
-  }
-
-  char tool_output[768] = {0};
-  esp_err_t err = tool_registry_execute("mesh_send_command",
-                                        payload,
-                                        tool_output,
-                                        sizeof(tool_output));
-  cJSON_free(payload);
-
-  snprintf(reply,
-           sizeof(reply),
-           "%s /%s -> %s: %.360s",
-           err == ESP_OK ? "OK:" : "Error:",
-           slash_command,
-           mesh_action,
-           tool_output[0] ? tool_output : esp_err_to_name(err));
-  return send_direct_text_reply(msg, reply);
-}
-
 static bool handle_slash_action(const espagent_msg_t *msg,
                                 const espagent_slash_result_t *slash) {
   if (!msg || !slash || slash->type != ESPAGENT_SLASH_ACTION) {
@@ -4094,65 +3920,6 @@ static bool handle_slash_action(const espagent_msg_t *msg,
 
   char reply[512] = {0};
   bool any_removed = false;
-
-  if (strcmp(slash->command, "estop") == 0 ||
-      strcmp(slash->command, "stop") == 0) {
-    return send_control_mesh_slash_action(msg,
-                                          slash->command,
-                                          "control_emergency_stop",
-                                          0);
-  }
-
-  if (strcmp(slash->command, "control_state") == 0) {
-    return send_control_mesh_slash_action(msg,
-                                          slash->command,
-                                          "control_state",
-                                          0);
-  }
-
-  if (strcmp(slash->command, "resume_control") == 0 ||
-      strcmp(slash->command, "resume") == 0) {
-    return send_control_mesh_slash_action(msg,
-                                          slash->command,
-                                          "control_clear_emergency_stop",
-                                          1);
-  }
-
-  if (strcmp(slash->command, "approve") == 0 ||
-      strcmp(slash->command, "deny") == 0) {
-    bool approve = strcmp(slash->command, "approve") == 0;
-    cJSON *root = cJSON_CreateObject();
-    cJSON *args = cJSON_CreateObject();
-    if (!root || !args) {
-      cJSON_Delete(root);
-      cJSON_Delete(args);
-      snprintf(reply, sizeof(reply), "内存不足，无法处理 Guardian 审批。 ");
-      return send_direct_text_reply(msg, reply);
-    }
-    cJSON_AddStringToObject(root, "target_role", "guardian_agent");
-    cJSON_AddStringToObject(root, "action", approve ? "guardian_approval_confirm" : "guardian_approval_deny");
-    cJSON_AddNumberToObject(root, "safety_level", 0);
-    cJSON_AddNumberToObject(root, "ttl_ms", 8000);
-    cJSON_AddBoolToObject(root, "async", false);
-    cJSON_AddStringToObject(root, "reply_channel", msg->channel);
-    cJSON_AddStringToObject(root, "reply_chat_id", msg->chat_id);
-    cJSON_AddStringToObject(args, "approval_id", slash->text);
-    cJSON_AddItemToObject(root, "args", args);
-    char *payload = cJSON_PrintUnformatted(root);
-    cJSON_Delete(root);
-    if (!payload) {
-      snprintf(reply, sizeof(reply), "内存不足，无法序列化 Guardian 审批命令。 ");
-      return send_direct_text_reply(msg, reply);
-    }
-    char tool_output[768] = {0};
-    esp_err_t err = tool_registry_execute("mesh_send_command", payload, tool_output, sizeof(tool_output));
-    cJSON_free(payload);
-    snprintf(reply, sizeof(reply), "%s Guardian approval %s: %.420s",
-             err == ESP_OK ? "OK:" : "Error:",
-             approve ? "approve" : "deny",
-             tool_output[0] ? tool_output : esp_err_to_name(err));
-    return send_direct_text_reply(msg, reply);
-  }
 
   if (strcmp(slash->command, "clear") == 0) {
     if (session_clear_all_context(msg->chat_id) == ESP_OK) {
@@ -4186,62 +3953,11 @@ static bool handle_slash_action(const espagent_msg_t *msg,
     return send_direct_text_reply(msg, reply);
   }
 
-  if (strcmp(slash->command, "compact") == 0) {
-    char *status = heap_caps_calloc(1, 1024, MALLOC_CAP_SPIRAM);
-    if (!status) {
-      snprintf(reply, sizeof(reply), "内存不足，无法刷新 compact brief。");
-      return send_direct_text_reply(msg, reply);
-    }
-
-    esp_err_t err = session_refresh_context_brief(msg->chat_id);
-    if (err == ESP_OK &&
-        session_context_status_text(msg->chat_id, status, 1024) == ESP_OK) {
-      char *compact_reply = heap_caps_calloc(1, 1280, MALLOC_CAP_SPIRAM);
-      if (compact_reply) {
-        snprintf(compact_reply, 1280,
-                 "已刷新当前 chat_id 的 compact brief。该操作不会删除 history/trace。\n\n%.1000s",
-                 status);
-        bool ok = send_direct_text_reply(msg, compact_reply);
-        free(compact_reply);
-        free(status);
-        return ok;
-      }
-    }
-
-    snprintf(reply, sizeof(reply), "刷新 compact brief 失败：%s",
-             esp_err_to_name(err));
-    free(status);
-    return send_direct_text_reply(msg, reply);
-  }
-
   if (strcmp(slash->command, "context_status") == 0) {
     if (session_context_status_text(msg->chat_id, reply, sizeof(reply)) != ESP_OK) {
       snprintf(reply, sizeof(reply), "无法读取当前 chat_id 的 context 状态。");
     }
     return send_direct_text_reply(msg, reply);
-  }
-
-  if (strcmp(slash->command, "doctor") == 0 ||
-      strcmp(slash->command, "init") == 0 ||
-      strcmp(slash->command, "mcp") == 0) {
-    char *diagnostic = heap_caps_calloc(1, 2048, MALLOC_CAP_SPIRAM);
-    if (!diagnostic) {
-      snprintf(reply, sizeof(reply), "内存不足，无法生成 /%s 输出。",
-               slash->command);
-      return send_direct_text_reply(msg, reply);
-    }
-
-    if (strcmp(slash->command, "doctor") == 0) {
-      build_slash_doctor_reply(diagnostic, 2048);
-    } else if (strcmp(slash->command, "init") == 0) {
-      build_slash_init_reply(diagnostic, 2048);
-    } else {
-      build_slash_mcp_reply(diagnostic, 2048);
-    }
-
-    bool ok = send_direct_text_reply(msg, diagnostic);
-    free(diagnostic);
-    return ok;
   }
 
   if (strcmp(slash->command, "skills_list") == 0) {

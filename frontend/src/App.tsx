@@ -25,8 +25,8 @@ import {
   type TimelineFilter
 } from './components/ConsoleViews';
 import { mockDashboardPayload } from './data/mock';
-import { fetchDashboard, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills, updateRuntimeSkill } from './services/dashboard';
-import type { AgentNode, DashboardPayload, RuntimeSkillRecord, SkillDraft, TimelineEvent, UserPreferenceProfile } from './types';
+import { fetchDashboard, fetchRuntimeDeviceManifests, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills, updateRuntimeDeviceManifest, updateRuntimeSkill } from './services/dashboard';
+import type { AgentNode, DashboardPayload, RuntimeDeviceManifestRecord, RuntimeSkillRecord, SkillDraft, TimelineEvent, UserPreferenceProfile } from './types';
 
 type ViewMode = '总览' | '协作链路' | 'Sandbox' | 'Skills Studio' | '用户偏好';
 type Role = 'admin' | 'operator' | 'viewer';
@@ -141,13 +141,18 @@ function App() {
   const [viewMode, setViewMode] = useState<ViewMode>('总览');
   const [timelineFilter, setTimelineFilter] = useState<TimelineFilter>('全部');
   const [activeSkillId, setActiveSkillId] = useState(mockDashboardPayload.skills[0]?.id || '');
-  const [skillEditorMode, setSkillEditorMode] = useState<'draft' | 'runtime'>('draft');
+  const [skillEditorMode, setSkillEditorMode] = useState<'draft' | 'runtime' | 'device'>('draft');
   const [activeRuntimeSkillId, setActiveRuntimeSkillId] = useState('');
+  const [runtimeDeviceManifests, setRuntimeDeviceManifests] = useState<RuntimeDeviceManifestRecord[]>([]);
+  const [activeRuntimeDeviceManifestId, setActiveRuntimeDeviceManifestId] = useState('');
   const [savingSkills, setSavingSkills] = useState(false);
   const [installingSkillId, setInstallingSkillId] = useState<string | null>(null);
   const [savingRuntimeSkillId, setSavingRuntimeSkillId] = useState<string | null>(null);
+  const [savingRuntimeDeviceManifestId, setSavingRuntimeDeviceManifestId] = useState<string | null>(null);
   const [runtimeSkillSource, setRuntimeSkillSource] = useState<'local_mock' | 'proxy' | 'serial'>('local_mock');
   const [runtimeSkillError, setRuntimeSkillError] = useState('');
+  const [runtimeDeviceSource, setRuntimeDeviceSource] = useState<'local_mock' | 'proxy' | 'serial'>('local_mock');
+  const [runtimeDeviceError, setRuntimeDeviceError] = useState('');
   const [savingPrefs, setSavingPrefs] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [wsUrl, setWsUrl] = useState(defaultGatewayWsUrl);
@@ -174,7 +179,15 @@ function App() {
   useEffect(() => {
     if (viewMode !== 'Skills Studio') return;
     let cancelled = false;
-    void fetchRuntimeSkills().then((next) => { if (!cancelled) { setRuntimeSkills(next.skills); setRuntimeSkillSource(next.source); setRuntimeSkillError(next.error || ''); } });
+    void Promise.all([fetchRuntimeSkills(), fetchRuntimeDeviceManifests()]).then(([skills, devices]) => {
+      if (cancelled) return;
+      setRuntimeSkills(skills.skills);
+      setRuntimeSkillSource(skills.source);
+      setRuntimeSkillError(skills.error || '');
+      setRuntimeDeviceManifests(devices.devices);
+      setRuntimeDeviceSource(devices.source);
+      setRuntimeDeviceError(devices.error || '');
+    });
     return () => { cancelled = true; };
   }, [viewMode]);
 
@@ -191,11 +204,21 @@ function App() {
       setActiveRuntimeSkillId(runtimeSkills[0].runtimeName);
     }
   }, [activeRuntimeSkillId, runtimeSkills]);
+  useEffect(() => {
+    if (!runtimeDeviceManifests.length) {
+      if (activeRuntimeDeviceManifestId) setActiveRuntimeDeviceManifestId('');
+      return;
+    }
+    if (!runtimeDeviceManifests.some((item) => item.manifestName === activeRuntimeDeviceManifestId)) {
+      setActiveRuntimeDeviceManifestId(runtimeDeviceManifests[0].manifestName);
+    }
+  }, [activeRuntimeDeviceManifestId, runtimeDeviceManifests]);
   useEffect(() => () => wsInstance?.close(), [wsInstance]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [chatMessages]);
 
   const activeSkill = useMemo(() => draftSkills.find((item) => item.id === activeSkillId) || null, [activeSkillId, draftSkills]);
   const activeRuntimeSkill = useMemo(() => runtimeSkills.find((item) => item.runtimeName === activeRuntimeSkillId) || null, [activeRuntimeSkillId, runtimeSkills]);
+  const activeRuntimeDeviceManifest = useMemo(() => runtimeDeviceManifests.find((item) => item.manifestName === activeRuntimeDeviceManifestId) || null, [activeRuntimeDeviceManifestId, runtimeDeviceManifests]);
   const canEditSkills = session?.role === 'admin';
   const canUseChat = session?.role !== 'viewer';
   const isLive = Boolean(payload.mqtt);
@@ -264,10 +287,25 @@ function App() {
     const next = await fetchRuntimeSkills(); setRuntimeSkills(next.skills); setRuntimeSkillSource(next.source); setRuntimeSkillError(next.error || '');
   }
 
+  async function refreshRuntimeDeviceManifests() {
+    const next = await fetchRuntimeDeviceManifests(); setRuntimeDeviceManifests(next.devices); setRuntimeDeviceSource(next.source); setRuntimeDeviceError(next.error || '');
+  }
+
+  async function refreshRuntimeAssets() {
+    await Promise.all([refreshRuntimeSkills(), refreshRuntimeDeviceManifests()]);
+  }
+
   function patchRuntimeSkill(patch: Partial<RuntimeSkillRecord>) {
     if (!activeRuntimeSkillId) return;
     setRuntimeSkills((current) => current.map((item) => (
       item.runtimeName === activeRuntimeSkillId ? { ...item, ...patch } : item
+    )));
+  }
+
+  function patchRuntimeDeviceManifest(patch: Partial<RuntimeDeviceManifestRecord>) {
+    if (!activeRuntimeDeviceManifestId) return;
+    setRuntimeDeviceManifests((current) => current.map((item) => (
+      item.manifestName === activeRuntimeDeviceManifestId ? { ...item, ...patch } : item
     )));
   }
 
@@ -290,6 +328,28 @@ function App() {
       }
     } finally {
       setSavingRuntimeSkillId(null);
+    }
+  }
+
+  async function handleSaveRuntimeDeviceManifest() {
+    if (!activeRuntimeDeviceManifest || !canEditSkills) return;
+    setSavingRuntimeDeviceManifestId(activeRuntimeDeviceManifest.manifestName);
+    try {
+      const result = await updateRuntimeDeviceManifest(activeRuntimeDeviceManifest, true);
+      if (result.ok) {
+        if (result.device) {
+          setRuntimeDeviceManifests((current) => current.map((item) => (
+            item.manifestName === result.device?.manifestName ? result.device : item
+          )));
+          setActiveRuntimeDeviceManifestId(result.device.manifestName);
+        }
+        messageApi.success(result.message || 'Device Manifest 已保存');
+        await refreshRuntimeDeviceManifests();
+      } else {
+        messageApi.error(result.error || result.message || '保存失败');
+      }
+    } finally {
+      setSavingRuntimeDeviceManifestId(null);
     }
   }
 
@@ -407,7 +467,16 @@ function App() {
                   savingRuntime={savingRuntimeSkillId === activeRuntimeSkillId}
                   runtimeSource={runtimeSkillSource}
                   runtimeError={runtimeSkillError}
-                  refresh={refreshRuntimeSkills}
+                  runtimeDevices={runtimeDeviceManifests}
+                  activeRuntimeDevice={activeRuntimeDeviceManifest}
+                  activeRuntimeDeviceId={activeRuntimeDeviceManifestId}
+                  setActiveRuntimeDeviceId={setActiveRuntimeDeviceManifestId}
+                  patchRuntimeDevice={patchRuntimeDeviceManifest}
+                  saveRuntimeDevice={handleSaveRuntimeDeviceManifest}
+                  savingRuntimeDevice={savingRuntimeDeviceManifestId === activeRuntimeDeviceManifestId}
+                  runtimeDeviceSource={runtimeDeviceSource}
+                  runtimeDeviceError={runtimeDeviceError}
+                  refresh={refreshRuntimeAssets}
                 />
               )}
               {viewMode === '用户偏好' && <PreferencesView preferences={preferences} setPreferences={setPreferences} save={handleSavePreferences} saving={savingPrefs} username={session.username} role={session.role} />}

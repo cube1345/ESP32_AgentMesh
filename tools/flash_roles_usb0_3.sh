@@ -40,7 +40,7 @@ NODE_ROLES=(
 NODE_CAPABILITIES=(
   "coordinator,communication,llm,dispatch,timeline,alerts"
   "sensor,telemetry,environment,air_quality,light,presence"
-  "control,gpio,rgb,servo,relay,actuator"
+  "control,gpio,ws2812,status_light,servo,relay,actuator"
   "guardian,security,policy,privacy,audit,watchdog,stateboard"
 )
 

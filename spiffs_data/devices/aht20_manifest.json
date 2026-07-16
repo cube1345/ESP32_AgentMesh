@@ -1,0 +1,36 @@
+{
+  "manifest_version": 1,
+  "name": "aht20_manifest",
+  "protocol": "i2c",
+  "role": "sensor_agent",
+  "risk": "read_only",
+  "permissions": ["read"],
+  "publisher": "local_developer",
+  "trust": {
+    "source": "local_spiffs",
+    "integrity": "sha256_sidecar",
+    "review": "developer"
+  },
+  "pins": {
+    "sda": 21,
+    "scl": 18
+  },
+  "i2c_port": 0,
+  "scl_hz": 100000,
+  "address": "0x38",
+  "timeout_ms": 100,
+  "internal_pullup": true,
+  "operations": [
+    {"type": "write", "bytes": [225, 8, 0]},
+    {"type": "delay_ms", "value": 40},
+    {"type": "write", "bytes": [172, 51, 0]},
+    {"type": "delay_ms", "value": 90},
+    {"type": "read", "length": 6}
+  ],
+  "decode": {
+    "type": "aht20_temp_humidity",
+    "field": "temperature_humidity",
+    "unit": "C/%RH"
+  },
+  "notes": "Runtime I2C manifest for the current AHT10/AHT20-compatible temperature and humidity module on SDA21/SCL18. It uses the existing driver-compatible init command, then triggers one measurement and decodes the 6-byte payload in firmware."
+}

@@ -656,12 +656,12 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "mesh_send_command",
-        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic hardware work. Use action=agent_task with args.task when the coordinator should delegate a natural-language subtask to a remote role's own local AI loop. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote control/status-light, servo, GPIO, or Gree air-conditioner requests, use target_role=control_agent with the matching action and structured args. Do not claim a Mesh command was sent unless this tool returns OK.",
+        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic hardware work. Use action=agent_task with args.task when the coordinator should delegate a natural-language subtask to a remote role's own local AI loop. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote RGB light, humidifier, fan, GPIO, or Gree air-conditioner requests, use target_role=control_agent with the matching action and structured args. Do not claim a Mesh command was sent unless this tool returns OK.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\",\"guardian_approval_list\",\"guardian_approval_confirm\",\"guardian_approval_deny\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop; guardian_approval_* actions resolve Guardian approval requests on the guardian_agent.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\",\"guardian_approval_list\",\"guardian_approval_confirm\",\"guardian_approval_deny\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop; guardian_approval_* actions resolve Guardian approval requests on the guardian_agent.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -676,7 +676,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "virtual_device_read",
-        .description = "Read or perform a bounded UART exchange with a simple runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports bounded I2C, UART query, Modbus RTU function 3/4 register reads, SPI transfer-read, ADC one-shot, and GPIO input manifests. For UART manifests, command_ascii or command_bytes may be overridden at call time, and expect_response=false enables send-only serial pushes such as HC-05 phone bridge text output. The manifest must use manifest_version=1, role=sensor_agent, permissions=[read], and risk=read_only. On a coordinator_agent, this routes to sensor_agent unless local=true is explicitly set. Use this when a developer added a protocol manifest for a new simple sensor or serial module and no dedicated C tool exists.",
+        .description = "Read or perform a bounded UART exchange with a simple runtime hardware device described by /spiffs/devices/<device>.json. Current phase supports bounded I2C, UART query, Modbus RTU function 3/4 register reads, SPI transfer-read, ADC one-shot, and GPIO input manifests; I2C decode types include raw_u8, raw_u16_be/le, and aht20_temp_humidity. For UART manifests, command_ascii or command_bytes may be overridden at call time, and expect_response=false enables send-only serial pushes such as HC-05 phone bridge text output. The manifest must use manifest_version=1, role=sensor_agent, permissions=[read], and risk=read_only. On a coordinator_agent, this routes to sensor_agent unless local=true is explicitly set. Use this when a developer added a protocol manifest for a new simple sensor or serial module and no dedicated C tool exists.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"device\":{\"type\":\"string\",\"description\":\"Device manifest name, loaded from /spiffs/devices/<device>.json\"},"
@@ -714,7 +714,7 @@ esp_err_t tool_registry_init(void)
             "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
             "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
             "\"required\":[\"action\"]}}},"
@@ -736,9 +736,9 @@ esp_err_t tool_registry_init(void)
             "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this background condition rule\"},"
             "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
             "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
             "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"servo_write\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
             "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
         .execute = tool_automation_create_rule_execute,
     });
@@ -909,12 +909,12 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "set_humidifier",
-        .description = "Turn the humidifier on or off. The humidifier is wired to GPIO4 on the third/control role; HIGH turns it on and LOW turns it off. Prefer this over generic GPIO tools when the user says humidifier, 加湿器, or humidification. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Turn the humidifier on or off. The humidifier is wired to GPIO4 on the third/control role and is active-high: logical ON drives HIGH, logical OFF drives LOW. Prefer this over generic GPIO tools when the user says humidifier, 加湿器, or humidification. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
             "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
-            "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language on/off alias\"},"
+            "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language alias. on/off controls logical device state; high/low requests physical GPIO level and is converted for this active-high device\"},"
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
             "\"required\":[]}",
         .execute = tool_set_humidifier_routed_execute,
@@ -935,12 +935,13 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "set_device_led",
-        .description = "Turn the discrete device LED on GPIO6 on or off. This is not the WS2812 status light; HIGH turns the GPIO6 LED on and LOW turns it off. Prefer this when the user asks for GPIO6 LED, ordinary LED, 单色LED, or 独立LED. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Turn the onboard WS2812 status light on or off as a white/off alias. Prefer set_status_light when the user names a color. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
-            "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
+            "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF, 1 for ON/white\"},"
             "\"level\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"Alias for state\"},"
             "\"value\":{\"type\":\"string\",\"enum\":[\"on\",\"off\",\"open\",\"close\",\"high\",\"low\",\"打开\",\"关闭\",\"拉高\",\"拉低\"],\"description\":\"Natural-language on/off alias\"},"
+            "\"pin\":{\"type\":\"integer\",\"description\":\"Optional WS2812 GPIO override; defaults to the configured onboard WS2812 pin\"},"
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
             "\"required\":[]}",
         .execute = tool_set_device_led_routed_execute,
@@ -966,7 +967,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "ws2812_set",
-        .description = "Set a single WS2812/NeoPixel RGB LED color. Useful for the onboard RGB LED on ESP32-S3 boards. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Low-level WS2812/NeoPixel single-wire LED control. Use set_status_light for named colors; use this when explicit RGB values are needed. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"r\":{\"type\":\"integer\",\"description\":\"Red value 0-255\"},"
@@ -981,12 +982,12 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "set_status_light",
-        .description = "Set the onboard RGB status light with a natural-language-friendly color. Prefer this when the user asks to turn the board light red, green, blue, white, yellow, purple, cyan, orange, or off. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Set the third/control role onboard WS2812 status light with a natural-language-friendly color. Prefer this when the user asks to turn the status light or WS2812 red, green, blue, white, yellow, purple, cyan, orange, or off. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"color\":{\"type\":\"string\",\"description\":\"Named color such as red, green, blue, white, yellow, orange, purple, cyan, or off\"},"
             "\"brightness\":{\"type\":\"integer\",\"description\":\"Optional brightness 0-255, defaults to 255\"},"
-            "\"pin\":{\"type\":\"integer\",\"description\":\"Optional GPIO override. Defaults to the configured onboard WS2812 pin.\"},"
+            "\"pin\":{\"type\":\"integer\",\"description\":\"Optional WS2812 GPIO override; defaults to the configured onboard WS2812 pin\"},"
             "\"r\":{\"type\":\"integer\",\"description\":\"Optional red value 0-255 when using explicit RGB\"},"
             "\"g\":{\"type\":\"integer\",\"description\":\"Optional green value 0-255 when using explicit RGB\"},"
             "\"b\":{\"type\":\"integer\",\"description\":\"Optional blue value 0-255 when using explicit RGB\"},"
@@ -997,7 +998,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "servo_write",
-        .description = "Control the servo motor on GPIO5. Set the angle in degrees (0-180) or pulse width in microseconds. For requests like opening, starting, or testing the servo without a specific angle, prefer angle=90 to produce a visible motion. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Disabled for the current demo hardware unless ESPAGENT_SECRET_SERVO_GPIO is explicitly configured. The current GPIO5 line is reserved for the active-high fan. Do not choose this tool for normal demonstrations. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
@@ -1073,14 +1074,16 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "read_light_level",
-        .description = "Read ambient light level in lux from a GY-30/BH1750 I2C light sensor. Prefer this when the user asks about light level, ambient light, illuminance, lux, GY-30, BH1750, 光照, 光线亮度, 照度, or 勒克斯. Optional SDA/SCL GPIO and address overrides can be provided for wiring diagnostics.",
+        .description = "Read ambient light level in lux from a GY-30/BH1750 I2C light sensor. Prefer this when the user asks about light level, ambient light, illuminance, lux, GY-30, BH1750, 光照, 光线亮度, 照度, or 勒克斯. Defaults to the sensor role's software I2C path because hardware I2C0/I2C1 are already used by AHT20 and SGP30; set hardware_i2c=true only for explicit bus diagnostics.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"sda_gpio\":{\"type\":\"integer\",\"description\":\"Optional SDA GPIO override\"},"
             "\"scl_gpio\":{\"type\":\"integer\",\"description\":\"Optional SCL GPIO override\"},"
             "\"i2c_port\":{\"type\":\"integer\",\"description\":\"Optional I2C port override\"},"
             "\"scl_hz\":{\"type\":\"integer\",\"description\":\"Optional I2C clock speed in Hz, defaults to 100000\"},"
-            "\"address\":{\"type\":\"integer\",\"description\":\"Optional BH1750 I2C address, 0x23 by default or 0x5C when ADDR is high\"}},"
+            "\"address\":{\"type\":\"integer\",\"description\":\"Optional BH1750 I2C address, 0x23 by default or 0x5C when ADDR is high\"},"
+            "\"software_i2c\":{\"type\":\"boolean\",\"description\":\"Use software I2C; defaults true for the current sensor board wiring\"},"
+            "\"hardware_i2c\":{\"type\":\"boolean\",\"description\":\"Force ESP-IDF hardware I2C path for diagnostics; may fail if the port is already acquired\"}},"
             "\"required\":[]}",
         .execute = tool_bh1750_read_light_execute,
     });

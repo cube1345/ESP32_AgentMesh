@@ -204,6 +204,16 @@ def find_config_field(text: str, label: str) -> str | None:
     return value
 
 
+def find_identity_fallback(text: str) -> tuple[str | None, str | None]:
+    node_id = None
+    role = None
+    for match in re.finditer(r"node=([A-Za-z0-9_-]+)\s+role=([A-Za-z0-9_]+)\s+capabilities=", text):
+        node_id, role = match.groups()
+    for match in re.finditer(r'"node_id":"([^"]+)".*?"role":"([^"]+)"', text):
+        node_id, role = match.groups()
+    return node_id, role
+
+
 def request_config(states: dict[int, PortState]) -> bool:
     for state in states.values():
         write_line(state, "config_show")
@@ -214,6 +224,9 @@ def request_config(states: dict[int, PortState]) -> bool:
         state = next(s for s in states.values() if s.port == port)
         state.role = find_config_field(state.text, "Node Role")
         state.node_id = find_config_field(state.text, "Node ID")
+        fallback_node, fallback_role = find_identity_fallback(state.text)
+        state.node_id = state.node_id or fallback_node
+        state.role = state.role or fallback_role
         expected = EXPECTED_ROLES[port]
         status = "OK" if state.role == expected else "MISMATCH"
         ok = ok and status == "OK"

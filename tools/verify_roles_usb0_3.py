@@ -136,6 +136,17 @@ def find_field(text: str, label: str) -> str | None:
     return value
 
 
+def find_identity_fallback(text: str) -> tuple[str | None, str | None, str | None]:
+    node_id = None
+    role = None
+    caps = None
+    for match in re.finditer(r"node=([A-Za-z0-9_-]+)\s+role=([A-Za-z0-9_]+)\s+capabilities=([^\s\r\n]+)", text):
+        node_id, role, caps = match.groups()
+    for match in re.finditer(r'"node_id":"([^"]+)".*?"role":"([^"]+)".*?"capabilities":"([^"]+)"', text):
+        node_id, role, caps = match.groups()
+    return node_id, role, caps
+
+
 def state_for_port(states: dict[int, PortState], port: str) -> PortState:
     for state in states.values():
         if state.port == port:
@@ -151,6 +162,10 @@ def verify(states: dict[int, PortState]) -> bool:
         node_id = find_field(state.text, "Node ID")
         role = find_field(state.text, "Node Role")
         caps = find_field(state.text, "Node Caps") or ""
+        fallback_node, fallback_role, fallback_caps = find_identity_fallback(state.text)
+        node_id = node_id or fallback_node
+        role = role or fallback_role
+        caps = caps or (fallback_caps or "")
 
         port_ok = (
             node_id == item["node_id"] and

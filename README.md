@@ -50,7 +50,7 @@ This is still an MCU-oriented runtime, not a Linux multi-process agent framework
 - Structured weather lookup through Amap WebService, with Nanjing Qixia District as the default location when configured
 - Hardware tools for GPIO, WS2812, servo, MAX98357, AHT10/AHT20, SGP30, BH1750/GY-30, HC-SR05, and environment readings
 - Runtime skill guidance for protocol-manifest based hardware extension over I2C/IIC, SPI, UART, RS485/Modbus RTU, CAN/TWAI, GPIO, PWM, ADC, 1-Wire, I2S/PDM, RMT/IR, USB CDC, SDIO/SDMMC, and BLE GATT, with clear driver-vs-manifest boundaries
-- `virtual_device_read` runtime extension: read-only I2C, UART query, Modbus RTU register-read, SPI transfer-read, ADC one-shot, and GPIO input manifests under `/spiffs/devices/*.json`
+- `virtual_device_read` runtime extension: read-only I2C, UART query, Modbus RTU register-read, SPI transfer-read, ADC one-shot, and GPIO input manifests under `/spiffs/devices/*.json`; I2C decoder whitelist includes raw integer decoders and `aht20_temp_humidity`
 - `virtual_device_control` runtime extension: bounded GPIO output, relay, `pwm_output`, and `ledc_pwm` manifests with allowlist, cooldown, duration, background safe-state restore, Mesh Guardian policy, and Control Agent local verification
 - Developer manifest toolchain: `schemas/device_manifest.schema.json` and `tools/manifest_lint.py --dry-run`, `--support-matrix`, `--init-template`, and `--write-signatures`
 - Manifest trust check: `manifest_version=1`, `permissions`, role/risk consistency, and `<device>.json.sha256` sidecar verification; control manifests require a matching SHA-256 sidecar before execution
@@ -269,7 +269,7 @@ For a four-ESP32 setup, use the same codebase and assign each board a different 
 ```text
 esp32s3-coordinator-01  coordinator_agent  coordinator,communication,llm,dispatch,timeline,alerts
 esp32s3-sensor-01       sensor_agent       sensor,telemetry,environment,air_quality,light,presence
-esp32s3-control-01      control_agent      control,gpio,rgb,servo,relay,actuator
+esp32s3-control-01      control_agent      control,gpio,ws2812,status_light,servo,relay,actuator
 esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audit,watchdog,stateboard
 ```
 

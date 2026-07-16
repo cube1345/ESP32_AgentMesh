@@ -16,6 +16,7 @@ import type {
   AgentNode,
   DashboardPayload,
   EnvironmentMetric,
+  RuntimeDeviceManifestRecord,
   RuntimeSkillRecord,
   SkillDraft,
   TimelineEvent,
@@ -257,8 +258,8 @@ interface SkillsProps {
   drafts: SkillDraft[];
   active: SkillDraft | null;
   activeId: string;
-  editorMode: 'draft' | 'runtime';
-  setEditorMode: (mode: 'draft' | 'runtime') => void;
+  editorMode: 'draft' | 'runtime' | 'device';
+  setEditorMode: (mode: 'draft' | 'runtime' | 'device') => void;
   setActiveId: (id: string) => void;
   patchSkill: (patch: Partial<SkillDraft>) => void;
   canEdit: boolean;
@@ -276,6 +277,15 @@ interface SkillsProps {
   savingRuntime: boolean;
   runtimeSource: 'local_mock' | 'proxy' | 'serial';
   runtimeError: string;
+  runtimeDevices: RuntimeDeviceManifestRecord[];
+  activeRuntimeDevice: RuntimeDeviceManifestRecord | null;
+  activeRuntimeDeviceId: string;
+  setActiveRuntimeDeviceId: (id: string) => void;
+  patchRuntimeDevice: (patch: Partial<RuntimeDeviceManifestRecord>) => void;
+  saveRuntimeDevice: () => void;
+  savingRuntimeDevice: boolean;
+  runtimeDeviceSource: 'local_mock' | 'proxy' | 'serial';
+  runtimeDeviceError: string;
   refresh: () => void;
 }
 
@@ -303,6 +313,15 @@ export function SkillsView(props: SkillsProps) {
     savingRuntime,
     runtimeSource,
     runtimeError,
+    runtimeDevices,
+    activeRuntimeDevice,
+    activeRuntimeDeviceId,
+    setActiveRuntimeDeviceId,
+    patchRuntimeDevice,
+    saveRuntimeDevice,
+    savingRuntimeDevice,
+    runtimeDeviceSource,
+    runtimeDeviceError,
     refresh
   } = props;
   const runtimeSourceLabel = runtimeError
@@ -310,6 +329,13 @@ export function SkillsView(props: SkillsProps) {
     : runtimeSource === 'serial'
       ? '串口实时'
       : runtimeSource === 'proxy'
+        ? '网关代理'
+        : '本地演示';
+  const runtimeDeviceSourceLabel = runtimeDeviceError
+    ? '连接不可用'
+    : runtimeDeviceSource === 'serial'
+      ? '串口实时'
+      : runtimeDeviceSource === 'proxy'
         ? '网关代理'
         : '本地演示';
 
@@ -348,6 +374,23 @@ export function SkillsView(props: SkillsProps) {
               <i className={item.content ? 'is-enabled' : ''} />
             </button>
           )) : <p className="studio-list-note">当前未读取到 Runtime Skill</p>}
+
+          <div className="studio-list-divider">
+            <span>Devices</span>
+            <button onClick={refresh} aria-label="刷新 Device Manifests"><ReloadOutlined /></button>
+          </div>
+          {runtimeDeviceError ? (
+            <p className="studio-list-note">{runtimeErrorLabel(runtimeDeviceError)}</p>
+          ) : runtimeDevices.length ? runtimeDevices.map((item) => (
+            <button
+              key={item.manifestName}
+              className={`skill-select runtime-select ${editorMode === 'device' && item.manifestName === activeRuntimeDeviceId ? 'is-active' : ''}`}
+              onClick={() => { setEditorMode('device'); setActiveRuntimeDeviceId(item.manifestName); }}
+            >
+              <span><strong>{item.manifestName}</strong><small>{item.protocol} · {item.role}</small></span>
+              <i className={item.content ? 'is-enabled' : ''} />
+            </button>
+          )) : <p className="studio-list-note">当前未读取到 Device Manifest</p>}
         </aside>
         <section className="studio-editor">
           {editorMode === 'draft' ? (
@@ -374,7 +417,7 @@ export function SkillsView(props: SkillsProps) {
                 </Form>
               ) : <Empty description="没有可编辑的 Skill 草稿" />}
             </>
-          ) : (
+          ) : editorMode === 'runtime' ? (
             <>
               <div className="section-heading">
                 <div><span>Runtime Editor</span><h2>{activeRuntime?.title || '选择一个 Runtime Skill'}</h2></div>
@@ -407,12 +450,51 @@ export function SkillsView(props: SkillsProps) {
                 </Form>
               ) : <Empty description="没有可编辑的 Runtime Skill" />}
             </>
+          ) : (
+            <>
+              <div className="section-heading">
+                <div><span>Device Manifest</span><h2>{activeRuntimeDevice?.manifestName || '选择一个 Device Manifest'}</h2></div>
+                <div className="section-actions">
+                  <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
+                  <Button type="primary" icon={<SaveOutlined />} onClick={saveRuntimeDevice} loading={savingRuntimeDevice} disabled={!canEdit || !activeRuntimeDevice}>保存到上位机/板端</Button>
+                </div>
+              </div>
+              {activeRuntimeDevice ? (
+                <Form layout="vertical" className="skill-form">
+                  <div className="field-grid">
+                    <Form.Item label="Manifest 文件名"><Input value={activeRuntimeDevice.manifestName} disabled /></Form.Item>
+                    <Form.Item label="协议"><Input value={activeRuntimeDevice.protocol} disabled /></Form.Item>
+                  </div>
+                  <div className="runtime-detail-grid">
+                    <span>Source：{activeRuntimeDevice.source}</span>
+                    <span>Role：{activeRuntimeDevice.role}</span>
+                    <span>Risk：{activeRuntimeDevice.risk}</span>
+                    <span>Path：{activeRuntimeDevice.path}</span>
+                    <span>Signature：{activeRuntimeDevice.signaturePath}</span>
+                    <span>Status：{activeRuntimeDevice.status}</span>
+                  </div>
+                  {activeRuntimeDevice.lastMessage ? <p className="studio-list-note">{activeRuntimeDevice.lastMessage}</p> : null}
+                  <Form.Item label="Device Manifest JSON">
+                    <Input.TextArea
+                      rows={20}
+                      value={activeRuntimeDevice.content || ''}
+                      onChange={(event) => patchRuntimeDevice({ content: event.target.value })}
+                      disabled={!canEdit}
+                      placeholder={'{\n  "manifest_version": 1,\n  "name": "aht20_manifest",\n  "protocol": "i2c"\n}'}
+                    />
+                  </Form.Item>
+                </Form>
+              ) : <Empty description="没有可编辑的 Device Manifest" />}
+            </>
           )}
         </section>
       </div>
       <section className="runtime-band">
-        <div><span>Runtime Skills</span><strong>{runtimeSourceLabel}</strong></div>
-        <div className="runtime-list">{runtimeError ? <em>{runtimeErrorLabel(runtimeError)}</em> : runtimeSkills.length ? runtimeSkills.map((item) => <span key={item.id || item.runtimeName}>{item.title}<small>{item.status}</small></span>) : <em>当前未读取到 Runtime Skill</em>}</div>
+        <div><span>Runtime Assets</span><strong>{runtimeSourceLabel} / {runtimeDeviceSourceLabel}</strong></div>
+        <div className="runtime-list">
+          {runtimeError ? <em>{runtimeErrorLabel(runtimeError)}</em> : runtimeSkills.length ? runtimeSkills.slice(0, 8).map((item) => <span key={item.id || item.runtimeName}>{item.title}<small>{item.status}</small></span>) : <em>未读取到 Runtime Skill</em>}
+          {runtimeDeviceError ? <em>{runtimeErrorLabel(runtimeDeviceError)}</em> : runtimeDevices.length ? runtimeDevices.slice(0, 8).map((item) => <span key={item.id || item.manifestName}>{item.manifestName}<small>{item.protocol}</small></span>) : <em>未读取到 Device Manifest</em>}
+        </div>
         <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
       </section>
     </div>

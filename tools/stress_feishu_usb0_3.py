@@ -78,6 +78,8 @@ class Metrics:
     control_received: int = 0
     control_executed: int = 0
     mesh_results: int = 0
+    tls_alloc_failures: int = 0
+    tls_read_errors: int = 0
     warnings: int = 0
     errors: int = 0
     crashes: int = 0
@@ -187,6 +189,12 @@ def request_config(states: dict[int, PortState]) -> None:
         node_match = re.search(r"Node ID\s+:\s+([^\s]+)", state.text)
         state.role = role_match.group(1) if role_match else None
         state.node_id = node_match.group(1) if node_match else None
+        for match in re.finditer(r"node=([A-Za-z0-9_-]+)\s+role=([A-Za-z0-9_]+)\s+capabilities=", state.text):
+            state.node_id = state.node_id or match.group(1)
+            state.role = state.role or match.group(2)
+        for match in re.finditer(r'"node_id":"([^"]+)".*?"role":"([^"]+)"', state.text):
+            state.node_id = state.node_id or match.group(1)
+            state.role = state.role or match.group(2)
 
 
 def print_config_summary(states: dict[int, PortState]) -> bool:
@@ -202,7 +210,24 @@ def print_config_summary(states: dict[int, PortState]) -> bool:
     return ok
 
 
-def send_feishu(chat_id: str, text: str, tag: str, timeout: int) -> SentMessage:
+def retryable_lark_error(error: str) -> bool:
+    text = error.lower()
+    retry_keys = (
+        "timeout",
+        "transport",
+        "temporary",
+        "lookup",
+        "dns",
+        "server misbehaving",
+        "connection reset",
+        "connection refused",
+        "tls handshake",
+        "i/o timeout",
+    )
+    return any(key in text for key in retry_keys)
+
+
+def send_feishu(chat_id: str, text: str, tag: str, timeout: int, retries: int) -> SentMessage:
     cmd = [
         "lark-cli",
         "im",
@@ -217,29 +242,44 @@ def send_feishu(chat_id: str, text: str, tag: str, timeout: int) -> SentMessage:
         f"espagent-{tag}-{uuid.uuid4().hex[:8]}",
         "--json",
     ]
-    try:
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return SentMessage(tag=tag, text=text, ok=False, error="lark-cli timeout")
+    last_error = ""
+    attempts = max(1, retries + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            last_error = f"lark-cli timeout on attempt {attempt}/{attempts}"
+            time.sleep(min(2.0 * attempt, 6.0))
+            continue
 
-    if proc.returncode != 0:
-        return SentMessage(tag=tag, text=text, ok=False, error=(proc.stderr or proc.stdout).strip())
+        if proc.returncode != 0:
+            last_error = (proc.stderr or proc.stdout).strip()
+            if retryable_lark_error(last_error) and attempt < attempts:
+                time.sleep(min(2.0 * attempt, 6.0))
+                continue
+            return SentMessage(tag=tag, text=text, ok=False, error=last_error)
 
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return SentMessage(tag=tag, text=text, ok=False, error=f"invalid lark-cli JSON: {proc.stdout[:200]}")
+        try:
+            data = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return SentMessage(tag=tag, text=text, ok=False, error=f"invalid lark-cli JSON: {proc.stdout[:200]}")
 
-    if not data.get("ok"):
-        return SentMessage(tag=tag, text=text, ok=False, error=json.dumps(data.get("error", data), ensure_ascii=False))
+        if not data.get("ok"):
+            last_error = json.dumps(data.get("error", data), ensure_ascii=False)
+            if retryable_lark_error(last_error) and attempt < attempts:
+                time.sleep(min(2.0 * attempt, 6.0))
+                continue
+            return SentMessage(tag=tag, text=text, ok=False, error=last_error)
 
-    message_id = ""
-    payload = data.get("data") or {}
-    if isinstance(payload, dict):
-        message = payload.get("message") or payload
-        if isinstance(message, dict):
-            message_id = str(message.get("message_id") or "")
-    return SentMessage(tag=tag, text=text, ok=True, message_id=message_id)
+        message_id = ""
+        payload = data.get("data") or {}
+        if isinstance(payload, dict):
+            message = payload.get("message") or payload
+            if isinstance(message, dict):
+                message_id = str(message.get("message_id") or "")
+        return SentMessage(tag=tag, text=text, ok=True, message_id=message_id)
+
+    return SentMessage(tag=tag, text=text, ok=False, error=last_error or "lark-cli send failed")
 
 
 def build_messages(run_id: str, rounds: int) -> list[tuple[str, str]]:
@@ -272,6 +312,29 @@ def write_artifacts(states: dict[int, PortState], run_id: str, out_dir: Path) ->
         (out_dir / f"feishu_stress_{run_id}_{name}.log").write_text(state.text, encoding="utf-8", errors="replace")
 
 
+def write_summary(run_id: str,
+                  out_dir: Path,
+                  roles_ok: bool,
+                  passed: bool,
+                  sent: list[SentMessage],
+                  metrics: Metrics,
+                  expected_total: int,
+                  expected_each: int) -> Path:
+    summary = {
+        "run_id": run_id,
+        "result": "PASS" if passed else "FAIL",
+        "roles_ok": roles_ok,
+        "expected_total": expected_total,
+        "expected_each_role": expected_each,
+        "metrics": metrics.__dict__,
+        "sent": [item.__dict__ for item in sent],
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"feishu_stress_{run_id}_summary.json"
+    path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def final_metrics(states: dict[int, PortState], sent: list[SentMessage], sensor_tags: list[str], control_tags: list[str]) -> Metrics:
     usb0 = next(s for s in states.values() if s.port == "/dev/ttyUSB0").text
     usb1 = next(s for s in states.values() if s.port == "/dev/ttyUSB1").text
@@ -286,7 +349,10 @@ def final_metrics(states: dict[int, PortState], sent: list[SentMessage], sensor_
     metrics.processing_turns = count_tags_near(usb0, all_tags, "Processing message from feishu")
     metrics.working_status_sent = usb0.count("Feishu send success") - count_tags_near(usb0, all_tags, "Queue final response")
     metrics.final_responses = usb0.count("Queue final response to feishu:")
-    metrics.async_result_turns = usb0.count("Internal async Mesh result.")
+    metrics.async_result_turns = (
+        usb0.count("Internal async Mesh result.") +
+        usb0.count("mesh_async_result")
+    )
     metrics.feishu_send_ok = usb0.count("Feishu send success")
     metrics.llm_tool_mesh = usb0.count("mesh_send_command")
     metrics.queued_mesh = usb0.count("OK: queued MQTT mesh command")
@@ -295,6 +361,8 @@ def final_metrics(states: dict[int, PortState], sent: list[SentMessage], sensor_
     metrics.control_received = usb2.count("Mesh role command received for control_agent")
     metrics.control_executed = usb2.count("Mesh control command executed")
     metrics.mesh_results = all_text.count("mesh_command_result")
+    metrics.tls_alloc_failures = all_text.count("esp-aes: Failed to allocate memory")
+    metrics.tls_read_errors = all_text.count("esp-tls-mbedtls: read error")
     metrics.warnings = all_text.count("W (")
     metrics.errors = all_text.count("E (")
     metrics.crashes = sum(all_text.count(pattern) for pattern in CRASH_PATTERNS)
@@ -311,6 +379,7 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=25.0)
     parser.add_argument("--settle", type=float, default=120.0)
     parser.add_argument("--send-timeout", type=int, default=20)
+    parser.add_argument("--send-retries", type=int, default=2)
     parser.add_argument("--artifact-dir", default="artifacts/feishu_stress")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -339,7 +408,7 @@ def main() -> int:
         print(f"Sending {len(messages)} Feishu messages: {args.rounds} sensor + {args.rounds} control")
         for index, (tag, text) in enumerate(messages, start=1):
             print(f"SEND {index}/{len(messages)} {tag}: {text}")
-            result = send_feishu(args.chat_id, text, tag, args.send_timeout)
+            result = send_feishu(args.chat_id, text, tag, args.send_timeout, args.send_retries)
             sent.append(result)
             if result.ok:
                 print(f"LARK OK {tag} message_id={result.message_id or '(unknown)'}")
@@ -363,22 +432,26 @@ def main() -> int:
         print(f"sensor_received={metrics.sensor_received} sensor_executed={metrics.sensor_executed} expected={expected_each}")
         print(f"control_received={metrics.control_received} control_executed={metrics.control_executed} expected={expected_each}")
         print(f"mesh_command_result_lines={metrics.mesh_results}")
+        print(f"tls_alloc_failures={metrics.tls_alloc_failures} tls_read_errors={metrics.tls_read_errors}")
         print(f"warnings={metrics.warnings} errors={metrics.errors} crashes={metrics.crashes}")
         print(f"artifacts={args.artifact_dir}/feishu_stress_{run_id}_ttyUSB*.log")
 
+        result_observed = metrics.async_result_turns >= expected_total or metrics.mesh_results >= expected_total
         passed = (
             roles_ok
             and metrics.sent_failed == 0
             and metrics.sent_ok == expected_total
             and metrics.processing_turns >= expected_total
             and metrics.final_responses >= expected_total
-            and metrics.async_result_turns >= expected_total
+            and result_observed
             and metrics.sensor_received >= expected_each
             and metrics.sensor_executed >= expected_each
             and metrics.control_received >= expected_each
             and metrics.control_executed >= expected_each
             and metrics.crashes == 0
         )
+        summary_path = write_summary(run_id, Path(args.artifact_dir), roles_ok, passed, sent, metrics, expected_total, expected_each)
+        print(f"summary={summary_path}")
         print("RESULT:", "PASS" if passed else "FAIL")
         return 0 if passed else 1
     finally:

@@ -124,7 +124,7 @@ espagent/alerts
 ```text
 esp32s3-coordinator-01  coordinator_agent  coordinator,communication,llm,dispatch,timeline,alerts
 esp32s3-sensor-01       sensor_agent       sensor,telemetry,environment,air_quality,light,presence
-esp32s3-control-01      control_agent      control,gpio,rgb,servo,relay,actuator
+esp32s3-control-01      control_agent      control,gpio,ws2812,status_light,servo,relay,actuator
 esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audit,watchdog,stateboard
 ```
 

@@ -72,6 +72,8 @@ static automation_rule_t s_rules[AUTOMATION_MAX_RULES];
 static SemaphoreHandle_t s_lock = NULL;
 static TaskHandle_t s_task = NULL;
 
+#define AUTOMATION_PERSIST_STACK 4096
+
 static void lock(void)
 {
     if (s_lock) {
@@ -436,6 +438,37 @@ static esp_err_t persist_rules_locked(void)
     return ESP_OK;
 }
 
+static void persist_rules_task(void *arg)
+{
+    (void)arg;
+    lock();
+    esp_err_t err = persist_rules_locked();
+    unlock();
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "Async automation rule persist failed: %s", esp_err_to_name(err));
+    }
+    vTaskDelete(NULL);
+}
+
+static esp_err_t schedule_rules_persist(void)
+{
+    BaseType_t ok = xTaskCreatePinnedToCore(persist_rules_task,
+                                           "auto_persist",
+                                           AUTOMATION_PERSIST_STACK,
+                                           NULL,
+                                           3,
+                                           NULL,
+                                           0);
+    if (ok != pdPASS) {
+        ESP_LOGW(TAG,
+                 "Async automation rule persist task create failed (free_internal=%u largest_internal=%u)",
+                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
 static esp_err_t load_rules_locked(void)
 {
     FILE *f = fopen(ESPAGENT_AUTOMATION_FILE, "r");
@@ -516,20 +549,21 @@ static esp_err_t load_rules_locked(void)
     return ESP_OK;
 }
 
-static esp_err_t remove_rule_slot_locked(int slot, const char *reason)
+static esp_err_t clear_rule_slot_locked(int slot, const char *reason, char *id_out, size_t id_out_size)
 {
     if (slot < 0 || slot >= AUTOMATION_MAX_RULES || !s_rules[slot].used) {
         return ESP_ERR_NOT_FOUND;
     }
     char id[sizeof(s_rules[slot].id)] = {0};
     snprintf(id, sizeof(id), "%s", s_rules[slot].id);
+    if (id_out && id_out_size > 0) {
+        snprintf(id_out, id_out_size, "%s", id);
+    }
     memset(&s_rules[slot], 0, sizeof(s_rules[slot]));
-    esp_err_t err = persist_rules_locked();
-    ESP_LOGI(TAG, "Auto-removed automation rule %s after %s: %s",
+    ESP_LOGI(TAG, "Auto-cleared automation rule %s after %s",
              id,
-             reason && reason[0] ? reason : "completion",
-             esp_err_to_name(err));
-    return err;
+             reason && reason[0] ? reason : "completion");
+    return ESP_OK;
 }
 
 static void publish_rule_event(const automation_rule_t *rule,
@@ -728,16 +762,28 @@ static void rule_task(void *arg)
                                "act",
                                action_err == ESP_OK ? "ok" : "error",
                                action_output[0] ? action_output : "automation rule action executed");
+            bool removed = false;
+            char removed_id[sizeof(snapshot.id)] = {0};
             lock();
             if (s_rules[i].used && strcmp(s_rules[i].id, snapshot.id) == 0) {
-                esp_err_t remove_err = remove_rule_slot_locked(i, "first branch action");
-                if (remove_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to persist auto-remove for rule %s: %s",
+                esp_err_t clear_err = clear_rule_slot_locked(i, "first branch action", removed_id, sizeof(removed_id));
+                if (clear_err == ESP_OK) {
+                    removed = true;
+                } else {
+                    ESP_LOGW(TAG, "Failed to auto-clear rule %s: %s",
                              snapshot.id,
-                             esp_err_to_name(remove_err));
+                             esp_err_to_name(clear_err));
                 }
             }
             unlock();
+            if (removed) {
+                esp_err_t persist_err = schedule_rules_persist();
+                if (persist_err != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to schedule persist for auto-cleared rule %s: %s",
+                             removed_id[0] ? removed_id : snapshot.id,
+                             esp_err_to_name(persist_err));
+                }
+            }
             publish_rule_event(&snapshot,
                                "cleanup",
                                "ok",

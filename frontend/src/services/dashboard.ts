@@ -3,6 +3,9 @@ import type { AxiosError } from 'axios';
 import { mockDashboardPayload } from '../data/mock';
 import type {
   DashboardPayload,
+  RuntimeDeviceManifestListResponse,
+  RuntimeDeviceManifestRecord,
+  RuntimeDeviceManifestUpdateResponse,
   RuntimeSkillInstallResponse,
   RuntimeSkillListResponse,
   RuntimeSkillRecord,
@@ -47,6 +50,14 @@ function isRuntimeSkillListResponse(value: unknown): value is RuntimeSkillListRe
 }
 
 function isRuntimeSkillInstallResponse(value: unknown): value is RuntimeSkillInstallResponse {
+  return isObject(value) && typeof value.ok === 'boolean';
+}
+
+function isRuntimeDeviceManifestListResponse(value: unknown): value is RuntimeDeviceManifestListResponse {
+  return isObject(value) && Array.isArray(value.devices);
+}
+
+function isRuntimeDeviceManifestUpdateResponse(value: unknown): value is RuntimeDeviceManifestUpdateResponse {
   return isObject(value) && typeof value.ok === 'boolean';
 }
 
@@ -151,6 +162,48 @@ export async function updateRuntimeSkill(
       ok: false,
       source: 'local_mock',
       message: 'runtime skill update request failed',
+      error: errorMessage(error)
+    };
+  }
+}
+
+export async function fetchRuntimeDeviceManifests(): Promise<RuntimeDeviceManifestListResponse> {
+  try {
+    const response = await api.get<RuntimeDeviceManifestListResponse>('/devices/runtime', {
+      timeout: 25000
+    });
+    return isRuntimeDeviceManifestListResponse(response.data)
+      ? response.data
+      : { devices: [], source: 'local_mock' };
+  } catch {
+    return { devices: [], source: 'local_mock' };
+  }
+}
+
+export async function updateRuntimeDeviceManifest(
+  device: RuntimeDeviceManifestRecord,
+  confirmed = true
+): Promise<RuntimeDeviceManifestUpdateResponse> {
+  try {
+    const response = await api.post<RuntimeDeviceManifestUpdateResponse>('/devices/runtime', {
+      device,
+      confirmed
+    }, {
+      timeout: 30000
+    });
+    return isRuntimeDeviceManifestUpdateResponse(response.data)
+      ? response.data
+      : {
+          ok: false,
+          source: 'local_mock',
+          message: 'invalid device manifest update response',
+          error: 'invalid device manifest update response'
+        };
+  } catch (error) {
+    return {
+      ok: false,
+      source: 'local_mock',
+      message: 'device manifest update request failed',
       error: errorMessage(error)
     };
   }

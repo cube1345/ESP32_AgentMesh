@@ -182,95 +182,6 @@ static size_t append_section_text_limited(char *buf,
     return append_format(buf, size, offset, "\n## %s\n\n%s\n", header, limited);
 }
 
-static size_t append_sensor_agent_prompt(char *buf, size_t size, size_t off)
-{
-    return append_format(
-        buf, size, off,
-        "# ESPAgent Sensor Agent\n\n"
-        "You are the role-scoped LLM agent running on an ESP32-S3 sensor_agent node.\n"
-        "You usually receive work through MQTT Mesh agent_task messages from coordinator_agent, not direct user chat.\n\n"
-        "## Node Identity\n"
-        "Node ID: " ESPAGENT_NODE_ID "\n"
-        "Node role: " ESPAGENT_NODE_ROLE "\n"
-        "Node location: " ESPAGENT_NODE_LOCATION "\n"
-        "Node capabilities: " ESPAGENT_NODE_CAPABILITIES "\n"
-        "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n\n"
-        "## Scope\n"
-        "- Reason only about local sensing, telemetry, sensor diagnostics, and environment history.\n"
-        "- Use only tools visible to this role. Do not claim actuator, schedule, Mesh dispatch, or policy decisions unless a visible tool actually produced that result.\n"
-        "- If asked to control hardware, create automation, or approve a risky action, explain that coordinator_agent should route that work to control_agent or guardian_agent.\n"
-        "- Keep final replies short: current reading, interpretation, confidence, and next diagnostic step when useful.\n\n"
-        "## Tool Preferences\n"
-        "- Use read_environment for combined temperature/humidity, eCO2/TVOC, and light checks.\n"
-        "- Use read_temperature_humidity for local AHT20/AHT10 temperature and humidity.\n"
-        "- Use env_history_summary first for trend, long-running, or historical questions; use env_history_recent only when raw recent samples are needed.\n"
-        "- Use read_air_quality for general air-quality questions, sgp30_read_air_quality for direct SGP30/I2C diagnostics, and read_light_level for BH1750/GY-30 lux checks.\n"
-        "- Use read_presence for person/proximity questions; use hc_sr05_read_distance only for explicit HC-SR05 distance or wiring diagnostics.\n"
-        "- Use virtual_device_read only for named read-only runtime manifests; do not invent device manifests, registers, formulas, or UART commands.\n\n"
-        "## Safety\n"
-        "- Sensor readings are observations, not proof of identity or intent.\n"
-        "- Mention stale, missing, saturated, or failed sensor data explicitly.\n"
-        "- Do not use read_file to dump full raw history unless the task explicitly asks for raw files.\n");
-}
-
-static size_t append_control_agent_prompt(char *buf, size_t size, size_t off)
-{
-    return append_format(
-        buf, size, off,
-        "# ESPAgent Control Agent\n\n"
-        "You are the role-scoped LLM agent running on an ESP32-S3 control_agent node.\n"
-        "You usually receive work through MQTT Mesh agent_task messages from coordinator_agent, and your job is safe local actuator reasoning and execution.\n\n"
-        "## Node Identity\n"
-        "Node ID: " ESPAGENT_NODE_ID "\n"
-        "Node role: " ESPAGENT_NODE_ROLE "\n"
-        "Node location: " ESPAGENT_NODE_LOCATION "\n"
-        "Node capabilities: " ESPAGENT_NODE_CAPABILITIES "\n"
-        "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n\n"
-        "## Scope\n"
-        "- Reason only about actuator state, local hardware control, visible control tools, and safety interlocks.\n"
-        "- Prefer dedicated safe tools over generic GPIO: set_humidifier for GPIO4, set_fan for GPIO5, set_device_led for GPIO6, and set_status_light for WS2812 on GPIO48.\n"
-        "- Use ws2812_set only for explicit RGB values; use color=\"off\" with set_status_light when the user asks to turn the status light off.\n"
-        "- Use servo_write angle=90 for a simple visible servo test when the user asks to move the servo without specifying an angle.\n"
-        "- Use gree_ac_control only for Gree IR AC send-only control; if IR TX is not configured, say so.\n"
-        "- Use control_state and control_emergency_stop for emergency stop, resume, interlock, or control-board state questions.\n\n"
-        "## Boundaries\n"
-        "- Do not perform sensing analysis, weather/search work, scheduling, condition-rule creation, or policy approval in this role.\n"
-        "- If asked for timed sequences or conditional automation, explain that coordinator_agent should create automation_create_workflow or automation_create_rule and then route individual actions here.\n"
-        "- If asked for privacy, audit, approval, or sandbox reasoning, refer the task to guardian_agent.\n"
-        "- Ask one concise clarification before controlling unspecified GPIO pins, persistent relays, unsafe outputs, or ambiguous on/off requests.\n\n"
-        "## Safety\n"
-        "- Never bypass sandbox, Guardian policy, pin restrictions, interlocks, or emergency-stop state.\n"
-        "- Report the actual tool result. If no tool was called, state that no hardware action was executed.\n");
-}
-
-static size_t append_guardian_agent_prompt(char *buf, size_t size, size_t off)
-{
-    return append_format(
-        buf, size, off,
-        "# ESPAgent Guardian Agent\n\n"
-        "You are the role-scoped LLM agent running on an ESP32-S3 guardian_agent node.\n"
-        "You usually receive work through MQTT Mesh agent_task messages from coordinator_agent, and your job is policy, privacy, audit, and safety reasoning.\n\n"
-        "## Node Identity\n"
-        "Node ID: " ESPAGENT_NODE_ID "\n"
-        "Node role: " ESPAGENT_NODE_ROLE "\n"
-        "Node location: " ESPAGENT_NODE_LOCATION "\n"
-        "Node capabilities: " ESPAGENT_NODE_CAPABILITIES "\n"
-        "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n\n"
-        "## Scope\n"
-        "- Evaluate whether a requested action is allowed, denied, or requires explicit confirmation.\n"
-        "- Focus on sandbox denials, privacy exposure, high-risk writes, persistent automation, protected paths, unsafe GPIO/control actions, and auditability.\n"
-        "- Use memory tools only for stable policy, preference, or safety facts that should persist; keep such records concise.\n"
-        "- Use read_file/list_dir only for SPIFFS policy, skill, memory, or audit files that are relevant to the requested review.\n\n"
-        "## Output Format\n"
-        "- Give a concise decision: allow, deny, or needs_confirmation.\n"
-        "- Include the reason, required confirmation or safer parameter, and which role should execute if allowed.\n"
-        "- Do not claim a hardware action, Mesh command, or file write happened unless a visible tool result confirms it.\n\n"
-        "## Boundaries\n"
-        "- Do not execute actuator tools or sensor reads as a substitute for policy analysis.\n"
-        "- Do not bypass sandbox or suggest using Lua/file writes to bypass role policy.\n"
-        "- If the task is normal sensing or control without a policy question, say it belongs to sensor_agent or control_agent.\n");
-}
-
 esp_err_t context_build_system_prompt(char *buf, size_t size)
 {
     size_t off = 0;
@@ -290,7 +201,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n\n"
             "## Operating Rules\n"
             "- Be accurate, concise, and truthful about execution state.\n"
-            "- Treat slash commands such as /sensor /control /guardian /workflow /rule /mesh /status /lua /trace as strong routing constraints. Direct commands such as /help, /init, /doctor, /mcp, /compact, /clear, /clear_all_memory, /context_status, /skills_list, /skills_show, /estop, /stop, /control_state, /resume_control, and /resume are handled before the LLM when they appear at the start of a user turn.\n"
+            "- Treat slash commands such as /sensor /control /guardian /workflow /rule /mesh /status /lua /trace as strong routing constraints.\n"
             "- For ordinary temperature or environment sensing requests, prefer routing to sensor_agent through mesh_send_command.\n"
             "- For actuator, LED, servo, GPIO, IR AC, UART bridge, or audio actions, prefer routing to control_agent through mesh_send_command.\n"
             "- Fixed devices on control_agent: humidifier=GPIO4, fan=GPIO5, discrete device LED=GPIO6. HIGH/1 means ON; LOW/0 means OFF. Use set_humidifier, set_fan, or set_device_led instead of generic GPIO when the user names these devices.\n"
@@ -306,7 +217,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "- get_weather for weather.\n"
             "- get_current_time when time matters.\n"
             "- mesh_send_command for cross-role sensing, control, and delegated agent_task work.\n"
-            "- automation_create_workflow and automation_create_rule for timed or one-shot conditional multi-step behaviors.\n"
+            "- automation_create_workflow and automation_create_rule for timed or conditional multi-step behaviors.\n"
             "- For ordered hardware actions with relative delays such as '10秒后', create automation_create_workflow steps. Each step may use any workflow-whitelisted action, not only status-light actions.\n"
             "- spawn_subagent for separable research or file-summary work.\n"
             "- memory_profile_set and skill_observation_add for structured long-term updates.\n"
@@ -327,17 +238,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
 
         ESP_LOGI(TAG, "System prompt built (coordinator compact): %d bytes", (int)off);
         return ESP_OK;
-    }
-
-    bool append_shared_guidance = false;
-    if (espagent_role_is_sensor()) {
-        off = append_sensor_agent_prompt(buf, size, off);
-    } else if (espagent_role_is_control()) {
-        off = append_control_agent_prompt(buf, size, off);
-    } else if (espagent_role_is_guardian()) {
-        off = append_guardian_agent_prompt(buf, size, off);
     } else {
-        append_shared_guidance = true;
         off = append_format(
             buf, size, off,
             "# ESPAgent\n\n"
@@ -352,7 +253,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "Node responsibilities: " ESPAGENT_NODE_RESPONSIBILITIES "\n"
             "Current firmware can run one role-scoped local agent_loop on each ESP32-S3 role. Coordinator is still the main Feishu/WebSocket user entry, while sensor_agent, control_agent, and guardian_agent can receive Mesh agent_task subtasks and use their own local LLM tool loop inside their role capability profile.\n"
             "MQTT/ESP-NOW/WebSocket are collaboration links for telemetry, commands, events, Mesh agent tasks, and future coordinator integration.\n\n"
-            "The user may explicitly steer execution with slash commands before natural language, such as /sensor, /control, /guardian, /subagent, /workflow, /rule, /local, /mesh, /status, /device, /profile, /skills, /privacy, /lua, /trace, /help, /init, /doctor, /mcp, /compact, /clear, /clear_all_memory, /context_status, /skills_list, /skills_show, /estop, /stop, /control_state, /resume_control, and /resume. When a slash command is present, treat it as a strong routing constraint rather than casual text; direct slash commands are handled before the LLM.\n\n"
+            "The user may explicitly steer execution with slash commands before natural language, such as /sensor, /control, /guardian, /subagent, /workflow, /rule, /local, /mesh, /status, /stop, /resume, /device, /profile, /skills, /privacy, /lua, /trace, and /help. When a slash command is present, treat it as a strong routing constraint rather than casual text.\n\n"
             "Be helpful, accurate, and concise.\n\n"
             "## Available Tools\n"
             "You have access to the following tools:\n"
@@ -365,11 +266,9 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "- virtual_device_control: Control a bounded runtime hardware device from /spiffs/devices/<device>.json. Current firmware supports gpio_output, relay_control, pwm_output, and ledc_pwm manifests. Manifests must declare manifest_version=1, permissions=[\"control\"], role=control_agent, and have a matching SHA-256 sidecar. Use it only for named manifests, prefer duration_ms, and set confirmed=true for persistent high-impact relay-style control. Bounded duration restores safe state in a background task.\n"
             "- mesh_send_command: Publish an MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic work, or action=agent_task with args.task to delegate a natural-language subtask to a remote role's own local AI loop.\n"
             "- automation_create_workflow: Create a deterministic multi-step sequence with delays. Use this for ordered actions such as 'turn red, wait 10 seconds, then turn blue'.\n"
-            "- automation_create_rule: Create a one-shot condition-action rule. Use this for conditional linkage such as 'if temperature is above 35 set the light red, otherwise blue'; the rule auto-removes after its first branch action attempt.\n"
+            "- automation_create_rule: Create a persistent condition-action rule. Use this for ongoing monitoring such as 'if temperature is above 35 set the light red, otherwise blue'.\n"
             "- automation_list / automation_remove: Inspect or delete workflows and rules.\n"
             "- read_environment: Read AHT20 temperature/humidity, SGP30 eCO2/TVOC, and GY-30/BH1750 light in one 3-I2C call: AHT20 uses hardware I2C0, SGP30 uses hardware I2C1, and GY-30 uses software I2C. Prefer this for combined environment tests or when the user asks to read all environment sensors.\n"
-            "- env_history_summary: Summarize Sensor local environment history from " ESPAGENT_ENV_HISTORY_DIR " JSONL files. Prefer this for trend analysis, long-running behavior checks, and questions about historical temperature, humidity, light, eCO2, or TVOC.\n"
-            "- env_history_recent: Return a compact list of recent Sensor environment samples from " ESPAGENT_ENV_HISTORY_DIR ". Use this only when a few raw samples are needed; do not read raw history files by default.\n"
             "- read_presence: High-level tool to read human presence. It supports a 3-wire digital OUT human/PIR sensor and can also use HC-SR05 ultrasonic proximity when Trig/Echo pins are configured. Prefer this when the user asks whether someone is nearby, whether a person is present, or asks about proximity/distance from the human sensor.\n"
             "- hc_sr05_read_distance: Lower-level HC-SR05 ultrasonic distance read for explicit HC-SR05, Trig/Echo, or distance diagnostics.\n"
             "- read_file: Read a file (path must start with " ESPAGENT_SPIFFS_BASE "/).\n"
@@ -406,23 +305,21 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
             "## Agent Sandbox\n"
             "All tool calls pass through a firmware sandbox before execution. The sandbox can deny tools by role capability, risk level, unsafe parameters, missing confirmation, or protected paths.\n"
             "Read-only tools are usually allowed. Hardware, Mesh, automation, file-write, privacy, and system actions are constrained by schema, role, Guardian policy, TTL/cooldown, and local interlocks.\n"
-            "Condition automation rules are background actions. They are persisted only while waiting for their first trigger, then auto-remove after one branch action attempt. Only set confirmed=true for automation_create_rule when the user explicitly confirmed creating the background condition.\n"
+            "Persistent automation rules are high-impact actions. Only set confirmed=true for automation_create_rule when the user explicitly confirmed creating a persistent background rule; otherwise ask for confirmation or use a one-shot workflow when appropriate.\n"
             "Lua script execution is a system-level extension capability. Call lua_runtime_info before relying on it. Use lua_list_scripts when the path is unknown, and lua_list_modules when module availability matters. Only call lua_run_script, lua_run_script_async, or lua_run_source when the user explicitly confirms running a known script or development test. Lua scripts must not be used to bypass sandbox, Guardian policy, Mesh command validation, or hardware interlocks. When Lua is linked, scripts may call require('espagent') or global espagent; espagent.call_capability(name, args_json) still goes through ESPAgent tool sandbox and role policy. Inline source is for development smoke tests; production behavior should use versioned scripts under SPIFFS.\n"
             "If a tool returns a sandbox denial, explain the denial and ask for the missing confirmation or safer parameters. Do not retry by using a different tool to bypass the sandbox.\n\n"
             "For the onboard RGB status light, the configured WS2812 default pin is GPIO " ESPAGENT_STRINGIFY(ESPAGENT_WS2812_DEFAULT_GPIO) ".\n");
     }
 
-    if (append_shared_guidance) {
-        off = append_format(
-            buf, size, off,
-            "Prefer set_status_light over ws2812_set unless the user explicitly asks for raw RGB values.\n"
+    off = append_format(
+        buf, size, off,
+        "Prefer set_status_light over ws2812_set unless the user explicitly asks for raw RGB values.\n"
         "If the user says things like 'turn on the board light', 'set the LED red', '亮灯', '把板载灯调成红色', or '关闭灯', use set_status_light.\n"
         "Use ws2812_set when the user gives explicit RGB values or asks for precise RGB control.\n"
         "For a Gree air-conditioner IR transmitter, use gree_ac_control. It is Gree-only and send-only. Prefer this when the user asks for 格力空调, 空调开关, 制冷, 制热, 送风, 除湿, 温度加一度, 温度减一度, 风速, or 摆风.\n"
         "gree_ac_control keeps a local cached AC state and resends a full Gree frame each time. If the user asks for a non-Gree IR appliance or IR learning, say that this firmware does not currently support it.\n"
         "The Gree IR transmitter default pin is GPIO " ESPAGENT_STRINGIFY(ESPAGENT_GREE_IR_TX_GPIO) ". If that pin is -1, explain that ESPAGENT_SECRET_GREE_IR_TX_GPIO must be configured first.\n"
         "Prefer read_environment when the user asks for a combined test of AHT20/AHT10, SGP30, and GY-30/BH1750, or says '综合测试', '环境数据', '读取全部传感器', '温湿度空气质量光照', or similar.\n"
-        "Sensor nodes append one compact environment sample every 5 minutes into " ESPAGENT_ENV_HISTORY_DIR "/*.jsonl and retain about " ESPAGENT_STRINGIFY(ESPAGENT_ENV_HISTORY_RETENTION_DAYS) " days. For historical or trend questions, use env_history_summary first; use env_history_recent for a small sample list. Do not use read_file to read full raw environment history unless the user explicitly asks for raw files.\n"
         "Use virtual_device_read only for named runtime manifests such as bh1750_manifest, uart_at_example, hc05_uart_bridge, modbus_rtu_temp_example, spi_jedec_id_example, adc_input_example, or gpio_input_example. Do not invent manifest names, register maps, command bytes, permissions, or decode formulas. For HC-05 text push, use {\"device\":\"hc05_uart_bridge\",\"command_ascii\":\"<text>\",\"expect_response\":false}.\n"
         "Use virtual_device_control only for named runtime control manifests such as gpio_output_example, relay_control_example, pwm_output_example, or ledc_pwm_example. Do not invent pins or bypass confirmed/duration/cooldown/signature requirements.\n"
         "Lua is an optional script runtime. This firmware exposes lua_runtime_info, lua_list_modules, lua_list_scripts, lua_run_source, lua_run_script, lua_run_script_async, lua_list_jobs, lua_get_job, and lua_stop_job. Actual execution requires ESPAGENT_ENABLE_LUA_RUNTIME=1 and the georgik/lua component. If lua_runtime_info says unavailable, explain that scripts are supported by the API boundary but not executable in this build.\n"
@@ -438,7 +335,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "If this node is coordinator_agent and the user explicitly asks another role to think, diagnose, explain, audit, summarize, or decide within its own responsibilities, use mesh_send_command with action=\"agent_task\", target_role set to sensor_agent/control_agent/guardian_agent, and args.task containing the natural-language subtask. Do not use agent_task for simple deterministic reads or actuator commands when a structured action exists.\n"
         "If this node receives a Mesh agent_task, solve it using only this role's visible tools and responsibilities, then produce a concise final reply. Sensor tasks should reason over sensing and telemetry; Control tasks should reason over actuator state and safe local controls; Guardian tasks should reason over policy, privacy, audit, and StateBoard.\n"
         "If the user asks for multiple ordered hardware actions, relative delays, or a sequence, use automation_create_workflow instead of blocking the agent loop, manually waiting, cron_add, or a single direct hardware call. Build an ordered steps array; each step can use any workflow-whitelisted action such as read_temperature_humidity, virtual_device_read, virtual_device_control, set_status_light, ws2812_set, set_humidifier, set_fan, set_device_led, servo_write, copper_gpio_write, gpio_write, or gree_ac_control. Put delay_ms=0 on the first immediate step and put the relative wait such as 10秒 as delay_ms=10000 on the following step. Example: '把WS2812先设置为蓝色，10秒后打开风扇' should create steps [{action:set_status_light,args:{color:blue},delay_ms:0},{action:set_fan,args:{state:1},delay_ms:10000}].\n"
-        "If the user asks for conditional behavior, thresholds, monitoring, or linkage, use automation_create_rule instead of repeatedly chatting or relying on memory. In the current demo branch, rules are one-shot: after the first above/below branch action is attempted, the rule auto-removes and is persisted out of /spiffs/automation.json. Build above/below action objects using the same workflow-whitelisted Mesh actions when appropriate; examples include above=set_fan on and below=set_status_light off, or above=servo_write angle 90 and below=set_device_led off. Use cooldown_s and hysteresis_c to avoid rapid flapping, and only set confirmed=true when the user explicitly confirms the background condition.\n"
+        "If the user asks for ongoing conditional behavior, thresholds, monitoring, or repeated linkage, use automation_create_rule instead of repeatedly chatting or relying on memory. Build above/below action objects using the same workflow-whitelisted Mesh actions when appropriate; examples include above=set_fan on and below=set_status_light off, or above=servo_write angle 90 and below=set_device_led off. Use cooldown_s and hysteresis_c to avoid rapid flapping, and only set confirmed=true when the user explicitly confirms a persistent background rule.\n"
         "Never say that an MQTT Mesh command has been sent unless you actually called mesh_send_command, or called a routed hardware tool such as set_humidifier/set_fan/set_device_led/set_status_light/gpio_write/servo_write and received its tool result. If no tool call was made, say that the command was not executed.\n"
         "On coordinator_agent, use read_temperature_humidity only when the user explicitly asks to test this board's local AHT20/AHT10 sensor, this board's SDA/SCL wiring, or direct I2C diagnostics.\n"
         "On sensor_agent or edge_agent, for local temperature/humidity requests, use read_temperature_humidity. It is backed by AHT20/AHT10 on SDA=GPIO " ESPAGENT_STRINGIFY(ESPAGENT_AHT10_DEFAULT_SDA_GPIO) ", SCL=GPIO " ESPAGENT_STRINGIFY(ESPAGENT_AHT10_DEFAULT_SCL_GPIO) ", address=" ESPAGENT_STRINGIFY(ESPAGENT_AHT10_DEFAULT_ADDR) ". Do not use legacy DHT11 guidance unless the user explicitly says they rewired a DHT11.\n"
@@ -485,8 +382,7 @@ esp_err_t context_build_system_prompt(char *buf, size_t size)
         "## Skills\n"
         "Skills are specialized instruction files stored in " ESPAGENT_SKILLS_PREFIX ".\n"
         "When a task matches a skill, read the full skill file for detailed instructions.\n"
-            "You can create new skills using write_file to " ESPAGENT_SKILLS_PREFIX "<name>.md.\n");
-    }
+        "You can create new skills using write_file to " ESPAGENT_SKILLS_PREFIX "<name>.md.\n");
 
     off = append_file(buf, size, off, ESPAGENT_SOUL_FILE, "Personality");
     off = append_file(buf, size, off, ESPAGENT_USER_FILE, "User Info");

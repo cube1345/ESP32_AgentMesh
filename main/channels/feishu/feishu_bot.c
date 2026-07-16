@@ -34,11 +34,17 @@ static const char *TAG = "feishu";
 #define FEISHU_WS_CONNECT_GRACE_MS 15000
 #define FEISHU_WS_RECONNECT_MIN_MS 3000
 #define FEISHU_WS_RECONNECT_MAX_MS 10000
-#define FEISHU_WS_CONFIG_MIN_INTERNAL_FREE (24 * 1024)
-#define FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL (8 * 1024)
+#define FEISHU_WS_CONFIG_MIN_INTERNAL_FREE (20 * 1024)
+#define FEISHU_WS_CONFIG_MIN_LARGEST_INTERNAL (7 * 1024)
 #define FEISHU_WS_LOW_MEM_BACKOFF_MS 30000
 #define FEISHU_ACK_QUEUE_DEPTH 2
 #define FEISHU_ACK_HEADER_LIMIT 4
+#define FEISHU_HTTP_BUFFER_SIZE 512
+#define FEISHU_HTTP_BUFFER_SIZE_TX 512
+#define FEISHU_TOKEN_RESP_CAP 1024
+#define FEISHU_API_RESP_CAP 2048
+#define FEISHU_HTTP_RETRY_COUNT 3
+#define FEISHU_HTTP_RETRY_DELAY_MS 1500
 
 /* ── Credentials & token state ─────────────────────────────── */
 static char s_app_id[64] = ESPAGENT_SECRET_FEISHU_APP_ID;
@@ -82,6 +88,19 @@ static bool feishu_wait_wifi_stable(uint32_t wait_ms, uint32_t stable_ms)
     }
     vTaskDelay(pdMS_TO_TICKS(stable_ms));
     return wifi_manager_is_connected();
+}
+
+static void feishu_http_retry_delay(const char *phase, int attempt, esp_err_t err)
+{
+    ESP_LOGW(TAG,
+             "%s HTTP attempt %d/%d failed: %s internal_free=%u largest_internal=%u",
+             phase,
+             attempt,
+             FEISHU_HTTP_RETRY_COUNT,
+             esp_err_to_name(err),
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    vTaskDelay(pdMS_TO_TICKS(FEISHU_HTTP_RETRY_DELAY_MS));
 }
 
 /* ── Message deduplication ─────────────────────────────────── */
@@ -477,7 +496,7 @@ static esp_err_t feishu_get_tenant_token(void)
     cJSON_Delete(body);
     if (!json_str) return ESP_ERR_NO_MEM;
 
-    http_resp_t resp = { .buf = calloc(1, 2048), .len = 0, .cap = 2048 };
+    http_resp_t resp = { .buf = calloc(1, FEISHU_TOKEN_RESP_CAP), .len = 0, .cap = FEISHU_TOKEN_RESP_CAP };
     if (!resp.buf) { free(json_str); return ESP_ERR_NO_MEM; }
 
     esp_http_client_config_t config = {
@@ -485,28 +504,43 @@ static esp_err_t feishu_get_tenant_token(void)
         .event_handler = http_event_handler,
         .user_data = &resp,
         .timeout_ms = 10000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+        .buffer_size = FEISHU_HTTP_BUFFER_SIZE,
+        .buffer_size_tx = FEISHU_HTTP_BUFFER_SIZE_TX,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { free(json_str); free(resp.buf); return ESP_FAIL; }
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= FEISHU_HTTP_RETRY_COUNT; attempt++) {
+        resp.len = 0;
+        resp.buf[0] = '\0';
 
-    esp_http_client_set_method(client, HTTP_METHOD_POST);
-    esp_http_client_set_header(client, "Content-Type", "application/json");
-    esp_http_client_set_post_field(client, json_str, strlen(json_str));
-
-    esp_err_t err = espagent_net_guard_take(20000);
-    if (err == ESP_OK) {
-        if (!wifi_manager_is_connected()) {
-            err = ESP_ERR_INVALID_STATE;
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) {
+            err = ESP_ERR_NO_MEM;
         } else {
-            err = esp_http_client_perform(client);
+            esp_http_client_set_method(client, HTTP_METHOD_POST);
+            esp_http_client_set_header(client, "Content-Type", "application/json");
+            esp_http_client_set_post_field(client, json_str, strlen(json_str));
+
+            err = espagent_net_guard_take(20000);
+            if (err == ESP_OK) {
+                if (!wifi_manager_is_connected()) {
+                    err = ESP_ERR_INVALID_STATE;
+                } else {
+                    err = esp_http_client_perform(client);
+                }
+                espagent_net_guard_give();
+            }
+            esp_http_client_cleanup(client);
         }
-        espagent_net_guard_give();
+
+        if (err == ESP_OK) {
+            break;
+        }
+        if (attempt < FEISHU_HTTP_RETRY_COUNT) {
+            feishu_http_retry_delay("Token request", attempt, err);
+        }
     }
-    esp_http_client_cleanup(client);
     free(json_str);
 
     if (err != ESP_OK) {
@@ -545,7 +579,7 @@ static char *feishu_api_call(const char *url, const char *method, const char *po
 {
     if (feishu_get_tenant_token() != ESP_OK) return NULL;
 
-    http_resp_t resp = { .buf = calloc(1, 4096), .len = 0, .cap = 4096 };
+    http_resp_t resp = { .buf = calloc(1, FEISHU_API_RESP_CAP), .len = 0, .cap = FEISHU_API_RESP_CAP };
     if (!resp.buf) return NULL;
 
     esp_http_client_config_t config = {
@@ -553,36 +587,52 @@ static char *feishu_api_call(const char *url, const char *method, const char *po
         .event_handler = http_event_handler,
         .user_data = &resp,
         .timeout_ms = 15000,
-        .buffer_size = 2048,
-        .buffer_size_tx = 2048,
+        .buffer_size = FEISHU_HTTP_BUFFER_SIZE,
+        .buffer_size_tx = FEISHU_HTTP_BUFFER_SIZE_TX,
         .crt_bundle_attach = esp_crt_bundle_attach,
     };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-    if (!client) { free(resp.buf); return NULL; }
-
     char auth_header[600];
     snprintf(auth_header, sizeof(auth_header), "Bearer %s", s_tenant_token);
-    esp_http_client_set_header(client, "Authorization", auth_header);
-    esp_http_client_set_header(client, "Content-Type", "application/json; charset=utf-8");
 
-    if (strcmp(method, "POST") == 0) {
-        esp_http_client_set_method(client, HTTP_METHOD_POST);
-        if (post_data) {
-            esp_http_client_set_post_field(client, post_data, strlen(post_data));
-        }
-    }
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= FEISHU_HTTP_RETRY_COUNT; attempt++) {
+        resp.len = 0;
+        resp.buf[0] = '\0';
 
-    esp_err_t err = espagent_net_guard_take(20000);
-    if (err == ESP_OK) {
-        if (!wifi_manager_is_connected()) {
-            err = ESP_ERR_INVALID_STATE;
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (!client) {
+            err = ESP_ERR_NO_MEM;
         } else {
-            err = esp_http_client_perform(client);
+            esp_http_client_set_header(client, "Authorization", auth_header);
+            esp_http_client_set_header(client, "Content-Type", "application/json; charset=utf-8");
+
+            if (strcmp(method, "POST") == 0) {
+                esp_http_client_set_method(client, HTTP_METHOD_POST);
+                if (post_data) {
+                    esp_http_client_set_post_field(client, post_data, strlen(post_data));
+                }
+            }
+
+            err = espagent_net_guard_take(20000);
+            if (err == ESP_OK) {
+                if (!wifi_manager_is_connected()) {
+                    err = ESP_ERR_INVALID_STATE;
+                } else {
+                    err = esp_http_client_perform(client);
+                }
+                espagent_net_guard_give();
+            }
+            esp_http_client_cleanup(client);
         }
-        espagent_net_guard_give();
+
+        if (err == ESP_OK) {
+            break;
+        }
+        if (attempt < FEISHU_HTTP_RETRY_COUNT) {
+            feishu_http_retry_delay("API call", attempt, err);
+        }
     }
-    esp_http_client_cleanup(client);
 
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "API call failed: %s", esp_err_to_name(err));
@@ -869,11 +919,11 @@ static void feishu_ws_task(void *arg)
         }
 
         size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
-        if (largest_internal < ESPAGENT_FEISHU_WS_CLIENT_STACK + 1024) {
+        if (largest_internal < ESPAGENT_FEISHU_WS_CLIENT_STACK + 256) {
             ESP_LOGW(TAG,
                      "Feishu WS start postponed: largest_internal=%u required=%u",
                      (unsigned)largest_internal,
-                     (unsigned)(ESPAGENT_FEISHU_WS_CLIENT_STACK + 1024));
+                     (unsigned)(ESPAGENT_FEISHU_WS_CLIENT_STACK + 256));
             vTaskDelay(pdMS_TO_TICKS(s_ws_reconnect_interval_ms));
             continue;
         }

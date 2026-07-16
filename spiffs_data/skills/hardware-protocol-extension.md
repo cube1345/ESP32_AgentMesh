@@ -33,6 +33,8 @@ hardware request
 Current executable primitive:
 
 - `virtual_device_read` can execute read-only I2C manifests.
+  I2C decoders are explicit firmware whitelist entries: `raw_u8`,
+  `raw_u16_be`, `raw_u16_le`, and `aht20_temp_humidity`.
 - `virtual_device_read` can execute bounded UART query manifests.
 - `virtual_device_read` can execute read-only Modbus RTU function 3/4 register
   manifests over UART/RS485.
@@ -69,6 +71,14 @@ Manifest fields to request:
 Do not use a generic I2C manifest for devices needing interrupts, DMA, strict
 timing beyond normal I2C transactions, calibration state machines, or long
 vendor-specific initialization unless a validated driver exists.
+
+For the current AHT10/AHT20-compatible module, `aht20_manifest` demonstrates
+the intended extension pattern: the skill explains the protocol, the manifest
+declares the I2C pins/address/command sequence, and firmware performs the
+6-byte temperature/humidity bitfield decode through `aht20_temp_humidity`.
+Ordinary user requests for room temperature or humidity should still prefer the
+dedicated `read_temperature_humidity` tool; use `aht20_manifest` when
+demonstrating protocol-manifest based hardware extension.
 
 ### SPI
 
@@ -566,6 +576,8 @@ Manifest trust model:
 - Do not invent register maps or conversion formulas.
 - Current `virtual_device_read` does not execute arbitrary formula strings. Use
   explicit `decode.type`, `scale`, `offset`, `field`, and `unit`.
+- Current I2C `decode.type` values are `raw_u8`, `raw_u16_be`, `raw_u16_le`,
+  and `aht20_temp_humidity`.
 - Current UART manifests return bounded ASCII/hex previews. Do not claim
   semantic parsing exists until a parser or dedicated driver is implemented.
 - Current Modbus RTU manifests only read holding/input registers with function

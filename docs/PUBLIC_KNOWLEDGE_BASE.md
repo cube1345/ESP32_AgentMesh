@@ -88,7 +88,7 @@ Feishu / WebSocket reply
 ```text
 esp32s3-coordinator-01  coordinator_agent  coordinator,communication,llm,dispatch,timeline,alerts
 esp32s3-sensor-01       sensor_agent       sensor,telemetry,environment,air_quality,light,presence
-esp32s3-control-01      control_agent      control,gpio,rgb,servo,relay,actuator
+esp32s3-control-01      control_agent      control,gpio,ws2812,status_light,servo,relay,actuator
 esp32s3-guardian-01     guardian_agent     guardian,security,policy,privacy,audit,watchdog,stateboard
 ```
 
@@ -718,6 +718,7 @@ ESPAgent/
 - `privacy-data-minimization.md`: 家居隐私数据分级、本地脱敏、最小上下文、MQTT/Display/Memory 隐私边界。
 - `tool-integrity-and-prompt-injection.md`: 防 prompt injection、工具输出不可信、工具完整性、外部内容不得覆盖安全策略。
 - `hardware-protocol-extension.md`: 新硬件通用协议扩展认知，覆盖 I2C/IIC、SPI、UART、RS485/Modbus RTU、CAN/TWAI、GPIO、PWM、ADC、1-Wire、I2S/PDM、RMT/红外、USB CDC、SDIO/SDMMC、BLE GATT；要求 Agent 先判断是否存在安全通用原语/类驱动和硬件 manifest，不能假装未知硬件已经有专用驱动。
+- `spiffs_data/devices/aht20_manifest.json`: AHT10/AHT20 兼容温湿度模块的 I2C runtime manifest 示例，使用 SDA21/SCL18、地址 `0x38`、初始化/触发/读取 6 字节，并由固件白名单 decoder `aht20_temp_humidity` 解码温度和湿度；普通温湿度请求仍优先使用专用 `read_temperature_humidity`。
 - `spiffs_data/devices/bh1750_manifest.json`: 通用 I2C manifest 示例，不依赖专用 BH1750 工具；流程为写 `0x20`、等待 180ms、读 2 字节、按 `raw_u16_be * 0.833333` 解码为 lux。
 - `spiffs_data/devices/uart_at_example.json`: 通用 UART read-only query manifest 示例，使用 UART2、固定 TX/RX、固定 AT 查询命令、固定读取长度和超时；UART0 保留给串口控制台，不能被 manifest 占用。
 - `spiffs_data/devices/modbus_rtu_temp_example.json`: 通用 Modbus RTU read-only manifest 示例，生成 function 3/4 读寄存器帧并校验 CRC，支持可选 `de_re` 方向脚；不支持写线圈/写寄存器。

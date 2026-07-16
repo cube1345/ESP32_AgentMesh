@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -17,19 +18,40 @@ const TOPIC_PREFIX = (process.env.ESPAGENT_TOPIC_PREFIX || 'espagent/cube1345').
 const MQTT_URL = `${MQTT_PROTOCOL}://${MQTT_HOST}:${MQTT_PORT}`;
 const CHAT_REQUEST_TOPIC = `${TOPIC_PREFIX}/web/chat/request`;
 const CHAT_REPLY_TOPIC = `${TOPIC_PREFIX}/web/chat/reply`;
+const FEISHU_BRIDGE_ENABLED = process.env.ESPAGENT_FEISHU_BRIDGE_ENABLED === '1';
+const FEISHU_BRIDGE_STATUSES = new Set(
+  (process.env.ESPAGENT_FEISHU_BRIDGE_STATUSES || 'skipped_low_memory')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean)
+);
+const FEISHU_BRIDGE_DEDUP_MS = Number(process.env.ESPAGENT_FEISHU_BRIDGE_DEDUP_MS || 10 * 60 * 1000);
+const FEISHU_BRIDGE_MAX_TEXT_BYTES = Number(process.env.ESPAGENT_FEISHU_BRIDGE_MAX_TEXT_BYTES || 700);
+const FEISHU_BRIDGE_SKIP_QUEUED_ACK = process.env.ESPAGENT_FEISHU_BRIDGE_SKIP_QUEUED_ACK !== '0';
+const FEISHU_BRIDGE_SECRET_FILE = process.env.ESPAGENT_FEISHU_BRIDGE_SECRET_FILE ||
+  path.join(REPO_ROOT, 'main', 'espagent_secrets.h');
+const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
+const FEISHU_SEND_MSG_URL = 'https://open.feishu.cn/open-apis/im/v1/messages';
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
 const SKILLS_SERIAL_ENABLED = process.env.ESPAGENT_SKILLS_SERIAL_ENABLED !== '0';
 const SKILLS_SERIAL_PORT = process.env.ESPAGENT_SKILLS_SERIAL_PORT || '/dev/ttyUSB0';
 const SKILLS_SERIAL_TIMEOUT_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_TIMEOUT_MS || 20000);
 const SKILLS_SERIAL_LIST_CACHE_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_LIST_CACHE_MS || 30000);
 const SKILLS_SERIAL_MAX_CONTENT_BYTES = Number(process.env.ESPAGENT_SKILLS_SERIAL_MAX_CONTENT_BYTES || 4096);
+const DEVICE_SERIAL_MAX_CONTENT_BYTES = Number(process.env.ESPAGENT_DEVICE_SERIAL_MAX_CONTENT_BYTES || 4096);
+const DEVICE_SERIAL_LIST_CACHE_MS = Number(process.env.ESPAGENT_DEVICE_SERIAL_LIST_CACHE_MS || 30000);
 const SERIAL_CMD_PATH = process.env.ESPAGENT_SERIAL_CMD_PATH ||
   path.join(REPO_ROOT, 'tools', 'serial_cmd.py');
 const CHAT_GATEWAY_PATH = '/ws';
 const runtimeSkills = new Map();
 let runtimeSkillsCacheAt = 0;
+const runtimeDeviceManifests = new Map();
+let runtimeDeviceManifestsCacheAt = 0;
 const chatSessions = new Map();
 const wsSessions = new Set();
+const feishuBridgeSeen = new Map();
+let feishuBridgeCredentialsPromise = null;
+let feishuBridgeToken = null;
 const MAX_TIMELINE_EVENTS = 120;
 
 function isHighValueTimelineEntry(entry) {
@@ -132,6 +154,27 @@ function runtimeSkillName(skill) {
   return `skill_${stableNameSuffix(JSON.stringify(skill || {}))}`;
 }
 
+function normalizeDeviceName(name) {
+  return String(name || '')
+    .trim()
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 47);
+}
+
+function runtimeDeviceName(device) {
+  if (typeof device === 'string') {
+    return normalizeDeviceName(device) || `device_${stableNameSuffix(device)}`;
+  }
+  const fromManifest = normalizeDeviceName(device?.manifestName);
+  if (fromManifest) return fromManifest;
+  const fromName = normalizeDeviceName(device?.name);
+  if (fromName) return fromName;
+  const fromId = normalizeDeviceName(device?.id);
+  if (fromId) return fromId;
+  return `device_${stableNameSuffix(JSON.stringify(device || {}))}`;
+}
+
 function normalizeRuntimeSkillContent(content, title) {
   const text = String(content || '').trimEnd();
   const firstNonSpace = text.trimStart();
@@ -164,6 +207,33 @@ function draftToRuntimeRecord(skill, source = 'serial', message = 'runtime skill
 
 function spiffsSkillPath(name) {
   return `/spiffs/skills/${runtimeSkillName(name)}.md`;
+}
+
+function spiffsDevicePath(name) {
+  return `/spiffs/devices/${runtimeDeviceName(name)}.json`;
+}
+
+function spiffsDeviceSignaturePath(name) {
+  return `${spiffsDevicePath(name)}.sha256`;
+}
+
+function normalizeDeviceManifestContent(content, expectedName) {
+  const text = String(content || '').trim();
+  if (!text) {
+    throw new Error('device manifest content is empty');
+  }
+  const parsed = JSON.parse(text);
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('device manifest must be a JSON object');
+  }
+  const manifestName = normalizeDeviceName(parsed.name);
+  if (!manifestName) {
+    throw new Error('device manifest name is required');
+  }
+  if (expectedName && manifestName !== expectedName) {
+    throw new Error(`manifest name=${manifestName} does not match selected file=${expectedName}`);
+  }
+  return `${JSON.stringify(parsed, null, 2)}\n`;
 }
 
 function upstreamSkillToRuntimeRecord(item) {
@@ -210,6 +280,36 @@ function listRuntimeSkills() {
   return Array.from(runtimeSkills.values()).sort((a, b) => {
     return String(b.installedAt).localeCompare(String(a.installedAt));
   });
+}
+
+function deviceRecordFromManifest(name, content, source = 'local_mock', message = 'listed') {
+  const parsed = safeJsonParse(content) || {};
+  const manifestName = runtimeDeviceName(parsed?.name || name);
+  return attachContentHash({
+    id: manifestName,
+    manifestName,
+    title: parsed?.name || manifestName,
+    protocol: parsed?.protocol || 'unknown',
+    role: parsed?.role || 'unknown',
+    risk: parsed?.risk || 'unknown',
+    path: spiffsDevicePath(manifestName),
+    signaturePath: spiffsDeviceSignaturePath(manifestName),
+    source,
+    installedAt: nowIso(),
+    status: 'installed',
+    content,
+    lastMessage: message
+  });
+}
+
+function listRuntimeDeviceManifests() {
+  return Array.from(runtimeDeviceManifests.values()).sort((a, b) => {
+    return String(a.manifestName).localeCompare(String(b.manifestName));
+  });
+}
+
+function invalidateRuntimeDeviceManifestCache() {
+  runtimeDeviceManifestsCacheAt = 0;
 }
 
 function invalidateRuntimeSkillCache() {
@@ -296,6 +396,21 @@ function parseSerialSkillList(output) {
         path: item[2]
       }));
     }
+  }
+  return records;
+}
+
+function parseSerialDeviceManifestList(output) {
+  const payload = extractSerialPayload(output);
+  const records = [];
+  const seen = new Set();
+  const fileRegex = /\/spiffs\/devices\/([A-Za-z0-9_-]+)\.json(?=\s|$|\()/g;
+  let match;
+  while ((match = fileRegex.exec(payload)) !== null) {
+    const manifestName = normalizeDeviceName(match[1]);
+    if (!manifestName || seen.has(manifestName)) continue;
+    seen.add(manifestName);
+    records.push(deviceRecordFromManifest(manifestName, '{}\n', 'serial', 'listed from ESP32 SPIFFS'));
   }
   return records;
 }
@@ -461,7 +576,7 @@ async function fetchSerialRuntimeSkills() {
   if (runtimeSkillsCacheAt && Date.now() - runtimeSkillsCacheAt < SKILLS_SERIAL_LIST_CACHE_MS) {
     return listRuntimeSkills();
   }
-  const output = await runSerialCommand('tool_exec list_files {"prefix":"/spiffs/skills/"}');
+  const output = await runSerialCommand('tool_exec list_dir {"prefix":"/spiffs/skills/"}');
   const skills = parseSerialSkillList(output);
   runtimeSkills.clear();
   for (const item of skills) {
@@ -502,6 +617,118 @@ async function upsertSerialRuntimeSkillContent(runtimeName, content) {
     `saved to ${spiffsSkillPath(runtimeName)}`;
 }
 
+async function fetchSerialDeviceManifestContent(record) {
+  const output = await runSerialCommand(`tool_exec read_file ${JSON.stringify({
+    path: record.path || spiffsDevicePath(record.manifestName)
+  })}`);
+  const content = extractSerialToolOutput(output);
+  return deviceRecordFromManifest(record.manifestName, content, 'serial', 'loaded from ESP32 SPIFFS');
+}
+
+async function fetchSerialDeviceManifestContentOrNull(manifestName) {
+  try {
+    return await fetchSerialDeviceManifestContent({
+      manifestName,
+      path: spiffsDevicePath(manifestName)
+    });
+  } catch (error) {
+    if (isMissingRuntimeSkillError(error)) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+async function fetchSerialDeviceManifests() {
+  if (!SKILLS_SERIAL_ENABLED) {
+    return listRuntimeDeviceManifests();
+  }
+  if (runtimeDeviceManifestsCacheAt &&
+      Date.now() - runtimeDeviceManifestsCacheAt < DEVICE_SERIAL_LIST_CACHE_MS) {
+    return listRuntimeDeviceManifests();
+  }
+  const output = await runSerialCommand('tool_exec list_dir {"prefix":"/spiffs/devices/"}');
+  const devices = parseSerialDeviceManifestList(output);
+  runtimeDeviceManifests.clear();
+  for (const item of devices) {
+    let record = item;
+    try {
+      record = await fetchSerialDeviceManifestContent(item);
+    } catch (error) {
+      record.lastMessage = error instanceof Error ? error.message : 'content unavailable';
+    }
+    runtimeDeviceManifests.set(record.manifestName, record);
+  }
+  runtimeDeviceManifestsCacheAt = Date.now();
+  return listRuntimeDeviceManifests();
+}
+
+async function fetchLocalDeviceManifests() {
+  const deviceDir = path.join(REPO_ROOT, 'spiffs_data', 'devices');
+  const entries = await fs.readdir(deviceDir, { withFileTypes: true });
+  runtimeDeviceManifests.clear();
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+    const manifestName = entry.name.replace(/\.json$/, '');
+    const content = await fs.readFile(path.join(deviceDir, entry.name), 'utf8');
+    runtimeDeviceManifests.set(
+      manifestName,
+      deviceRecordFromManifest(manifestName, content, 'local_mock', 'loaded from repository spiffs_data')
+    );
+  }
+  runtimeDeviceManifestsCacheAt = Date.now();
+  return listRuntimeDeviceManifests();
+}
+
+function buildUnchangedDeviceMessage(manifestName, hash) {
+  return `unchanged: ${manifestName} already matches SPIFFS sha256=${hash.slice(0, 12)}; skipped write`;
+}
+
+async function upsertSerialDeviceManifestContent(manifestName, content) {
+  if (!SKILLS_SERIAL_ENABLED) {
+    throw new Error('serial device manifest gateway disabled');
+  }
+  const contentBytes = Buffer.byteLength(content, 'utf8');
+  if (contentBytes > DEVICE_SERIAL_MAX_CONTENT_BYTES) {
+    throw new Error(
+      `device manifest content is ${contentBytes} bytes; serial gateway limit is ${DEVICE_SERIAL_MAX_CONTENT_BYTES} bytes`
+    );
+  }
+  const hash = contentSha256(content);
+  const writeManifest = `tool_exec write_file ${JSON.stringify({
+    path: spiffsDevicePath(manifestName),
+    content,
+    confirmed: true
+  })}`;
+  const manifestOutput = await runSerialCommand(writeManifest);
+  const manifestPayload = extractSerialPayload(manifestOutput);
+  if (!/tool_exec status:\s*ESP_OK|OK:/m.test(manifestPayload)) {
+    throw new Error(manifestPayload || 'ESP32 write_file did not report success for manifest');
+  }
+
+  const writeSignature = `tool_exec write_file ${JSON.stringify({
+    path: spiffsDeviceSignaturePath(manifestName),
+    content: `${hash}\n`,
+    confirmed: true
+  })}`;
+  const signatureOutput = await runSerialCommand(writeSignature);
+  const signaturePayload = extractSerialPayload(signatureOutput);
+  if (!/tool_exec status:\s*ESP_OK|OK:/m.test(signaturePayload)) {
+    throw new Error(signaturePayload || 'ESP32 write_file did not report success for manifest signature');
+  }
+  invalidateRuntimeDeviceManifestCache();
+  return `saved ${spiffsDevicePath(manifestName)} and sha256=${hash.slice(0, 12)}`;
+}
+
+async function upsertSerialDeviceManifestContentIfChanged(manifestName, content) {
+  const desiredHash = contentSha256(content);
+  const existing = await fetchSerialDeviceManifestContentOrNull(manifestName);
+  if (existing?.content && existing.contentHash === desiredHash) {
+    return buildUnchangedDeviceMessage(manifestName, desiredHash);
+  }
+  return upsertSerialDeviceManifestContent(manifestName, content);
+}
+
 function createStore() {
   return {
     mqtt: {
@@ -516,6 +743,15 @@ function createStore() {
       upstreamUrl: `${MQTT_URL} -> ${CHAT_REQUEST_TOPIC}`,
       activeSessions: 0,
       connectedSessions: 0,
+      lastEventAt: null,
+      lastError: null
+    },
+    feishuBridge: {
+      enabled: FEISHU_BRIDGE_ENABLED,
+      statuses: Array.from(FEISHU_BRIDGE_STATUSES),
+      sent: 0,
+      skipped: 0,
+      failed: 0,
       lastEventAt: null,
       lastError: null
     },
@@ -655,6 +891,7 @@ function toDashboardPayload() {
     flows,
     mqtt: store.mqtt,
     chatGateway: store.chatGateway,
+    feishuBridge: store.feishuBridge,
     guardian: store.guardian
   };
 }
@@ -802,7 +1039,198 @@ function handleState(topic, payload) {
   });
 }
 
-function handleTimeline(payload) {
+function pruneFeishuBridgeSeen(now = Date.now()) {
+  for (const [key, seenAt] of feishuBridgeSeen.entries()) {
+    if (now - seenAt > FEISHU_BRIDGE_DEDUP_MS) {
+      feishuBridgeSeen.delete(key);
+    }
+  }
+}
+
+function truncateUtf8(text, maxBytes) {
+  const input = String(text || '');
+  if (Buffer.byteLength(input, 'utf8') <= maxBytes) {
+    return input;
+  }
+
+  let output = '';
+  for (const char of input) {
+    const next = `${output}${char}`;
+    if (Buffer.byteLength(`${next}...`, 'utf8') > maxBytes) {
+      break;
+    }
+    output = next;
+  }
+  return `${output}...`;
+}
+
+function feishuBridgeTarget(chatId) {
+  if (typeof chatId !== 'string' || !chatId.trim()) {
+    return null;
+  }
+  const id = chatId.trim();
+  if (id.startsWith('ou_')) {
+    return { receiveId: id, receiveIdType: 'open_id' };
+  }
+  if (id.startsWith('oc_')) {
+    return { receiveId: id, receiveIdType: 'chat_id' };
+  }
+  return null;
+}
+
+function parseCStringMacro(text, name) {
+  const pattern = new RegExp(`#define\\s+${name}\\s+"([^"]*)"`);
+  return text.match(pattern)?.[1] || '';
+}
+
+async function readFeishuBridgeCredentials() {
+  const fromEnv = {
+    appId: process.env.ESPAGENT_FEISHU_BRIDGE_APP_ID || '',
+    appSecret: process.env.ESPAGENT_FEISHU_BRIDGE_APP_SECRET || ''
+  };
+  if (fromEnv.appId && fromEnv.appSecret) {
+    return fromEnv;
+  }
+
+  const text = await fs.readFile(FEISHU_BRIDGE_SECRET_FILE, 'utf8');
+  return {
+    appId: parseCStringMacro(text, 'ESPAGENT_SECRET_FEISHU_APP_ID'),
+    appSecret: parseCStringMacro(text, 'ESPAGENT_SECRET_FEISHU_APP_SECRET')
+  };
+}
+
+async function getFeishuBridgeCredentials() {
+  if (!feishuBridgeCredentialsPromise) {
+    feishuBridgeCredentialsPromise = readFeishuBridgeCredentials();
+  }
+  const credentials = await feishuBridgeCredentialsPromise;
+  if (!credentials.appId || !credentials.appSecret) {
+    throw new Error('missing Feishu bridge app credentials');
+  }
+  return credentials;
+}
+
+async function getFeishuTenantToken() {
+  const now = Date.now();
+  if (feishuBridgeToken?.token && feishuBridgeToken.expiresAt > now + 5 * 60 * 1000) {
+    return feishuBridgeToken.token;
+  }
+
+  const credentials = await getFeishuBridgeCredentials();
+  const response = await fetch(FEISHU_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({
+      app_id: credentials.appId,
+      app_secret: credentials.appSecret
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.code !== 0 || !payload?.tenant_access_token) {
+    throw new Error(`Feishu token request failed: code=${payload?.code ?? response.status} msg=${payload?.msg || response.statusText}`);
+  }
+
+  feishuBridgeToken = {
+    token: payload.tenant_access_token,
+    expiresAt: now + Number(payload.expire || 7200) * 1000
+  };
+  return feishuBridgeToken.token;
+}
+
+async function sendFeishuBridgeMessage(target, text, key) {
+  const token = await getFeishuTenantToken();
+  const url = new URL(FEISHU_SEND_MSG_URL);
+  url.searchParams.set('receive_id_type', target.receiveIdType);
+  url.searchParams.set('uuid', `espagent-bridge-${key}`);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify({
+      receive_id: target.receiveId,
+      msg_type: 'text',
+      content: JSON.stringify({ text })
+    })
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || payload?.code !== 0) {
+    throw new Error(`Feishu bridge send failed: code=${payload?.code ?? response.status} msg=${payload?.msg || response.statusText}`);
+  }
+}
+
+function shouldSkipQueuedFeishuAck(text) {
+  if (!FEISHU_BRIDGE_SKIP_QUEUED_ACK) {
+    return false;
+  }
+  return text.includes('已通过 MQTT Mesh 下发命令') ||
+    text.includes('result will be injected when OutputMessage arrives');
+}
+
+function noteFeishuBridgeEvent(error = null) {
+  store.feishuBridge.lastEventAt = nowIso();
+  store.feishuBridge.lastError = error;
+}
+
+function maybeBridgeFeishuOutbound(payload, meta = {}) {
+  if (!FEISHU_BRIDGE_ENABLED || payload?.event !== 'feishu_outbound') {
+    return;
+  }
+
+  if (meta.retained) {
+    store.feishuBridge.skipped += 1;
+    return;
+  }
+
+  const status = String(payload.status || '');
+  if (!FEISHU_BRIDGE_STATUSES.has(status)) {
+    return;
+  }
+
+  const rawText = String(payload.text || payload.text_preview || '').trim();
+  if (!rawText || shouldSkipQueuedFeishuAck(rawText)) {
+    store.feishuBridge.skipped += 1;
+    return;
+  }
+
+  const target = feishuBridgeTarget(payload.chat_id);
+  if (!target) {
+    noteFeishuBridgeEvent(`unsupported chat_id=${payload.chat_id || '(missing)'}`);
+    store.feishuBridge.failed += 1;
+    return;
+  }
+
+  pruneFeishuBridgeSeen();
+  const keyMaterial = [
+    payload.chat_id || '',
+    status,
+    payload.ts_ms || '',
+    rawText
+  ].join('\n');
+  const key = createHash('sha256').update(keyMaterial).digest('hex').slice(0, 24);
+  if (feishuBridgeSeen.has(key)) {
+    store.feishuBridge.skipped += 1;
+    return;
+  }
+  feishuBridgeSeen.set(key, Date.now());
+
+  const text = truncateUtf8(rawText, FEISHU_BRIDGE_MAX_TEXT_BYTES);
+  sendFeishuBridgeMessage(target, text, key)
+    .then(() => {
+      store.feishuBridge.sent += 1;
+      noteFeishuBridgeEvent(null);
+    })
+    .catch((error) => {
+      store.feishuBridge.failed += 1;
+      noteFeishuBridgeEvent(error instanceof Error ? error.message : String(error));
+    });
+}
+
+function handleTimeline(payload, meta = {}) {
+  maybeBridgeFeishuOutbound(payload, meta);
+
   const stage = payload.event || payload.type || payload.phase || 'timeline';
   pushTimeline({
     time: new Date(Number(payload.ts_ms || Date.now())).toLocaleTimeString('zh-CN', { hour12: false }),
@@ -858,9 +1286,10 @@ client.on('error', (error) => {
   console.error('[dashboard] mqtt error', error.message);
 });
 
-client.on('message', (topic, buffer) => {
+client.on('message', (topic, buffer, packet) => {
   const text = buffer.toString();
   const payload = safeJsonParse(text);
+  const meta = { retained: Boolean(packet?.retain) };
   store.mqtt.lastEventAt = nowIso();
 
   if (!payload) {
@@ -876,7 +1305,7 @@ client.on('message', (topic, buffer) => {
     return;
   }
   if (topic.endsWith('/timeline')) {
-    handleTimeline(payload);
+    handleTimeline(payload, meta);
     return;
   }
   if (topic === CHAT_REPLY_TOPIC) {
@@ -928,6 +1357,145 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     sendJson(res, 200, toDashboardPayload());
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/devices/runtime') {
+    if (SKILLS_SERIAL_ENABLED) {
+      fetchSerialDeviceManifests()
+        .then((devices) => {
+          sendJson(res, 200, {
+            devices,
+            source: 'serial'
+          });
+        })
+        .catch((error) => {
+          fetchLocalDeviceManifests()
+            .then((devices) => {
+              sendJson(res, 200, {
+                devices,
+                source: 'local_mock',
+                error: error instanceof Error ? error.message : 'serial device manifest list failed'
+              });
+            })
+            .catch((localError) => {
+              sendJson(res, 200, {
+                devices: listRuntimeDeviceManifests(),
+                source: 'local_mock',
+                error: localError instanceof Error ? localError.message : 'local device manifest list failed'
+              });
+            });
+        });
+      return;
+    }
+
+    fetchLocalDeviceManifests()
+      .then((devices) => {
+        sendJson(res, 200, {
+          devices,
+          source: 'local_mock'
+        });
+      })
+      .catch((error) => {
+        sendJson(res, 200, {
+          devices: listRuntimeDeviceManifests(),
+          source: 'local_mock',
+          error: error instanceof Error ? error.message : 'local device manifest list failed'
+        });
+      });
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/devices/runtime') {
+    let body = '';
+    req.on('data', (chunk) => {
+      body += chunk;
+    });
+    req.on('end', async () => {
+      const payload = safeJsonParse(body);
+      const device = payload?.device;
+      const confirmed = Boolean(payload?.confirmed);
+      const source = SKILLS_SERIAL_ENABLED ? 'serial' : 'local_mock';
+
+      if (!device || typeof device !== 'object') {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'missing device manifest payload',
+          error: 'missing device manifest payload'
+        });
+        return;
+      }
+      if (!confirmed) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'device manifest update requires confirmed=true',
+          error: 'device manifest update requires confirmed=true'
+        });
+        return;
+      }
+
+      const manifestName = runtimeDeviceName(device);
+      let content = '';
+      try {
+        content = normalizeDeviceManifestContent(device.content, manifestName);
+      } catch (error) {
+        sendJson(res, 400, {
+          ok: false,
+          source,
+          message: 'invalid device manifest content',
+          error: error instanceof Error ? error.message : 'invalid device manifest content'
+        });
+        return;
+      }
+
+      if (SKILLS_SERIAL_ENABLED) {
+        try {
+          const message = await upsertSerialDeviceManifestContentIfChanged(manifestName, content);
+          const skipped = message.startsWith('unchanged:');
+          const saved = deviceRecordFromManifest(manifestName, content, 'serial', message);
+          runtimeDeviceManifests.set(saved.manifestName, saved);
+          runtimeDeviceManifestsCacheAt = Date.now();
+          sendJson(res, 200, {
+            ok: true,
+            source,
+            message,
+            skipped,
+            device: saved
+          });
+          return;
+        } catch (error) {
+          sendJson(res, 502, {
+            ok: false,
+            source,
+            message: 'device manifest update failed on ESP32 serial gateway',
+            error: error instanceof Error ? error.message : 'device manifest update failed on ESP32 serial gateway'
+          });
+          return;
+        }
+      }
+
+      const localExisting = runtimeDeviceManifests.get(manifestName);
+      const localSkipped = localExisting?.contentHash === contentSha256(content);
+      const saved = deviceRecordFromManifest(
+        manifestName,
+        content,
+        'local_mock',
+        localSkipped
+          ? buildUnchangedDeviceMessage(manifestName, contentSha256(content))
+          : 'front-end device manifest update simulated; ESP32 SPIFFS not yet connected'
+      );
+      runtimeDeviceManifests.set(saved.manifestName, saved);
+      runtimeDeviceManifestsCacheAt = Date.now();
+      sendJson(res, 200, {
+        ok: true,
+        source,
+        message: saved.lastMessage,
+        skipped: localSkipped,
+        device: saved
+      });
+    });
     return;
   }
 
@@ -1272,4 +1840,5 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[dashboard] http://127.0.0.1:${PORT}`);
   console.log(`[dashboard] mqtt=${MQTT_URL} prefix=${TOPIC_PREFIX}`);
   console.log(`[dashboard] chat-gateway=${CHAT_GATEWAY_PATH} request=${CHAT_REQUEST_TOPIC} reply=${CHAT_REPLY_TOPIC}`);
+  console.log(`[dashboard] feishu-bridge enabled=${FEISHU_BRIDGE_ENABLED} statuses=${Array.from(FEISHU_BRIDGE_STATUSES).join(',')}`);
 });

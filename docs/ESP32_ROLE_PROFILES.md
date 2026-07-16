@@ -103,7 +103,7 @@
 ```c
 #define ESPAGENT_SECRET_NODE_ID "esp32s3-control-01"
 #define ESPAGENT_SECRET_NODE_ROLE "control_agent"
-#define ESPAGENT_SECRET_NODE_CAPABILITIES "control,gpio,rgb,servo,relay,actuator"
+#define ESPAGENT_SECRET_NODE_CAPABILITIES "control,gpio,ws2812,status_light,servo,relay,actuator"
 #define ESPAGENT_SECRET_NODE_RESPONSIBILITIES "execute whitelisted hardware actions after schema validation and tool guard checks"
 ```
 

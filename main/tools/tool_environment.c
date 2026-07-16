@@ -143,6 +143,8 @@ static bool valid_i2c_gpio_pair(int sda_gpio, int scl_gpio)
            GPIO_IS_VALID_OUTPUT_GPIO((gpio_num_t)scl_gpio);
 }
 
+static void soft_i2c_stop(const soft_i2c_bus_t *bus);
+
 static void soft_i2c_delay(const soft_i2c_bus_t *bus)
 {
     esp_rom_delay_us((uint32_t)bus->delay_us);
@@ -166,6 +168,36 @@ static int soft_i2c_read_sda(const soft_i2c_bus_t *bus)
     return gpio_get_level((gpio_num_t)bus->sda_gpio);
 }
 
+static int soft_i2c_read_scl(const soft_i2c_bus_t *bus)
+{
+    soft_i2c_delay(bus);
+    return gpio_get_level((gpio_num_t)bus->scl_gpio);
+}
+
+static esp_err_t soft_i2c_check_idle(soft_i2c_bus_t *bus)
+{
+    soft_i2c_set_sda(bus, 1);
+    soft_i2c_set_scl(bus, 1);
+
+    if (!soft_i2c_read_scl(bus)) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (soft_i2c_read_sda(bus)) {
+        return ESP_OK;
+    }
+
+    for (int i = 0; i < 9 && !soft_i2c_read_sda(bus); i++) {
+        soft_i2c_set_scl(bus, 0);
+        soft_i2c_set_scl(bus, 1);
+    }
+    soft_i2c_stop(bus);
+    soft_i2c_set_sda(bus, 1);
+    soft_i2c_set_scl(bus, 1);
+    return (soft_i2c_read_scl(bus) && soft_i2c_read_sda(bus))
+               ? ESP_OK
+               : ESP_ERR_INVALID_STATE;
+}
+
 static esp_err_t soft_i2c_init(soft_i2c_bus_t *bus, int sda_gpio, int scl_gpio)
 {
     if (!valid_i2c_gpio_pair(sda_gpio, scl_gpio)) {
@@ -174,7 +206,7 @@ static esp_err_t soft_i2c_init(soft_i2c_bus_t *bus, int sda_gpio, int scl_gpio)
 
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << sda_gpio) | (1ULL << scl_gpio),
-        .mode = GPIO_MODE_OUTPUT_OD,
+        .mode = GPIO_MODE_INPUT_OUTPUT_OD,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
@@ -189,7 +221,7 @@ static esp_err_t soft_i2c_init(soft_i2c_bus_t *bus, int sda_gpio, int scl_gpio)
     bus->delay_us = ENV_SOFT_I2C_DELAY_US;
     soft_i2c_set_sda(bus, 1);
     soft_i2c_set_scl(bus, 1);
-    return ESP_OK;
+    return soft_i2c_check_idle(bus);
 }
 
 static void soft_i2c_start(const soft_i2c_bus_t *bus)
@@ -790,6 +822,52 @@ esp_err_t tool_read_environment_execute(const char *input_json, char *output, si
 static int env_float_x10(float value)
 {
     return (int)((value * 10.0f) + (value >= 0.0f ? 0.5f : -0.5f));
+}
+
+esp_err_t tool_environment_read_bh1750_values(int sda_gpio,
+                                              int scl_gpio,
+                                              int address,
+                                              float *lux,
+                                              uint16_t *raw,
+                                              char *status,
+                                              size_t status_size)
+{
+    if (!lux || !raw) {
+        if (status && status_size) {
+            snprintf(status, status_size, "Error: light output is NULL");
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!s_env_mutex) {
+        s_env_mutex = xSemaphoreCreateMutex();
+        if (!s_env_mutex) {
+            if (status && status_size) {
+                snprintf(status, status_size, "Error: failed to create environment sensor mutex");
+            }
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    if (xSemaphoreTake(s_env_mutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+        if (status && status_size) {
+            snprintf(status, status_size, "Error: environment sensor buses are busy");
+        }
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t err = env_ensure_gy30_ready(sda_gpio, scl_gpio, address);
+    if (err == ESP_OK) {
+        err = env_read_bh1750(lux, raw);
+        if (err != ESP_OK) {
+            env_deinit_gy30();
+        }
+    }
+    if (status && status_size) {
+        snprintf(status, status_size, "gy30=%s", esp_err_to_name(err));
+    }
+
+    xSemaphoreGive(s_env_mutex);
+    return err;
 }
 
 esp_err_t tool_environment_read_values(tool_environment_values_t *values,

@@ -45,6 +45,7 @@ static const char *TAG = "tool_virtual_device";
 #define VIRTUAL_CONTROL_DEFAULT_COOLDOWN_MS 1000
 #define VIRTUAL_CONTROL_COOLDOWN_SLOTS 8
 #define VIRTUAL_DEVICE_MANIFEST_VERSION 1
+#define AHT20_STATUS_BUSY 0x80
 
 typedef struct {
     char device[DEVICE_NAME_MAX];
@@ -537,6 +538,31 @@ static esp_err_t decode_reading(const virtual_i2c_device_t *cfg,
                                 char *decoded,
                                 size_t decoded_size)
 {
+    if (strcmp(cfg->decode_type, "aht20_temp_humidity") == 0) {
+        if (len < 6) {
+            return ESP_ERR_INVALID_SIZE;
+        }
+        if (data[0] & AHT20_STATUS_BUSY) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+        uint32_t raw_humidity = ((uint32_t)data[1] << 12) |
+                                ((uint32_t)data[2] << 4) |
+                                ((uint32_t)data[3] >> 4);
+        uint32_t raw_temperature = (((uint32_t)data[3] & 0x0f) << 16) |
+                                   ((uint32_t)data[4] << 8) |
+                                   (uint32_t)data[5];
+        double humidity_percent = ((double)raw_humidity * 100.0) / 1048576.0;
+        double temperature_c = (((double)raw_temperature * 200.0) / 1048576.0) - 50.0;
+        snprintf(decoded, decoded_size,
+                 "temperature=%.2f C humidity=%.2f %%RH raw_h=%lu raw_t=%lu status=0x%02x",
+                 temperature_c,
+                 humidity_percent,
+                 (unsigned long)raw_humidity,
+                 (unsigned long)raw_temperature,
+                 (unsigned)data[0]);
+        return ESP_OK;
+    }
+
     uint32_t raw = 0;
     if (strcmp(cfg->decode_type, "raw_u8") == 0) {
         if (len < 1) {
@@ -675,7 +701,7 @@ static esp_err_t execute_i2c_manifest(cJSON *manifest,
         snprintf(output, output_size, "Error: manifest executed but no read operation produced data");
     }
     if (err == ESP_OK) {
-        char decoded[96] = {0};
+        char decoded[160] = {0};
         err = decode_reading(cfg, last_read, last_read_len, decoded, sizeof(decoded));
         if (err == ESP_OK) {
             snprintf(output, output_size,

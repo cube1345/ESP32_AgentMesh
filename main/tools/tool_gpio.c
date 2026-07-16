@@ -136,7 +136,7 @@ static esp_err_t validate_allowed_gpio(int pin, char *output, size_t output_size
     return ESP_OK;
 }
 
-static esp_err_t ensure_output_gpio(int pin)
+static esp_err_t configure_output_gpio(int pin, bool enable_pulldown)
 {
     if (!GPIO_IS_VALID_OUTPUT_GPIO(pin)) {
         return ESP_ERR_INVALID_ARG;
@@ -146,11 +146,59 @@ static esp_err_t ensure_output_gpio(int pin)
         .pin_bit_mask = 1ULL << pin,
         .mode = GPIO_MODE_OUTPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .pull_down_en = enable_pulldown ? GPIO_PULLDOWN_ENABLE : GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
 
     return gpio_config(&cfg);
+}
+
+static bool is_fixed_device_gpio(int pin)
+{
+    return pin == ESPAGENT_HUMIDIFIER_GPIO || pin == ESPAGENT_FAN_GPIO;
+}
+
+static esp_err_t ensure_output_gpio(int pin)
+{
+    if (!is_fixed_device_gpio(pin)) {
+        return configure_output_gpio(pin, false);
+    }
+
+    /* These pins are reserved during startup; do not reserve them again per call. */
+    esp_err_t err = gpio_set_direction((gpio_num_t)pin, GPIO_MODE_OUTPUT);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return gpio_set_pull_mode((gpio_num_t)pin,
+                              ESPAGENT_FIXED_OUTPUT_PULLDOWN
+                                  ? GPIO_PULLDOWN_ONLY
+                                  : GPIO_FLOATING);
+}
+
+static esp_err_t fixed_device_configure_safe_off(int pin, const char *device_name, int active_level)
+{
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(pin)) {
+        ESP_LOGW(TAG, "%s safe-off skipped: GPIO%d is not a valid output", device_name, pin);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int inactive_level = active_level ? 0 : 1;
+    bool enable_pulldown = ESPAGENT_FIXED_OUTPUT_PULLDOWN != 0;
+
+    /* Configure the output and bias first, then apply the safe inactive level. */
+    esp_err_t err = configure_output_gpio(pin, enable_pulldown);
+    if (err == ESP_OK) {
+        err = gpio_set_level((gpio_num_t)pin, inactive_level);
+    }
+
+    ESP_LOGI(TAG, "%s safe-off GPIO%d active_%s idle=%s pulldown=%s -> %s",
+             device_name,
+             pin,
+             active_level ? "high" : "low",
+             inactive_level ? "HIGH" : "LOW",
+             enable_pulldown ? "enabled" : "disabled",
+             esp_err_to_name(err));
+    return err;
 }
 
 static bool is_copper_gpio_pin(int pin)
@@ -212,6 +260,69 @@ static bool parse_gpio_level(cJSON *root, int *state)
         strcmp(value, "拉低") == 0 ||
         strcmp(value, "低电平") == 0) {
         *state = 0;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_fixed_device_state(cJSON *root, int active_level, int *state, int *physical_level)
+{
+    if (!root || !state || !physical_level) {
+        return false;
+    }
+
+    int value = -1;
+    if (get_optional_int(root, "state", &value) ||
+        get_optional_int(root, "level", &value)) {
+        if (value != 0 && value != 1) {
+            return false;
+        }
+        *state = value;
+        *physical_level = value ? active_level : (active_level ? 0 : 1);
+        return true;
+    }
+
+    const char *text = get_optional_string(root, "value");
+    if (!text) {
+        text = get_optional_string(root, "state");
+    }
+    if (!text) {
+        text = get_optional_string(root, "level");
+    }
+    if (!text) {
+        return false;
+    }
+
+    if (strcasecmp(text, "on") == 0 ||
+        strcmp(text, "open") == 0 ||
+        strcmp(text, "enable") == 0 ||
+        strcmp(text, "打开") == 0 ||
+        strcmp(text, "开启") == 0) {
+        *state = 1;
+        *physical_level = active_level;
+        return true;
+    }
+    if (strcasecmp(text, "off") == 0 ||
+        strcmp(text, "close") == 0 ||
+        strcmp(text, "disable") == 0 ||
+        strcmp(text, "关闭") == 0 ||
+        strcmp(text, "关掉") == 0) {
+        *state = 0;
+        *physical_level = active_level ? 0 : 1;
+        return true;
+    }
+    if (strcasecmp(text, "high") == 0 ||
+        strcmp(text, "拉高") == 0 ||
+        strcmp(text, "高电平") == 0) {
+        *physical_level = 1;
+        *state = active_level ? 1 : 0;
+        return true;
+    }
+    if (strcasecmp(text, "low") == 0 ||
+        strcmp(text, "拉低") == 0 ||
+        strcmp(text, "低电平") == 0) {
+        *physical_level = 0;
+        *state = active_level ? 0 : 1;
         return true;
     }
     return false;
@@ -553,9 +664,19 @@ static bool resolve_named_color(const char *color, int *r, int *g, int *b)
 esp_err_t tool_gpio_init(void)
 {
     status_led_configure_once();
+    (void)fixed_device_configure_safe_off(ESPAGENT_HUMIDIFIER_GPIO,
+                                          "humidifier",
+                                          ESPAGENT_HUMIDIFIER_ACTIVE_LEVEL ? 1 : 0);
+    (void)fixed_device_configure_safe_off(ESPAGENT_FAN_GPIO,
+                                          "fan",
+                                          ESPAGENT_FAN_ACTIVE_LEVEL ? 1 : 0);
     (void)ensure_indicator_mutex();
     ESP_LOGI(TAG,
-             "GPIO tools ready (default WS2812 GPIO=%d, thinking_leds=%u)",
+             "GPIO tools ready (humidifier GPIO%d active_%s, fan GPIO%d active_%s, status WS2812 GPIO=%d, thinking_leds=%u)",
+             ESPAGENT_HUMIDIFIER_GPIO,
+             ESPAGENT_HUMIDIFIER_ACTIVE_LEVEL ? "high" : "low",
+             ESPAGENT_FAN_GPIO,
+             ESPAGENT_FAN_ACTIVE_LEVEL ? "high" : "low",
              ESPAGENT_WS2812_DEFAULT_GPIO,
              (unsigned)s_status_led.count);
     return ESP_OK;
@@ -662,7 +783,68 @@ static esp_err_t fixed_device_gpio_write(const char *input_json,
                                          char *output,
                                          size_t output_size,
                                          int pin,
-                                         const char *device_name)
+                                         const char *device_name,
+                                         int active_level)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root) {
+        snprintf(output, output_size, "Error: invalid JSON input");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int state = -1;
+    int physical_level = -1;
+    if (!parse_fixed_device_state(root, active_level, &state, &physical_level)) {
+        snprintf(output, output_size,
+                 "Error: state/level/value required, use on/off for logical device state or high/low for physical GPIO level");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = ensure_output_gpio(pin);
+    if (err == ESP_OK) {
+        err = gpio_set_level(pin, physical_level);
+    }
+
+    if (err == ESP_OK) {
+        snprintf(output, output_size, "OK: %s on GPIO%d turned %s (active_%s, level=%s)",
+                 device_name, pin, state ? "ON" : "OFF",
+                 active_level ? "high" : "low",
+                 physical_level ? "HIGH" : "LOW");
+    } else if (err == ESP_ERR_INVALID_ARG) {
+        snprintf(output, output_size, "Error: GPIO%d is not a valid output pin", pin);
+    } else {
+        snprintf(output, output_size, "Error: failed to set %s GPIO%d (%s)",
+                 device_name, pin, esp_err_to_name(err));
+    }
+
+    ESP_LOGI(TAG, "%s pin=%d state=%d active_level=%d level=%d -> %s",
+             device_name, pin, state, active_level, physical_level, esp_err_to_name(err));
+    cJSON_Delete(root);
+    return err;
+}
+
+esp_err_t tool_set_humidifier_execute(const char *input_json, char *output, size_t output_size)
+{
+    return fixed_device_gpio_write(input_json,
+                                   output,
+                                   output_size,
+                                   ESPAGENT_HUMIDIFIER_GPIO,
+                                   "humidifier",
+                                   ESPAGENT_HUMIDIFIER_ACTIVE_LEVEL ? 1 : 0);
+}
+
+esp_err_t tool_set_fan_execute(const char *input_json, char *output, size_t output_size)
+{
+    return fixed_device_gpio_write(input_json,
+                                   output,
+                                   output_size,
+                                   ESPAGENT_FAN_GPIO,
+                                   "fan",
+                                   ESPAGENT_FAN_ACTIVE_LEVEL ? 1 : 0);
+}
+
+esp_err_t tool_set_device_led_execute(const char *input_json, char *output, size_t output_size)
 {
     cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
     if (!root) {
@@ -678,40 +860,24 @@ static esp_err_t fixed_device_gpio_write(const char *input_json,
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = ensure_output_gpio(pin);
-    if (err == ESP_OK) {
-        err = gpio_set_level(pin, state);
+    int pin = ESPAGENT_WS2812_DEFAULT_GPIO;
+    (void)get_optional_int(root, "pin", &pin);
+    esp_err_t err = ws2812_apply_color(pin,
+                                       state ? 255 : 0,
+                                       state ? 255 : 0,
+                                       state ? 255 : 0,
+                                       255,
+                                       output,
+                                       output_size,
+                                       state ? "white" : "off");
+    if (err == ESP_OK && pin == ESPAGENT_WS2812_DEFAULT_GPIO) {
+        ws2812_note_base_color(state ? 255 : 0,
+                               state ? 255 : 0,
+                               state ? 255 : 0,
+                               255);
     }
-
-    if (err == ESP_OK) {
-        snprintf(output, output_size, "OK: %s on GPIO%d turned %s",
-                 device_name, pin, state ? "ON" : "OFF");
-    } else if (err == ESP_ERR_INVALID_ARG) {
-        snprintf(output, output_size, "Error: GPIO%d is not a valid output pin", pin);
-    } else {
-        snprintf(output, output_size, "Error: failed to set %s GPIO%d (%s)",
-                 device_name, pin, esp_err_to_name(err));
-    }
-
-    ESP_LOGI(TAG, "%s pin=%d state=%d -> %s",
-             device_name, pin, state, esp_err_to_name(err));
     cJSON_Delete(root);
     return err;
-}
-
-esp_err_t tool_set_humidifier_execute(const char *input_json, char *output, size_t output_size)
-{
-    return fixed_device_gpio_write(input_json, output, output_size, 4, "humidifier");
-}
-
-esp_err_t tool_set_fan_execute(const char *input_json, char *output, size_t output_size)
-{
-    return fixed_device_gpio_write(input_json, output, output_size, 5, "fan");
-}
-
-esp_err_t tool_set_device_led_execute(const char *input_json, char *output, size_t output_size)
-{
-    return fixed_device_gpio_write(input_json, output, output_size, 6, "device_led");
 }
 
 esp_err_t tool_gpio_read_execute(const char *input_json, char *output, size_t output_size)
@@ -895,13 +1061,13 @@ esp_err_t tool_set_status_light_execute(const char *input_json, char *output, si
         return ESP_ERR_INVALID_ARG;
     }
 
-    int pin = ESPAGENT_WS2812_DEFAULT_GPIO;
     int brightness = 255;
     int red = -1;
     int green = -1;
     int blue = -1;
     const char *color = get_optional_string(root, "color");
 
+    int pin = ESPAGENT_WS2812_DEFAULT_GPIO;
     (void)get_optional_int(root, "pin", &pin);
     (void)get_optional_int(root, "brightness", &brightness);
 

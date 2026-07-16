@@ -4,7 +4,7 @@
 
 #include <stddef.h>
 
-/* Initialize GPIO and WS2812 helpers. */
+/* Initialize GPIO outputs and WS2812 status-light helpers. */
 esp_err_t tool_gpio_init(void);
 
 /* Write a GPIO pin HIGH or LOW.
@@ -18,9 +18,13 @@ esp_err_t tool_gpio_write_execute(const char *input_json, char *output, size_t o
 esp_err_t tool_copper_gpio_write_execute(const char *input_json, char *output, size_t output_size);
 
 /* High-level fixed device controls on the control agent.
- * GPIO4 = humidifier, GPIO5 = fan, GPIO6 = device LED.
+ * GPIO4 = humidifier active-high, GPIO5 = fan active-high by default.
+ * set_device_led is kept as an on/off alias for the onboard WS2812 status light.
  * Input JSON: {"state":0|1}; also accepts {"level":0|1} and
- * {"value":"on"|"off"|"high"|"low"|"打开"|"关闭"}. */
+ * logical {"value":"on"|"off"|"open"|"close"|"打开"|"关闭"}.
+ * Physical {"value":"high"|"low"|"拉高"|"拉低"} is also accepted and converted
+ * to the matching logical state for each device polarity.
+ * Use gpio_write/copper_gpio_write when the user explicitly asks for physical HIGH/LOW. */
 esp_err_t tool_set_humidifier_execute(const char *input_json, char *output, size_t output_size);
 esp_err_t tool_set_fan_execute(const char *input_json, char *output, size_t output_size);
 esp_err_t tool_set_device_led_execute(const char *input_json, char *output, size_t output_size);
@@ -37,8 +41,11 @@ esp_err_t tool_gpio_read_all_execute(const char *input_json, char *output, size_
  * Input JSON: {"r":<0-255>,"g":<0-255>,"b":<0-255>,"brightness"?:<0-255>,"pin"?:<int>} */
 esp_err_t tool_ws2812_set_execute(const char *input_json, char *output, size_t output_size);
 
-/* High-level chat-friendly status light alias.
- * Input JSON: {"color"?:<string>,"brightness"?:<0-255>,"pin"?:<int>,"r"?:<0-255>,"g"?:<0-255>,"b"?:<0-255>} */
+/* High-level chat-friendly WS2812 status light alias.
+ * Defaults to ESPAGENT_WS2812_DEFAULT_GPIO.
+ * Input JSON: {"color"?:<string>,"brightness"?:<0-255>,
+ * "pin"?:<int>,
+ * "r"?:<0-255>,"g"?:<0-255>,"b"?:<0-255>} */
 esp_err_t tool_set_status_light_execute(const char *input_json, char *output, size_t output_size);
 
 /* Start / stop internal rapid thinking animation on configured ordinary GPIO LEDs.

@@ -80,6 +80,28 @@
       "minimum": 0,
       "maximum": 60000
     },
+    "decode": {
+      "type": "object",
+      "description": "Optional firmware decoder. I2C currently supports raw_u8, raw_u16_be, raw_u16_le, and aht20_temp_humidity; arbitrary formula strings are intentionally unsupported.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["raw_u8", "raw_u16_be", "raw_u16_le", "aht20_temp_humidity"]
+        },
+        "field": {
+          "type": "string"
+        },
+        "scale": {
+          "type": "number"
+        },
+        "offset": {
+          "type": "number"
+        },
+        "unit": {
+          "type": "string"
+        }
+      }
+    },
     "notes": {
       "type": "string"
     }

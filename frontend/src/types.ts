@@ -81,6 +81,38 @@ export interface RuntimeSkillInstallResponse {
   skipped?: boolean;
 }
 
+export interface RuntimeDeviceManifestRecord {
+  id: string;
+  manifestName: string;
+  title: string;
+  protocol: string;
+  role: string;
+  risk: string;
+  path: string;
+  signaturePath: string;
+  source: 'local_mock' | 'proxy' | 'serial';
+  installedAt: string;
+  status: 'installed' | 'pending' | 'failed';
+  content?: string;
+  contentHash?: string;
+  lastMessage?: string;
+}
+
+export interface RuntimeDeviceManifestListResponse {
+  devices: RuntimeDeviceManifestRecord[];
+  source: 'local_mock' | 'proxy' | 'serial';
+  error?: string;
+}
+
+export interface RuntimeDeviceManifestUpdateResponse {
+  ok: boolean;
+  device?: RuntimeDeviceManifestRecord;
+  source: 'local_mock' | 'proxy' | 'serial';
+  message: string;
+  error?: string;
+  skipped?: boolean;
+}
+
 export interface UserPreferenceProfile {
   preferredChannel: string;
   privacyMode: 'metadata_only' | 'balanced' | 'full_context';

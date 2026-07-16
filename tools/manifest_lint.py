@@ -16,6 +16,7 @@ READ_PROTOCOLS = {"i2c", "uart", "modbus_rtu", "spi", "adc", "gpio_input"}
 CONTROL_PROTOCOLS = {"gpio_output", "relay_control", "pwm_output", "ledc_pwm"}
 PLANNED_PROTOCOLS = {"can_twai", "ble_gatt", "one_wire", "i2s_pdm", "rmt_ir", "usb_cdc", "sdmmc"}
 CONTROL_RISKS = {"low_control", "medium_control", "high_control"}
+I2C_DECODE_TYPES = {"raw_u8", "raw_u16_be", "raw_u16_le", "aht20_temp_humidity"}
 GPIO_ALLOWLIST = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 21, 38, 46}
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,47}$")
 MANIFEST_VERSION = 1
@@ -86,7 +87,20 @@ def validate_read_manifest(data: dict[str, Any]) -> None:
         pins = validate_pins_object(data, ["sda", "scl"])
         require(pins["sda"] != pins["scl"], "I2C SDA and SCL must differ")
         require("address" in data, "i2c address is required")
-        require(isinstance(data.get("operations"), list) and data["operations"], "i2c operations array is required")
+        operations = data.get("operations")
+        require(isinstance(operations, list) and operations, "i2c operations array is required")
+        decode = data.get("decode", {})
+        if isinstance(decode, dict) and "type" in decode:
+            dtype = decode["type"]
+            require(dtype in I2C_DECODE_TYPES, f"unsupported i2c decode.type={dtype}")
+            if dtype == "aht20_temp_humidity":
+                read_lengths = [
+                    op.get("length")
+                    for op in operations
+                    if isinstance(op, dict) and op.get("type") == "read"
+                ]
+                require(any(isinstance(length, int) and length >= 6 for length in read_lengths),
+                        "aht20_temp_humidity requires an I2C read operation with length >= 6")
     elif protocol == "uart":
         pins = validate_pins_object(data, ["tx", "rx"])
         require(pins["tx"] != pins["rx"], "UART tx and rx must differ")

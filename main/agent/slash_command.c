@@ -116,7 +116,8 @@ static const slash_command_spec_t s_commands[] = {
         .usage = "/control <自然语言任务>",
         .template_text =
             "这是一个显式的 /control 指令。请只从 control_agent 的职责出发处理这条请求，"
-            "优先使用状态灯、WS2812、GPIO、舵机、继电器、虚拟控制设备等执行能力。"
+            "优先使用板载 WS2812 状态灯、GPIO、继电器、虚拟控制设备等执行能力。"
+            "当前舵机暂时不使用，不要选择舵机控制。"
             "如果需要远程执行，应优先走 control_agent，而不是本地 coordinator 直接声称已执行。"
             "用户原始请求：%s",
     },
