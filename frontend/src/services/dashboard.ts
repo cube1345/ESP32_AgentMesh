@@ -6,8 +6,10 @@ import type {
   RuntimeDeviceManifestListResponse,
   RuntimeDeviceManifestRecord,
   RuntimeDeviceManifestUpdateResponse,
+  RuntimeSkillDetailResponse,
   RuntimeSkillInstallResponse,
   RuntimeSkillListResponse,
+  RuntimeSkillReadResult,
   RuntimeSkillRecord,
   SkillDraft,
   UserPreferenceProfile
@@ -17,6 +19,9 @@ const api = axios.create({
   baseURL: '/api',
   timeout: 2000
 });
+
+const RUNTIME_LIST_TIMEOUT_MS = 45000;
+const RUNTIME_INSTALL_TIMEOUT_MS = 90000;
 
 function clonePayload(): DashboardPayload {
   return JSON.parse(JSON.stringify(mockDashboardPayload)) as DashboardPayload;
@@ -36,6 +41,7 @@ function isDashboardPayload(value: unknown): value is DashboardPayload {
     Array.isArray(value.capabilities) &&
     Array.isArray(value.timeline) &&
     Array.isArray(value.environment) &&
+    Array.isArray(value.environmentHistory) &&
     Array.isArray(value.skills) &&
     isObject(value.preferences)
   );
@@ -51,6 +57,10 @@ function isRuntimeSkillListResponse(value: unknown): value is RuntimeSkillListRe
 
 function isRuntimeSkillInstallResponse(value: unknown): value is RuntimeSkillInstallResponse {
   return isObject(value) && typeof value.ok === 'boolean';
+}
+
+function isRuntimeSkillDetailResponse(value: unknown): value is RuntimeSkillDetailResponse {
+  return isObject(value) && isObject(value.skill) && typeof value.source === 'string';
 }
 
 function isRuntimeDeviceManifestListResponse(value: unknown): value is RuntimeDeviceManifestListResponse {
@@ -99,13 +109,27 @@ export async function saveSkills(skills: SkillDraft[]): Promise<SkillDraft[]> {
 export async function fetchRuntimeSkills(): Promise<RuntimeSkillListResponse> {
   try {
     const response = await api.get<RuntimeSkillListResponse>('/skills/runtime', {
-      timeout: 25000
+      timeout: RUNTIME_LIST_TIMEOUT_MS
     });
     return isRuntimeSkillListResponse(response.data)
       ? response.data
       : { skills: [], source: 'local_mock' };
-  } catch {
-    return { skills: [], source: 'local_mock' };
+  } catch (error) {
+    return { skills: [], source: 'local_mock', error: errorMessage(error) };
+  }
+}
+
+export async function fetchRuntimeSkill(runtimeName: string): Promise<RuntimeSkillReadResult> {
+  try {
+    const response = await api.get<RuntimeSkillDetailResponse>('/skills/runtime', {
+      params: { name: runtimeName },
+      timeout: RUNTIME_LIST_TIMEOUT_MS
+    });
+    return isRuntimeSkillDetailResponse(response.data)
+      ? { skill: response.data.skill, source: response.data.source }
+      : { skill: null, source: 'local_mock', error: 'invalid runtime skill detail response' };
+  } catch (error) {
+    return { skill: null, source: 'local_mock', error: errorMessage(error) };
   }
 }
 
@@ -118,7 +142,7 @@ export async function installRuntimeSkill(
       skill,
       confirmed
     }, {
-      timeout: 30000
+      timeout: RUNTIME_INSTALL_TIMEOUT_MS
     });
     return isRuntimeSkillInstallResponse(response.data)
       ? response.data
@@ -147,7 +171,7 @@ export async function updateRuntimeSkill(
       skill,
       confirmed
     }, {
-      timeout: 30000
+      timeout: RUNTIME_INSTALL_TIMEOUT_MS
     });
     return isRuntimeSkillInstallResponse(response.data)
       ? response.data

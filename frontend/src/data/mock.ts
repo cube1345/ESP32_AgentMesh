@@ -2,6 +2,7 @@ import type {
   AgentNode,
   Capability,
   DashboardPayload,
+  EnvironmentHistoryPoint,
   EnvironmentMetric,
   MeshMessageFlow,
   SkillDraft,
@@ -89,6 +90,20 @@ const environment: EnvironmentMetric[] = [
   { label: '光照', value: 185, unit: 'lux', status: 'attention', trend: 42 },
   { label: 'Presence', value: 1, unit: 'detected', status: 'good', trend: 0 }
 ];
+
+const environmentHistory: EnvironmentHistoryPoint[] = Array.from({ length: 48 }, (_, index) => {
+  const phase = index / 5;
+  return {
+    timestamp: new Date(Date.now() - (47 - index) * 5000).toISOString(),
+    nodeId: 'esp32s3-sensor-01',
+    temperatureC: Number((26.8 + Math.sin(phase) * 0.7).toFixed(1)),
+    humidityPercent: Number((62 + Math.cos(phase * 0.7) * 3.2).toFixed(1)),
+    eco2Ppm: Math.round(560 + Math.sin(phase * 0.45) * 90),
+    tvocPpb: Math.round(34 + Math.cos(phase * 0.55) * 14),
+    lightLux: Math.round(170 + Math.sin(phase * 0.8) * 48),
+    presence: index > 12 && index < 40 ? 1 : 0
+  };
+});
 
 const skills: SkillDraft[] = [
   {
@@ -181,6 +196,7 @@ export const mockDashboardPayload: DashboardPayload = {
   capabilities,
   timeline,
   environment,
+  environmentHistory,
   skills,
   preferences,
   flows

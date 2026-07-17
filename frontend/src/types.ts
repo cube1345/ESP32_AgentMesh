@@ -40,6 +40,17 @@ export interface EnvironmentMetric {
   trend: number;
 }
 
+export interface EnvironmentHistoryPoint {
+  timestamp: string;
+  nodeId: string;
+  temperatureC: number | null;
+  humidityPercent: number | null;
+  eco2Ppm: number | null;
+  tvocPpb: number | null;
+  lightLux: number | null;
+  presence: number | null;
+}
+
 export interface SkillDraft {
   id: string;
   name: string;
@@ -50,12 +61,14 @@ export interface SkillDraft {
   enabled: boolean;
 }
 
+export type RuntimeAssetSource = 'local_mock' | 'proxy' | 'serial' | 'mqtt';
+
 export interface RuntimeSkillRecord {
   id: string;
   runtimeName: string;
   title: string;
   path: string;
-  source: 'local_mock' | 'proxy' | 'serial';
+  source: RuntimeAssetSource;
   installedAt: string;
   cacheState: 'invalidated' | 'unknown';
   status: 'installed' | 'pending' | 'failed';
@@ -68,17 +81,28 @@ export interface RuntimeSkillRecord {
 
 export interface RuntimeSkillListResponse {
   skills: RuntimeSkillRecord[];
-  source: 'local_mock' | 'proxy' | 'serial';
+  source: RuntimeAssetSource;
   error?: string;
 }
 
 export interface RuntimeSkillInstallResponse {
   ok: boolean;
   skill?: RuntimeSkillRecord;
-  source: 'local_mock' | 'proxy' | 'serial';
+  source: RuntimeAssetSource;
   message: string;
   error?: string;
   skipped?: boolean;
+}
+
+export interface RuntimeSkillDetailResponse {
+  skill: RuntimeSkillRecord;
+  source: RuntimeAssetSource;
+}
+
+export interface RuntimeSkillReadResult {
+  skill: RuntimeSkillRecord | null;
+  source: RuntimeAssetSource;
+  error?: string;
 }
 
 export interface RuntimeDeviceManifestRecord {
@@ -136,6 +160,7 @@ export interface DashboardPayload {
   capabilities: Capability[];
   timeline: TimelineEvent[];
   environment: EnvironmentMetric[];
+  environmentHistory: EnvironmentHistoryPoint[];
   skills: SkillDraft[];
   preferences: UserPreferenceProfile;
   flows: MeshMessageFlow[];

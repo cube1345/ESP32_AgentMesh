@@ -4,6 +4,7 @@ import {
   BranchesOutlined,
   CloudUploadOutlined,
   ControlOutlined,
+  DeleteOutlined,
   DeploymentUnitOutlined,
   PlusOutlined,
   RadarChartOutlined,
@@ -11,17 +12,21 @@ import {
   SafetyCertificateOutlined,
   SaveOutlined
 } from '@ant-design/icons';
-import { Button, Empty, Form, Input, Progress, Segmented, Select, Slider, Switch, Tag, Typography } from 'antd';
+import { Alert, Button, Empty, Form, Input, Popconfirm, Progress, Segmented, Select, Slider, Spin, Switch, Tag, Typography } from 'antd';
+import { lazy, Suspense } from 'react';
 import type {
   AgentNode,
   DashboardPayload,
   EnvironmentMetric,
+  RuntimeAssetSource,
   RuntimeDeviceManifestRecord,
   RuntimeSkillRecord,
   SkillDraft,
   TimelineEvent,
   UserPreferenceProfile
 } from '../types';
+
+const EnvironmentHistoryChart = lazy(() => import('./EnvironmentHistoryChart'));
 
 export type TimelineFilter = '全部' | 'telemetry' | 'state' | 'policy' | 'sandbox' | 'reply' | 'error';
 
@@ -155,6 +160,16 @@ export function OverviewView({ payload, nodes, isLive }: OverviewProps) {
         </section>
       </div>
 
+      <section className="workspace-surface environment-history-surface">
+        <div className="section-heading">
+          <div><span>Sensor History</span><h2>环境趋势</h2></div>
+          <small>最近 {payload.environmentHistory?.length || 0} 次 MQTT 采样</small>
+        </div>
+        <Suspense fallback={<div className="environment-chart-loading"><Spin size="small" /></div>}>
+          <EnvironmentHistoryChart points={payload.environmentHistory || []} />
+        </Suspense>
+      </section>
+
       <div className="overview-grid overview-grid-secondary">
         <section className="workspace-surface activity-surface">
           <div className="section-heading">
@@ -264,6 +279,7 @@ interface SkillsProps {
   patchSkill: (patch: Partial<SkillDraft>) => void;
   canEdit: boolean;
   addSkill: () => void;
+  deleteSkill: (id: string) => void;
   saveSkills: () => void;
   saving: boolean;
   install: () => void;
@@ -275,8 +291,12 @@ interface SkillsProps {
   patchRuntimeSkill: (patch: Partial<RuntimeSkillRecord>) => void;
   saveRuntimeSkill: () => void;
   savingRuntime: boolean;
-  runtimeSource: 'local_mock' | 'proxy' | 'serial';
+  runtimeSource: RuntimeAssetSource;
   runtimeError: string;
+  runtimeLoading: boolean;
+  runtimeDetailLoading: boolean;
+  runtimeDetailError: string;
+  refreshRuntime: () => void;
   runtimeDevices: RuntimeDeviceManifestRecord[];
   activeRuntimeDevice: RuntimeDeviceManifestRecord | null;
   activeRuntimeDeviceId: string;
@@ -286,6 +306,8 @@ interface SkillsProps {
   savingRuntimeDevice: boolean;
   runtimeDeviceSource: 'local_mock' | 'proxy' | 'serial';
   runtimeDeviceError: string;
+  runtimeDevicesLoading: boolean;
+  refreshDevices: () => void;
   refresh: () => void;
 }
 
@@ -300,6 +322,7 @@ export function SkillsView(props: SkillsProps) {
     patchSkill,
     canEdit,
     addSkill,
+    deleteSkill,
     saveSkills,
     saving,
     install,
@@ -313,6 +336,10 @@ export function SkillsView(props: SkillsProps) {
     savingRuntime,
     runtimeSource,
     runtimeError,
+    runtimeLoading,
+    runtimeDetailLoading,
+    runtimeDetailError,
+    refreshRuntime,
     runtimeDevices,
     activeRuntimeDevice,
     activeRuntimeDeviceId,
@@ -322,11 +349,15 @@ export function SkillsView(props: SkillsProps) {
     savingRuntimeDevice,
     runtimeDeviceSource,
     runtimeDeviceError,
+    runtimeDevicesLoading,
+    refreshDevices,
     refresh
   } = props;
   const runtimeSourceLabel = runtimeError
     ? '连接不可用'
-    : runtimeSource === 'serial'
+    : runtimeSource === 'mqtt'
+      ? '无线 MQTT'
+      : runtimeSource === 'serial'
       ? '串口实时'
       : runtimeSource === 'proxy'
         ? '网关代理'
@@ -348,49 +379,73 @@ export function SkillsView(props: SkillsProps) {
             <Button type="text" icon={<PlusOutlined />} onClick={addSkill} disabled={!canEdit} aria-label="新增 Skill" />
           </div>
           {drafts.map((draft) => (
-            <button
-              key={draft.id}
-              className={`skill-select ${editorMode === 'draft' && draft.id === activeId ? 'is-active' : ''}`}
-              onClick={() => { setEditorMode('draft'); setActiveId(draft.id); }}
-            >
-              <span><strong>{draft.name}</strong><small>{draft.scope}</small></span>
-              <i className={draft.enabled ? 'is-enabled' : ''} />
-            </button>
+            <div className="skill-draft-row" key={draft.id}>
+              <button
+                className={`skill-select ${editorMode === 'draft' && draft.id === activeId ? 'is-active' : ''}`}
+                onClick={() => { setEditorMode('draft'); setActiveId(draft.id); }}
+              >
+                <span><strong>{draft.name}</strong><small>{draft.scope}</small></span>
+                <i className={draft.enabled ? 'is-enabled' : ''} />
+              </button>
+              <Popconfirm
+                title="删除这个 Skill 草稿？"
+                okText="删除"
+                cancelText="取消"
+                placement="right"
+                onConfirm={() => deleteSkill(draft.id)}
+              >
+                <Button
+                  type="text"
+                  danger
+                  icon={<DeleteOutlined />}
+                  disabled={!canEdit}
+                  aria-label={`删除 Skill 草稿 ${draft.name}`}
+                />
+              </Popconfirm>
+            </div>
           ))}
 
           <div className="studio-list-divider">
             <span>Runtime</span>
-            <button onClick={refresh} aria-label="刷新 Runtime Skills"><ReloadOutlined /></button>
+            <button onClick={refreshRuntime} aria-label="刷新 Runtime Skills" disabled={runtimeLoading}><ReloadOutlined /></button>
           </div>
-          {runtimeError ? (
-            <p className="studio-list-note">{runtimeErrorLabel(runtimeError)}</p>
-          ) : runtimeSkills.length ? runtimeSkills.map((item) => (
-            <button
-              key={item.runtimeName}
-              className={`skill-select runtime-select ${editorMode === 'runtime' && item.runtimeName === activeRuntimeId ? 'is-active' : ''}`}
-              onClick={() => { setEditorMode('runtime'); setActiveRuntimeId(item.runtimeName); }}
-            >
-              <span><strong>{item.title || item.runtimeName}</strong><small>{item.path || item.runtimeName}</small></span>
-              <i className={item.content ? 'is-enabled' : ''} />
-            </button>
-          )) : <p className="studio-list-note">当前未读取到 Runtime Skill</p>}
+          <div className="studio-asset-list">
+            {runtimeLoading && !runtimeSkills.length ? (
+              <div className="studio-list-note studio-loading"><Spin size="small" /> 正在读取 Runtime Skills...</div>
+            ) : runtimeError ? (
+              <p className="studio-list-note">{runtimeErrorLabel(runtimeError)}</p>
+            ) : runtimeSkills.length ? runtimeSkills.map((item) => (
+              <button
+                key={item.runtimeName}
+                className={`skill-select runtime-select ${editorMode === 'runtime' && item.runtimeName === activeRuntimeId ? 'is-active' : ''}`}
+                onClick={() => { setEditorMode('runtime'); setActiveRuntimeId(item.runtimeName); }}
+              >
+                <span><strong>{item.title || item.runtimeName}</strong><small>{item.path || item.runtimeName}</small></span>
+                <i className={item.status === 'installed' ? 'is-enabled' : ''} />
+              </button>
+            )) : <p className="studio-list-note">当前未读取到 Runtime Skill</p>}
+          </div>
 
           <div className="studio-list-divider">
             <span>Devices</span>
-            <button onClick={refresh} aria-label="刷新 Device Manifests"><ReloadOutlined /></button>
+            <button onClick={refreshDevices} aria-label="刷新 Device Manifests" disabled={runtimeDevicesLoading}><ReloadOutlined /></button>
           </div>
-          {runtimeDeviceError ? (
-            <p className="studio-list-note">{runtimeErrorLabel(runtimeDeviceError)}</p>
-          ) : runtimeDevices.length ? runtimeDevices.map((item) => (
-            <button
-              key={item.manifestName}
-              className={`skill-select runtime-select ${editorMode === 'device' && item.manifestName === activeRuntimeDeviceId ? 'is-active' : ''}`}
-              onClick={() => { setEditorMode('device'); setActiveRuntimeDeviceId(item.manifestName); }}
-            >
-              <span><strong>{item.manifestName}</strong><small>{item.protocol} · {item.role}</small></span>
-              <i className={item.content ? 'is-enabled' : ''} />
-            </button>
-          )) : <p className="studio-list-note">当前未读取到 Device Manifest</p>}
+          <div className="studio-asset-list">
+            {runtimeDevicesLoading && !runtimeDevices.length ? (
+              <div className="studio-list-note studio-loading"><Spin size="small" /> 正在读取 Device Manifests...</div>
+            ) : runtimeDeviceError ? (
+              <p className="studio-list-note">{runtimeErrorLabel(runtimeDeviceError)}</p>
+            ) : runtimeDevices.length ? runtimeDevices.map((item) => (
+              <button
+                key={item.manifestName}
+                className={`skill-select runtime-select ${editorMode === 'device' && item.manifestName === activeRuntimeDeviceId ? 'is-active' : ''}`}
+                onClick={() => { setEditorMode('device'); setActiveRuntimeDeviceId(item.manifestName); }}
+              >
+                <span><strong>{item.manifestName}</strong><small>{item.protocol} · {item.role}</small></span>
+                <i className={item.content ? 'is-enabled' : ''} />
+              </button>
+            )) : <p className="studio-list-note">当前未读取到 Device Manifest</p>}
+          </div>
         </aside>
         <section className="studio-editor">
           {editorMode === 'draft' ? (
@@ -422,8 +477,8 @@ export function SkillsView(props: SkillsProps) {
               <div className="section-heading">
                 <div><span>Runtime Editor</span><h2>{activeRuntime?.title || '选择一个 Runtime Skill'}</h2></div>
                 <div className="section-actions">
-                  <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
-                  <Button type="primary" icon={<SaveOutlined />} onClick={saveRuntimeSkill} loading={savingRuntime} disabled={!canEdit || !activeRuntime}>保存到上位机/板端</Button>
+                  <Button icon={<ReloadOutlined />} onClick={refreshRuntime} loading={runtimeLoading}>刷新</Button>
+                  <Button type="primary" icon={<SaveOutlined />} onClick={saveRuntimeSkill} loading={savingRuntime} disabled={!canEdit || !activeRuntime || runtimeDetailLoading || Boolean(runtimeDetailError)}>保存到上位机/板端</Button>
                 </div>
               </div>
               {activeRuntime ? (
@@ -433,11 +488,13 @@ export function SkillsView(props: SkillsProps) {
                     <Form.Item label="标题"><Input value={activeRuntime.title} onChange={(event) => patchRuntimeSkill({ title: event.target.value })} disabled={!canEdit} /></Form.Item>
                   </div>
                   <div className="runtime-detail-grid">
-                    <span>Source：{activeRuntime.source}</span>
+                    <span>Source：{activeRuntime.source === 'mqtt' ? '无线 MQTT' : activeRuntime.source}</span>
                     <span>Status：{activeRuntime.status}</span>
                     <span>Path：{activeRuntime.path}</span>
                   </div>
                   {activeRuntime.lastMessage ? <p className="studio-list-note">{activeRuntime.lastMessage}</p> : null}
+                  {runtimeDetailLoading ? <div className="runtime-detail-loading"><Spin size="small" /> 正在从设备读取 Skill 正文...</div> : null}
+                  {runtimeDetailError ? <Alert type="error" showIcon message="Runtime Skill 正文读取失败" description={runtimeErrorLabel(runtimeDetailError)} /> : null}
                   <Form.Item label="Runtime Skill Markdown">
                     <Input.TextArea
                       rows={16}
@@ -495,7 +552,7 @@ export function SkillsView(props: SkillsProps) {
           {runtimeError ? <em>{runtimeErrorLabel(runtimeError)}</em> : runtimeSkills.length ? runtimeSkills.slice(0, 8).map((item) => <span key={item.id || item.runtimeName}>{item.title}<small>{item.status}</small></span>) : <em>未读取到 Runtime Skill</em>}
           {runtimeDeviceError ? <em>{runtimeErrorLabel(runtimeDeviceError)}</em> : runtimeDevices.length ? runtimeDevices.slice(0, 8).map((item) => <span key={item.id || item.manifestName}>{item.manifestName}<small>{item.protocol}</small></span>) : <em>未读取到 Device Manifest</em>}
         </div>
-        <Button icon={<ReloadOutlined />} onClick={refresh}>刷新</Button>
+        <Button icon={<ReloadOutlined />} onClick={refresh} loading={runtimeLoading || runtimeDevicesLoading}>刷新</Button>
       </section>
     </div>
   );

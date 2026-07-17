@@ -827,10 +827,30 @@ static int cmd_tool_exec(int argc, char **argv)
     }
 
     const char *tool_name = argv[1];
-    const char *input_json = (argc >= 3) ? argv[2] : "{}";
+    char *joined_json = NULL;
+    const char *input_json = "{}";
+    if (argc >= 3) {
+        size_t input_len = 0;
+        for (int i = 2; i < argc; i++) {
+            input_len += strlen(argv[i]) + 1;
+        }
+        joined_json = calloc(1, input_len + 1);
+        if (!joined_json) {
+            printf("Out of memory.\n");
+            return 1;
+        }
+        for (int i = 2; i < argc; i++) {
+            if (i > 2) {
+                strncat(joined_json, " ", input_len - strlen(joined_json));
+            }
+            strncat(joined_json, argv[i], input_len - strlen(joined_json));
+        }
+        input_json = joined_json;
+    }
 
     char *output = calloc(1, 4096);
     if (!output) {
+        free(joined_json);
         printf("Out of memory.\n");
         return 1;
     }
@@ -843,6 +863,7 @@ static int cmd_tool_exec(int argc, char **argv)
     printf("tool_exec status: %s\n", esp_err_to_name(err));
     printf("%s\n", output[0] ? output : "(empty)");
     free(output);
+    free(joined_json);
     return (err == ESP_OK) ? 0 : 1;
 }
 

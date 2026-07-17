@@ -20,8 +20,9 @@ def configure(fd: int) -> None:
     termios.tcsetattr(fd, termios.TCSANOW, attrs)
 
 
-def drain(fd: int, seconds: float, echo: bool) -> str:
+def drain(fd: int, seconds: float, echo: bool, stop_markers: tuple[str, ...] = ()) -> str:
     end = time.time() + seconds
+    stop_at: float | None = None
     out: list[str] = []
     while time.time() < end:
         readable, _, _ = select.select([fd], [], [], 0.2)
@@ -38,6 +39,10 @@ def drain(fd: int, seconds: float, echo: bool) -> str:
         if echo:
             sys.stdout.write(text)
             sys.stdout.flush()
+        if stop_markers and stop_at is None and any(marker in "".join(out) for marker in stop_markers):
+            stop_at = time.time() + 0.75
+        if stop_at is not None and time.time() >= stop_at:
+            break
     return "".join(out)
 
 
@@ -61,7 +66,12 @@ def main() -> int:
         line = " ".join(args.command)
         print(f"===== serial command =====\n{args.port}: {line}")
         os.write(fd, (line + "\n").encode("utf-8"))
-        output = drain(fd, args.timeout, args.echo)
+        stop_markers: tuple[str, ...] = ()
+        if line.startswith("tool_exec "):
+            stop_markers = ("tool_exec status:",)
+        elif line.strip() == "config_show":
+            stop_markers = ("=============================",)
+        output = drain(fd, args.timeout, args.echo, stop_markers)
         print("===== serial output end =====")
         if not args.echo:
             print(output)

@@ -25,8 +25,8 @@ import {
   type TimelineFilter
 } from './components/ConsoleViews';
 import { mockDashboardPayload } from './data/mock';
-import { fetchDashboard, fetchRuntimeDeviceManifests, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills, updateRuntimeDeviceManifest, updateRuntimeSkill } from './services/dashboard';
-import type { AgentNode, DashboardPayload, RuntimeDeviceManifestRecord, RuntimeSkillRecord, SkillDraft, TimelineEvent, UserPreferenceProfile } from './types';
+import { fetchDashboard, fetchRuntimeDeviceManifests, fetchRuntimeSkill, fetchRuntimeSkills, installRuntimeSkill, savePreferences, saveSkills, updateRuntimeDeviceManifest, updateRuntimeSkill } from './services/dashboard';
+import type { AgentNode, DashboardPayload, RuntimeAssetSource, RuntimeDeviceManifestRecord, RuntimeSkillRecord, SkillDraft, TimelineEvent, UserPreferenceProfile } from './types';
 
 type ViewMode = '总览' | '协作链路' | 'Sandbox' | 'Skills Studio' | '用户偏好';
 type Role = 'admin' | 'operator' | 'viewer';
@@ -149,10 +149,14 @@ function App() {
   const [installingSkillId, setInstallingSkillId] = useState<string | null>(null);
   const [savingRuntimeSkillId, setSavingRuntimeSkillId] = useState<string | null>(null);
   const [savingRuntimeDeviceManifestId, setSavingRuntimeDeviceManifestId] = useState<string | null>(null);
-  const [runtimeSkillSource, setRuntimeSkillSource] = useState<'local_mock' | 'proxy' | 'serial'>('local_mock');
+  const [runtimeSkillSource, setRuntimeSkillSource] = useState<RuntimeAssetSource>('local_mock');
   const [runtimeSkillError, setRuntimeSkillError] = useState('');
+  const [runtimeSkillsLoading, setRuntimeSkillsLoading] = useState(false);
+  const [runtimeSkillDetailLoading, setRuntimeSkillDetailLoading] = useState(false);
+  const [runtimeSkillDetailError, setRuntimeSkillDetailError] = useState('');
   const [runtimeDeviceSource, setRuntimeDeviceSource] = useState<'local_mock' | 'proxy' | 'serial'>('local_mock');
   const [runtimeDeviceError, setRuntimeDeviceError] = useState('');
+  const [runtimeDevicesLoading, setRuntimeDevicesLoading] = useState(false);
   const [savingPrefs, setSavingPrefs] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [wsUrl, setWsUrl] = useState(defaultGatewayWsUrl);
@@ -179,17 +183,34 @@ function App() {
   useEffect(() => {
     if (viewMode !== 'Skills Studio') return;
     let cancelled = false;
-    void Promise.all([fetchRuntimeSkills(), fetchRuntimeDeviceManifests()]).then(([skills, devices]) => {
-      if (cancelled) return;
-      setRuntimeSkills(skills.skills);
-      setRuntimeSkillSource(skills.source);
-      setRuntimeSkillError(skills.error || '');
-      setRuntimeDeviceManifests(devices.devices);
-      setRuntimeDeviceSource(devices.source);
-      setRuntimeDeviceError(devices.error || '');
-    });
+    const loadSkills = async () => {
+      setRuntimeSkillsLoading(true);
+      const skills = await fetchRuntimeSkills();
+      if (!cancelled) {
+        setRuntimeSkills(skills.skills);
+        setRuntimeSkillSource(skills.source);
+        setRuntimeSkillError(skills.error || '');
+        setRuntimeSkillsLoading(false);
+      }
+    };
+    const loadDevices = async () => {
+      setRuntimeDevicesLoading(true);
+      const devices = await fetchRuntimeDeviceManifests();
+      if (!cancelled) {
+        setRuntimeDeviceManifests(devices.devices);
+        setRuntimeDeviceSource(devices.source);
+        setRuntimeDeviceError(devices.error || '');
+        setRuntimeDevicesLoading(false);
+      }
+    };
+    void loadSkills();
+    void loadDevices();
     return () => { cancelled = true; };
   }, [viewMode]);
+
+  const activeSkill = useMemo(() => draftSkills.find((item) => item.id === activeSkillId) || null, [activeSkillId, draftSkills]);
+  const activeRuntimeSkill = useMemo(() => runtimeSkills.find((item) => item.runtimeName === activeRuntimeSkillId) || null, [activeRuntimeSkillId, runtimeSkills]);
+  const activeRuntimeDeviceManifest = useMemo(() => runtimeDeviceManifests.find((item) => item.manifestName === activeRuntimeDeviceManifestId) || null, [activeRuntimeDeviceManifestId, runtimeDeviceManifests]);
 
   useEffect(() => { localStorage.setItem(DRAFT_SKILLS_STORAGE_KEY, JSON.stringify(draftSkills)); }, [draftSkills]);
   useEffect(() => { localStorage.setItem(PREFS_STORAGE_KEY, JSON.stringify(preferences)); }, [preferences]);
@@ -205,6 +226,29 @@ function App() {
     }
   }, [activeRuntimeSkillId, runtimeSkills]);
   useEffect(() => {
+    if (!activeRuntimeSkillId || typeof activeRuntimeSkill?.content === 'string' && activeRuntimeSkill.content.length > 0) {
+      setRuntimeSkillDetailLoading(false);
+      setRuntimeSkillDetailError('');
+      return;
+    }
+    let cancelled = false;
+    setRuntimeSkillDetailLoading(true);
+    setRuntimeSkillDetailError('');
+    void fetchRuntimeSkill(activeRuntimeSkillId).then((result) => {
+      if (cancelled) return;
+      if (result.skill) {
+        setRuntimeSkills((current) => current.map((item) => (
+          item.runtimeName === result.skill?.runtimeName ? result.skill : item
+        )));
+        setRuntimeSkillSource(result.source);
+      } else {
+        setRuntimeSkillDetailError(result.error || 'Runtime Skill 正文读取失败');
+      }
+      setRuntimeSkillDetailLoading(false);
+    });
+    return () => { cancelled = true; };
+  }, [activeRuntimeSkill?.content, activeRuntimeSkillId]);
+  useEffect(() => {
     if (!runtimeDeviceManifests.length) {
       if (activeRuntimeDeviceManifestId) setActiveRuntimeDeviceManifestId('');
       return;
@@ -216,9 +260,6 @@ function App() {
   useEffect(() => () => wsInstance?.close(), [wsInstance]);
   useEffect(() => { if (chatScrollRef.current) chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight; }, [chatMessages]);
 
-  const activeSkill = useMemo(() => draftSkills.find((item) => item.id === activeSkillId) || null, [activeSkillId, draftSkills]);
-  const activeRuntimeSkill = useMemo(() => runtimeSkills.find((item) => item.runtimeName === activeRuntimeSkillId) || null, [activeRuntimeSkillId, runtimeSkills]);
-  const activeRuntimeDeviceManifest = useMemo(() => runtimeDeviceManifests.find((item) => item.manifestName === activeRuntimeDeviceManifestId) || null, [activeRuntimeDeviceManifestId, runtimeDeviceManifests]);
   const canEditSkills = session?.role === 'admin';
   const canUseChat = session?.role !== 'viewer';
   const isLive = Boolean(payload.mqtt);
@@ -272,6 +313,14 @@ function App() {
     setSkillEditorMode('draft');
   }
 
+  function deleteSkill(id: string) {
+    if (!canEditSkills) return;
+    const next = draftSkills.filter((item) => item.id !== id);
+    setDraftSkills(next);
+    if (activeSkillId === id) setActiveSkillId(next[0]?.id || '');
+    messageApi.success('Skill 草稿已删除');
+  }
+
   async function handleSaveSkills() {
     if (!canEditSkills) return;
     setSavingSkills(true);
@@ -284,11 +333,27 @@ function App() {
   }
 
   async function refreshRuntimeSkills() {
-    const next = await fetchRuntimeSkills(); setRuntimeSkills(next.skills); setRuntimeSkillSource(next.source); setRuntimeSkillError(next.error || '');
+    setRuntimeSkillsLoading(true);
+    try {
+      const next = await fetchRuntimeSkills();
+      setRuntimeSkills(next.skills);
+      setRuntimeSkillSource(next.source);
+      setRuntimeSkillError(next.error || '');
+    } finally {
+      setRuntimeSkillsLoading(false);
+    }
   }
 
   async function refreshRuntimeDeviceManifests() {
-    const next = await fetchRuntimeDeviceManifests(); setRuntimeDeviceManifests(next.devices); setRuntimeDeviceSource(next.source); setRuntimeDeviceError(next.error || '');
+    setRuntimeDevicesLoading(true);
+    try {
+      const next = await fetchRuntimeDeviceManifests();
+      setRuntimeDeviceManifests(next.devices);
+      setRuntimeDeviceSource(next.source);
+      setRuntimeDeviceError(next.error || '');
+    } finally {
+      setRuntimeDevicesLoading(false);
+    }
   }
 
   async function refreshRuntimeAssets() {
@@ -323,6 +388,7 @@ function App() {
         }
         messageApi.success(result.message || 'Runtime Skill 已保存');
         await refreshRuntimeSkills();
+        setRuntimeSkillSource(result.source);
       } else {
         messageApi.error(result.error || result.message || '保存失败');
       }
@@ -366,6 +432,7 @@ function App() {
         }
         messageApi.success(result.message || 'Runtime Skill 已安装');
         await refreshRuntimeSkills();
+        setRuntimeSkillSource(result.source);
       }
       else messageApi.error(result.error || result.message || '安装失败');
     } finally { setInstallingSkillId(null); }
@@ -454,6 +521,7 @@ function App() {
                   patchSkill={(patch) => setDraftSkills((current) => current.map((item) => item.id === activeSkillId ? { ...item, ...patch } : item))}
                   canEdit={canEditSkills}
                   addSkill={addSkill}
+                  deleteSkill={deleteSkill}
                   saveSkills={handleSaveSkills}
                   saving={savingSkills}
                   install={handleInstallSkill}
@@ -467,6 +535,10 @@ function App() {
                   savingRuntime={savingRuntimeSkillId === activeRuntimeSkillId}
                   runtimeSource={runtimeSkillSource}
                   runtimeError={runtimeSkillError}
+                  runtimeLoading={runtimeSkillsLoading}
+                  runtimeDetailLoading={runtimeSkillDetailLoading}
+                  runtimeDetailError={runtimeSkillDetailError}
+                  refreshRuntime={refreshRuntimeSkills}
                   runtimeDevices={runtimeDeviceManifests}
                   activeRuntimeDevice={activeRuntimeDeviceManifest}
                   activeRuntimeDeviceId={activeRuntimeDeviceManifestId}
@@ -476,6 +548,8 @@ function App() {
                   savingRuntimeDevice={savingRuntimeDeviceManifestId === activeRuntimeDeviceManifestId}
                   runtimeDeviceSource={runtimeDeviceSource}
                   runtimeDeviceError={runtimeDeviceError}
+                  runtimeDevicesLoading={runtimeDevicesLoading}
+                  refreshDevices={refreshRuntimeDeviceManifests}
                   refresh={refreshRuntimeAssets}
                 />
               )}

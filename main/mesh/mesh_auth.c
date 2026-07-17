@@ -68,19 +68,14 @@ static esp_err_t build_canonical(const espagent_mesh_command_t *cmd,
     return (n > 0 && (size_t)n < buf_size) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
-static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
-                               const char *key,
-                               char *signature,
-                               size_t signature_size)
+static esp_err_t sign_text_with_key(const char *text,
+                                    const char *key,
+                                    char *signature,
+                                    size_t signature_size)
 {
-    if (!cmd || !key || !key[0] || !signature || signature_size < ESPAGENT_MESH_SIGNATURE_MAX) {
+    if (!text || !key || !key[0] || !signature ||
+        signature_size < ESPAGENT_MESH_SIGNATURE_MAX) {
         return ESP_ERR_INVALID_ARG;
-    }
-
-    char canonical[640] = {0};
-    esp_err_t err = build_canonical(cmd, canonical, sizeof(canonical));
-    if (err != ESP_OK) {
-        return err;
     }
 
     uint8_t mac[32] = {0};
@@ -88,15 +83,15 @@ static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
     if (!info) {
         return ESP_FAIL;
     }
-    err = espagent_net_guard_take(5000);
+    esp_err_t err = espagent_net_guard_take(5000);
     if (err != ESP_OK) {
         return err;
     }
     int rc = mbedtls_md_hmac(info,
                              (const uint8_t *)key,
                              strlen(key),
-                             (const uint8_t *)canonical,
-                             strlen(canonical),
+                             (const uint8_t *)text,
+                             strlen(text),
                              mac);
     espagent_net_guard_give();
     if (rc != 0) {
@@ -104,6 +99,22 @@ static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
     }
     bytes_to_hex(mac, sizeof(mac), signature, signature_size);
     return ESP_OK;
+}
+
+static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
+                               const char *key,
+                               char *signature,
+                               size_t signature_size)
+{
+    if (!cmd) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    char canonical[640] = {0};
+    esp_err_t err = build_canonical(cmd, canonical, sizeof(canonical));
+    if (err != ESP_OK) {
+        return err;
+    }
+    return sign_text_with_key(canonical, key, signature, signature_size);
 }
 
 esp_err_t espagent_mesh_auth_sign_command(const espagent_mesh_command_t *cmd,
@@ -170,4 +181,53 @@ esp_err_t espagent_mesh_auth_verify_command(const espagent_mesh_command_t *cmd,
         snprintf(reason, reason_size, "mesh command signature mismatch");
     }
     return ESP_ERR_INVALID_CRC;
+}
+
+esp_err_t espagent_mesh_auth_verify_text(const char *text,
+                                         const char *signature,
+                                         char *reason,
+                                         size_t reason_size)
+{
+    if (!text) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!espagent_mesh_auth_enabled()) {
+        if (reason && reason_size) {
+            snprintf(reason, reason_size, "mesh auth disabled");
+        }
+        return ESP_OK;
+    }
+    if (!signature || signature[0] == '\0') {
+        if (reason && reason_size) {
+            snprintf(reason, reason_size, "missing payload signature");
+        }
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char expected[ESPAGENT_MESH_SIGNATURE_MAX] = {0};
+    esp_err_t err = ESP_ERR_INVALID_CRC;
+    if (ESPAGENT_MESH_AUTH_KEY[0]) {
+        err = sign_text_with_key(text, ESPAGENT_MESH_AUTH_KEY,
+                                 expected, sizeof(expected));
+        if (err == ESP_OK && hex_equal(expected, signature)) {
+            if (reason && reason_size) {
+                snprintf(reason, reason_size, "payload signature verified current key");
+            }
+            return ESP_OK;
+        }
+    }
+    if (ESPAGENT_MESH_AUTH_PREVIOUS_KEY[0]) {
+        err = sign_text_with_key(text, ESPAGENT_MESH_AUTH_PREVIOUS_KEY,
+                                 expected, sizeof(expected));
+        if (err == ESP_OK && hex_equal(expected, signature)) {
+            if (reason && reason_size) {
+                snprintf(reason, reason_size, "payload signature verified previous key");
+            }
+            return ESP_OK;
+        }
+    }
+    if (reason && reason_size) {
+        snprintf(reason, reason_size, "payload signature mismatch");
+    }
+    return err == ESP_OK ? ESP_ERR_INVALID_CRC : err;
 }

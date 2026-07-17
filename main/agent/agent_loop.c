@@ -2152,11 +2152,15 @@ static bool try_execute_deterministic_skill_read_request(
 static bool try_execute_deterministic_condition_rule_request(
     const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
     char **final_text) {
+  const bool explicit_rule_request =
+      msg && msg->content &&
+      (contains_substr_ci(msg->content, "显式的 /rule") ||
+       contains_substr_ci(msg->content, "/rule"));
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
       message_has_local_marker(msg->content) ||
       message_is_skill_or_knowledge_query(msg->content) ||
-      !message_has_condition_rule_marker(msg->content)) {
+      (!explicit_rule_request && !message_has_condition_rule_marker(msg->content))) {
     return false;
   }
 
@@ -2190,7 +2194,7 @@ static bool try_execute_deterministic_condition_rule_request(
       contains_substr_ci(msg->content, "小于") ||
       contains_substr_ci(msg->content, "低于") ||
       contains_substr_ci(msg->content, "不超过");
-  if (!has_above || !has_below) {
+  if (!explicit_rule_request && (!has_above || !has_below)) {
     return false;
   }
 
@@ -2205,18 +2209,20 @@ static bool try_execute_deterministic_condition_rule_request(
   const char *colors[ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS] = {0};
   int color_count = extract_status_light_color_sequence(
       msg->content, colors, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS);
-  if (color_count < 2) {
+  if (color_count < 1) {
     return false;
   }
 
   const char *above_color = colors[0];
-  const char *below_color = colors[1];
-  if (contains_substr_ci(msg->content, "小于") ||
+  const char *below_color = color_count >= 2 ? colors[1] : "off";
+  const bool first_branch_is_below =
+      contains_substr_ci(msg->content, "小于") ||
       contains_substr_ci(msg->content, "低于") ||
       contains_substr_ci(msg->content, "below") ||
-      contains_substr_ci(msg->content, "less")) {
+      contains_substr_ci(msg->content, "less");
+  if (first_branch_is_below) {
     below_color = colors[0];
-    above_color = colors[1];
+    above_color = color_count >= 2 ? colors[1] : "off";
   }
 
   cJSON *root = cJSON_CreateObject();

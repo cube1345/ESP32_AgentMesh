@@ -4,10 +4,12 @@
 #include "espagent_config.h"
 #include "control/command_queue.h"
 #include "guardian/approval_queue.h"
+#include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
 #include "net/net_guard.h"
 #include "node/node_profile.h"
 #include "roles/role_config.h"
+#include "skills/skill_runtime.h"
 #include "tools/tool_environment.h"
 #include "tools/tool_gpio.h"
 #include "tools/tool_gree_ac.h"
@@ -28,6 +30,7 @@
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
 #include "lwip/sockets.h"
+#include "mbedtls/md.h"
 
 #include <errno.h>
 #include <math.h>
@@ -2052,6 +2055,129 @@ static void handle_web_chat_request(const char *payload, size_t payload_len)
     ESP_LOGI(TAG, "Web chat request injected: chat_id=%s text=%.64s", chat_id, content);
 }
 
+static esp_err_t runtime_skill_content_sha256(const char *content,
+                                              char *hex,
+                                              size_t hex_size)
+{
+    if (!content || !hex || hex_size < 65) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    uint8_t digest[32] = {0};
+    if (!info || mbedtls_md(info, (const unsigned char *)content,
+                            strlen(content), digest) != 0) {
+        return ESP_FAIL;
+    }
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); i++) {
+        hex[i * 2] = digits[(digest[i] >> 4) & 0x0f];
+        hex[i * 2 + 1] = digits[digest[i] & 0x0f];
+    }
+    hex[64] = '\0';
+    return ESP_OK;
+}
+
+static void publish_runtime_skill_reply(const char *request_id,
+                                        const char *name,
+                                        esp_err_t err,
+                                        const char *message)
+{
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return;
+    }
+    cJSON_AddBoolToObject(root, "ok", err == ESP_OK);
+    cJSON_AddStringToObject(root, "request_id", request_id ? request_id : "");
+    cJSON_AddStringToObject(root, "name", name ? name : "");
+    cJSON_AddStringToObject(root, "message", message ? message : "runtime skill request failed");
+    cJSON_AddStringToObject(root, "esp_err", esp_err_to_name(err));
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return;
+    }
+    (void)mqtt_queue_publish(ESPAGENT_MESH_TOPIC_RUNTIME_SKILL_REPLY, json);
+    cJSON_free(json);
+}
+
+static void handle_runtime_skill_request(const char *payload, size_t payload_len)
+{
+    if (!espagent_role_is_coordinator() || !payload || payload_len == 0) {
+        return;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(payload, payload_len);
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        ESP_LOGW(TAG, "Runtime skill request is not valid JSON");
+        return;
+    }
+
+    const char *request_id = json_optional_string(root, "request_id");
+    const char *operation = json_optional_string(root, "operation");
+    const char *name = json_optional_string(root, "name");
+    const char *content = json_optional_string(root, "content");
+    const char *expected_sha = json_optional_string(root, "sha256");
+    const char *signature = json_optional_string(root, "signature");
+    cJSON *ts_item = cJSON_GetObjectItem(root, "ts_ms");
+    int64_t ts_ms = cJSON_IsNumber(ts_item) ? (int64_t)ts_item->valuedouble : 0;
+    bool confirmed = cJSON_IsTrue(cJSON_GetObjectItem(root, "confirmed"));
+
+    char message[256] = {0};
+    esp_err_t err = ESP_OK;
+    if (!request_id[0] || strlen(request_id) >= ESPAGENT_MESH_ID_MAX) {
+        snprintf(message, sizeof(message), "invalid runtime skill request_id");
+        err = ESP_ERR_INVALID_ARG;
+    } else if (strcmp(operation, "upsert") != 0) {
+        snprintf(message, sizeof(message), "unsupported runtime skill operation");
+        err = ESP_ERR_NOT_SUPPORTED;
+    } else if (!name[0] || !content[0] || strlen(expected_sha) != 64 || ts_ms <= 0) {
+        snprintf(message, sizeof(message), "runtime skill request missing name/content/sha256/ts_ms");
+        err = ESP_ERR_INVALID_ARG;
+    }
+
+    char actual_sha[65] = {0};
+    if (err == ESP_OK) {
+        err = runtime_skill_content_sha256(content, actual_sha, sizeof(actual_sha));
+        if (err == ESP_OK && strcmp(actual_sha, expected_sha) != 0) {
+            snprintf(message, sizeof(message), "runtime skill sha256 mismatch");
+            err = ESP_ERR_INVALID_CRC;
+        }
+    }
+
+    char canonical[256] = {0};
+    if (err == ESP_OK) {
+        int n = snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%s\n%lld",
+                         request_id, operation, name, expected_sha,
+                         (long long)ts_ms);
+        if (n < 0 || (size_t)n >= sizeof(canonical)) {
+            snprintf(message, sizeof(message), "runtime skill auth payload too long");
+            err = ESP_ERR_INVALID_SIZE;
+        }
+    }
+
+    if (err == ESP_OK) {
+        char auth_reason[96] = {0};
+        err = espagent_mesh_auth_verify_text(canonical, signature,
+                                             auth_reason, sizeof(auth_reason));
+        if (err != ESP_OK) {
+            snprintf(message, sizeof(message), "runtime skill auth failed: %s", auth_reason);
+        }
+    }
+
+    if (err == ESP_OK) {
+        err = skill_runtime_upsert(name, content, confirmed,
+                                   message, sizeof(message));
+    }
+
+    ESP_LOGI(TAG, "Runtime skill MQTT upsert: id=%s name=%s status=%s",
+             request_id[0] ? request_id : "(none)",
+             name[0] ? name : "(none)", esp_err_to_name(err));
+    publish_runtime_skill_reply(request_id, name, err,
+                                message[0] ? message : esp_err_to_name(err));
+    cJSON_Delete(root);
+}
+
 static esp_err_t read_temperature_humidity_result(char *result, size_t result_size)
 {
     tool_environment_values_t values = {0};
@@ -2497,6 +2623,8 @@ static void mqtt_poll_inbound(int fd)
             } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST)) {
                 ESP_LOGI(TAG, "Web chat request received: %.*s", (int)msg_len, msg);
                 handle_web_chat_request(msg, msg_len);
+            } else if (mqtt_topic_equals(topic, topic_len, ESPAGENT_MESH_TOPIC_RUNTIME_SKILL_REQUEST)) {
+                handle_runtime_skill_request(msg, msg_len);
             } else {
                 char nodes_state_filter[160] = {0};
                 char nodes_telemetry_filter[160] = {0};
@@ -2790,6 +2918,7 @@ static void sensor_mqtt_task(void *arg)
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_TIMELINE, 5);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 6);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_WEB_CHAT_REQUEST, 10);
+            mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_RUNTIME_SKILL_REQUEST, 13);
         } else if (espagent_role_is_control()) {
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_ALERTS, 3);
             mqtt_subscribe(fd, ESPAGENT_MESH_TOPIC_POLICY_DECISION, 4);
