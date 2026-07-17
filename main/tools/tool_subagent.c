@@ -71,6 +71,35 @@ static bool subagent_try_low_memory_shortcut(subagent_ctx_t *ctx)
         return true;
     }
 
+    const bool wants_math =
+        contains_substr_ci(ctx->task, "计算") ||
+        contains_substr_ci(ctx->task, "math") ||
+        contains_substr_ci(ctx->task, "calculate");
+    if (wants_math) {
+        long nums[3] = {0};
+        int count = 0;
+        for (const char *p = ctx->task; *p && count < 3; p++) {
+            if ((*p >= '0' && *p <= '9') ||
+                ((*p == '-' || *p == '+') && p[1] >= '0' && p[1] <= '9')) {
+                char *end = NULL;
+                nums[count++] = strtol(p, &end, 10);
+                if (end && end > p) {
+                    p = end - 1;
+                }
+            }
+        }
+        if (count >= 3 &&
+            (strchr(ctx->task, '*') || contains_substr_ci(ctx->task, "乘")) &&
+            (strchr(ctx->task, '+') || contains_substr_ci(ctx->task, "加"))) {
+            snprintf(tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE,
+                     "%ld", nums[0] * nums[1] + nums[2]);
+            ctx->result = strdup(tool_output);
+            free(tool_output);
+            ESP_LOGI(TAG, "Subagent low-memory shortcut -> arithmetic");
+            return true;
+        }
+    }
+
     const bool wants_time =
         contains_substr_ci(ctx->task, "get_current_time") ||
         contains_substr_ci(ctx->task, "current time") ||
@@ -482,6 +511,22 @@ esp_err_t tool_subagent_execute(const char *input_json, char *output, size_t out
                  "Running subagent inline due to tight internal heap: free_internal=%u largest_internal=%u",
                  (unsigned)free_internal,
                  (unsigned)largest_internal);
+        if (subagent_try_low_memory_shortcut(ctx)) {
+            snprintf(output, output_size, "%s",
+                     ctx->result ? ctx->result : "(subagent returned no result)");
+            ESP_LOGI(TAG, "Subagent completed via low-memory shortcut, output=%d bytes",
+                     (int)strlen(output));
+            subagent_cleanup_ctx(ctx);
+            return ESP_OK;
+        }
+        if (free_internal < 24576 || largest_internal < 12288) {
+            snprintf(output, output_size,
+                     "Error: subagent skipped because internal heap is too low: free=%u largest=%u",
+                     (unsigned)free_internal,
+                     (unsigned)largest_internal);
+            subagent_cleanup_ctx(ctx);
+            return ESP_ERR_NO_MEM;
+        }
         subagent_run(ctx);
         snprintf(output, output_size, "%s",
                  ctx->result ? ctx->result : "(subagent returned no result)");

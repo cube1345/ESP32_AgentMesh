@@ -120,6 +120,12 @@ static const char *get_optional_string(cJSON *root, const char *key)
 
 static esp_err_t validate_allowed_gpio(int pin, char *output, size_t output_size)
 {
+    if (pin == ESPAGENT_SERVO_DEFAULT_GPIO) {
+        snprintf(output, output_size,
+                 "Error: GPIO%d is reserved for the curtain servo PWM; use set_curtain or servo_write",
+                 pin);
+        return ESP_ERR_INVALID_ARG;
+    }
     if (!gpio_policy_pin_is_allowed(pin)) {
         if (gpio_policy_pin_forbidden_hint(pin, output, output_size)) {
             return ESP_ERR_INVALID_ARG;
@@ -155,7 +161,8 @@ static esp_err_t configure_output_gpio(int pin, bool enable_pulldown)
 
 static bool is_fixed_device_gpio(int pin)
 {
-    return pin == ESPAGENT_HUMIDIFIER_GPIO || pin == ESPAGENT_FAN_GPIO;
+    return GPIO_IS_VALID_OUTPUT_GPIO(pin) &&
+           (pin == ESPAGENT_HUMIDIFIER_GPIO || pin == ESPAGENT_FAN_GPIO);
 }
 
 static esp_err_t ensure_output_gpio(int pin)
@@ -747,6 +754,13 @@ esp_err_t tool_copper_gpio_write_execute(const char *input_json, char *output, s
         cJSON_Delete(root);
         return ESP_ERR_INVALID_ARG;
     }
+    if (pin == ESPAGENT_SERVO_DEFAULT_GPIO) {
+        snprintf(output, output_size,
+                 "Error: GPIO%d is reserved for the curtain servo PWM; use set_curtain or servo_write",
+                 pin);
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
     if (!is_copper_gpio_pin(pin)) {
         snprintf(output, output_size, "Error: copper_gpio_write only allows GPIO4, GPIO5, or GPIO6");
         cJSON_Delete(root);
@@ -786,6 +800,13 @@ static esp_err_t fixed_device_gpio_write(const char *input_json,
                                          const char *device_name,
                                          int active_level)
 {
+    if (!GPIO_IS_VALID_OUTPUT_GPIO(pin)) {
+        snprintf(output, output_size,
+                 "Error: %s GPIO is disabled in this firmware profile",
+                 device_name);
+        return ESP_ERR_INVALID_ARG;
+    }
+
     cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
     if (!root) {
         snprintf(output, output_size, "Error: invalid JSON input");

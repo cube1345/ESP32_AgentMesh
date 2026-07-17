@@ -190,6 +190,7 @@ static void build_mesh_async_user_reply(const mesh_wait_task_ctx_t *ctx,
         (strcmp(action, "set_status_light") == 0 ||
          strcmp(action, "ws2812_set") == 0 ||
          strcmp(action, "virtual_device_control") == 0 ||
+         strcmp(action, "set_curtain") == 0 ||
          strcmp(action, "servo_write") == 0 ||
          strcmp(action, "set_humidifier") == 0 ||
          strcmp(action, "set_fan") == 0 ||
@@ -218,6 +219,7 @@ static bool is_control_action(const char *action)
            (strcmp(action, "set_status_light") == 0 ||
             strcmp(action, "ws2812_set") == 0 ||
             strcmp(action, "virtual_device_control") == 0 ||
+            strcmp(action, "set_curtain") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "set_humidifier") == 0 ||
             strcmp(action, "set_fan") == 0 ||
@@ -234,6 +236,8 @@ static bool is_sensor_action(const char *action)
 {
     return action &&
            (strcmp(action, "read_temperature_humidity") == 0 ||
+            strcmp(action, "read_environment") == 0 ||
+            strcmp(action, "read_light_level") == 0 ||
             strcmp(action, "virtual_device_read") == 0);
 }
 

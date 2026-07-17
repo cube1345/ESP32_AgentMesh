@@ -64,7 +64,8 @@ static const char *legacy_family_for_tool(const char *name)
         streq(name, "set_humidifier") || streq(name, "set_fan") ||
         streq(name, "set_device_led") ||
         streq(name, "ws2812_set") ||
-        streq(name, "set_status_light") || streq(name, "servo_write") ||
+        streq(name, "set_status_light") || streq(name, "set_curtain") ||
+        streq(name, "servo_write") ||
         streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
         streq(name, "virtual_device_control")) {
         return "control";
@@ -91,7 +92,8 @@ static espagent_capability_risk_t legacy_risk_for_tool(const char *name)
         streq(name, "set_humidifier") || streq(name, "set_fan") ||
         streq(name, "set_device_led") ||
         streq(name, "ws2812_set") ||
-        streq(name, "set_status_light") || streq(name, "servo_write") ||
+        streq(name, "set_status_light") || streq(name, "set_curtain") ||
+        streq(name, "servo_write") ||
         streq(name, "gree_ac_control") || streq(name, "max98357_play_tone") ||
         streq(name, "virtual_device_control") ||
         starts_with(name, "automation_")) {

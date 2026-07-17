@@ -8,6 +8,11 @@
  * The servo GPIO is fixed by firmware configuration. */
 esp_err_t tool_servo_write_execute(const char *input_json, char *output, size_t output_size);
 
+/* High-level curtain actuator backed by the configured servo GPIO.
+ * Input JSON: {"state":"open"} or {"state":"closed"}; optional {"angle":<0-180>}
+ * overrides the configured open/closed angle for calibration. */
+esp_err_t tool_set_curtain_execute(const char *input_json, char *output, size_t output_size);
+
 /* Direct helpers for non-agent startup or internal control paths. */
 esp_err_t tool_servo_set_angle(int angle);
 esp_err_t tool_servo_set_pulse_us(int pulse_us);

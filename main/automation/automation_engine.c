@@ -47,6 +47,7 @@ typedef struct {
 typedef enum {
     AUTOMATION_METRIC_TEMPERATURE = 0,
     AUTOMATION_METRIC_HUMIDITY = 1,
+    AUTOMATION_METRIC_LIGHT_LUX = 2,
 } automation_metric_t;
 
 typedef struct {
@@ -205,6 +206,8 @@ static const char *default_role_for_action(const char *action, const char *fallb
 {
     if (action &&
         (strcmp(action, "read_temperature_humidity") == 0 ||
+         strcmp(action, "read_environment") == 0 ||
+         strcmp(action, "read_light_level") == 0 ||
          strcmp(action, "virtual_device_read") == 0)) {
         return "sensor_agent";
     }
@@ -212,6 +215,7 @@ static const char *default_role_for_action(const char *action, const char *fallb
         (strcmp(action, "set_status_light") == 0 ||
          strcmp(action, "ws2812_set") == 0 ||
          strcmp(action, "virtual_device_control") == 0 ||
+         strcmp(action, "set_curtain") == 0 ||
          strcmp(action, "set_humidifier") == 0 ||
          strcmp(action, "set_fan") == 0 ||
          strcmp(action, "set_device_led") == 0 ||
@@ -222,6 +226,30 @@ static const char *default_role_for_action(const char *action, const char *fallb
         return "control_agent";
     }
     return fallback;
+}
+
+static const char *automation_metric_name(automation_metric_t metric)
+{
+    switch (metric) {
+    case AUTOMATION_METRIC_HUMIDITY:
+        return "humidity_percent";
+    case AUTOMATION_METRIC_LIGHT_LUX:
+        return "light_lux";
+    case AUTOMATION_METRIC_TEMPERATURE:
+    default:
+        return "temperature_c";
+    }
+}
+
+static automation_metric_t automation_metric_from_name(const char *metric)
+{
+    if (metric && strcmp(metric, "humidity_percent") == 0) {
+        return AUTOMATION_METRIC_HUMIDITY;
+    }
+    if (metric && strcmp(metric, "light_lux") == 0) {
+        return AUTOMATION_METRIC_LIGHT_LUX;
+    }
+    return AUTOMATION_METRIC_TEMPERATURE;
 }
 
 static void fill_step_from_json(automation_step_t *step, cJSON *obj, const char *default_role)
@@ -342,12 +370,42 @@ static bool parse_temperature_humidity(const char *text, float *temperature_c, f
     return true;
 }
 
+static bool parse_light_lux(const char *text, float *light_lux)
+{
+    if (!text || !light_lux) {
+        return false;
+    }
+    const char *light = strstr(text, "light_lux=");
+    if (!light) {
+        light = strstr(text, "light=");
+    }
+    if (!light) {
+        return false;
+    }
+    const char *eq = strchr(light, '=');
+    if (!eq) {
+        return false;
+    }
+    float lux = 0.0f;
+    if (sscanf(eq + 1, "%f", &lux) != 1) {
+        return false;
+    }
+    *light_lux = lux;
+    return true;
+}
+
 static bool parse_sensor_output_metric(const char *output_text, automation_metric_t metric, float *value)
 {
     float t = 0.0f;
     float h = 0.0f;
+    float lux = 0.0f;
+    if (metric == AUTOMATION_METRIC_LIGHT_LUX &&
+        parse_light_lux(output_text, &lux)) {
+        *value = lux;
+        return true;
+    }
     if (parse_temperature_humidity(output_text, &t, &h)) {
-        *value = (metric == AUTOMATION_METRIC_TEMPERATURE) ? t : h;
+        *value = (metric == AUTOMATION_METRIC_HUMIDITY) ? h : t;
         return true;
     }
 
@@ -371,11 +429,17 @@ static bool parse_sensor_output_metric(const char *output_text, automation_metri
 
     cJSON *text = cJSON_GetObjectItem(result, "text");
     const char *result_text = cJSON_IsString(text) ? text->valuestring : NULL;
+    if (metric == AUTOMATION_METRIC_LIGHT_LUX &&
+        parse_light_lux(result_text, &lux)) {
+        *value = lux;
+        cJSON_Delete(root);
+        return true;
+    }
     if (!parse_temperature_humidity(result_text, &t, &h)) {
         cJSON_Delete(root);
         return false;
     }
-    *value = (metric == AUTOMATION_METRIC_TEMPERATURE) ? t : h;
+    *value = (metric == AUTOMATION_METRIC_HUMIDITY) ? h : t;
     cJSON_Delete(root);
     return true;
 }
@@ -399,7 +463,7 @@ static esp_err_t persist_rules_locked(void)
         cJSON_AddStringToObject(item, "id", rule->id);
         cJSON_AddStringToObject(item, "name", rule->name);
         cJSON_AddBoolToObject(item, "enabled", rule->enabled);
-        cJSON_AddStringToObject(item, "metric", rule->metric == AUTOMATION_METRIC_HUMIDITY ? "humidity_percent" : "temperature_c");
+        cJSON_AddStringToObject(item, "metric", automation_metric_name(rule->metric));
         cJSON_AddNumberToObject(item, "threshold", rule->threshold);
         cJSON_AddNumberToObject(item, "hysteresis", rule->hysteresis);
         cJSON_AddNumberToObject(item, "interval_s", (double)rule->interval_s);
@@ -523,7 +587,7 @@ static esp_err_t load_rules_locked(void)
             rule->enabled = json_get_bool(item, "enabled", true);
             char metric[32] = {0};
             json_get_string(item, "metric", metric, sizeof(metric));
-            rule->metric = (strcmp(metric, "humidity_percent") == 0) ? AUTOMATION_METRIC_HUMIDITY : AUTOMATION_METRIC_TEMPERATURE;
+            rule->metric = automation_metric_from_name(metric);
             rule->threshold = (float)json_get_double(item, "threshold", 0.0);
             rule->hysteresis = (float)json_get_double(item, "hysteresis", 1.0);
             rule->interval_s = (uint32_t)json_get_int(item, "interval_s", 10);
@@ -712,7 +776,7 @@ static void rule_task(void *arg)
 
             char sensor_payload[512] = {0};
             snprintf(sensor_payload, sizeof(sensor_payload),
-                     "{\"target_role\":\"sensor_agent\",\"action\":\"read_temperature_humidity\",\"async\":false,\"require_ack\":true,\"ttl_ms\":30000,\"safety_level\":1%s%s}",
+                     "{\"target_role\":\"sensor_agent\",\"action\":\"read_environment\",\"async\":false,\"require_ack\":true,\"ttl_ms\":30000,\"safety_level\":1%s%s}",
                      snapshot.sensor_args_json[0] ? ",\"args\":" : "",
                      snapshot.sensor_args_json[0] ? snapshot.sensor_args_json : "");
             char sensor_output[1024] = {0};
@@ -972,11 +1036,7 @@ static esp_err_t add_rule_locked(cJSON *root, char *output, size_t output_size)
 
     char metric[32] = {0};
     json_get_string(root, "metric", metric, sizeof(metric));
-    if (strcmp(metric, "humidity_percent") == 0) {
-        rule->metric = AUTOMATION_METRIC_HUMIDITY;
-    } else {
-        rule->metric = AUTOMATION_METRIC_TEMPERATURE;
-    }
+    rule->metric = automation_metric_from_name(metric);
     rule->threshold = (float)json_get_double(root, "threshold", 35.0);
     cJSON *sensor_args = cJSON_GetObjectItem(root, "sensor_args");
     if (sensor_args && cJSON_IsObject(sensor_args)) {
@@ -1001,7 +1061,7 @@ static esp_err_t add_rule_locked(cJSON *root, char *output, size_t output_size)
         snprintf(output, output_size,
                  "OK: rule %s created metric=%s threshold=%.2f interval=%us cooldown=%us",
                  rule->id,
-                 rule->metric == AUTOMATION_METRIC_HUMIDITY ? "humidity_percent" : "temperature_c",
+                 automation_metric_name(rule->metric),
                  rule->threshold,
                  (unsigned)rule->interval_s,
                  (unsigned)rule->cooldown_s);
@@ -1064,7 +1124,7 @@ esp_err_t automation_engine_list(char *output, size_t output_size)
                         "- %s [%s] metric=%s threshold=%.2f interval=%us cooldown=%us enabled=%s\n",
                         rule->id,
                         rule->name,
-                        rule->metric == AUTOMATION_METRIC_HUMIDITY ? "humidity_percent" : "temperature_c",
+                        automation_metric_name(rule->metric),
                         rule->threshold,
                         (unsigned)rule->interval_s,
                         (unsigned)rule->cooldown_s,

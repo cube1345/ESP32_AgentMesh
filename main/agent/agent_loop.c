@@ -709,6 +709,16 @@ static bool tool_guard_match_servo_request(const char *message) {
                                  sizeof(keywords) / sizeof(keywords[0]));
 }
 
+static bool tool_guard_match_curtain_request(const char *message) {
+  static const char *const keywords[] = {
+      "curtain", "curtains", "curtain opener", "window blind", "blind",
+      "blinds", "窗帘", "窗帘开关", "窗帘开关器", "百叶窗", "遮光帘",
+      "打开窗帘", "关闭窗帘", "开窗帘", "关窗帘",
+  };
+  return message_has_any_keyword(message, keywords,
+                                 sizeof(keywords) / sizeof(keywords[0]));
+}
+
 static bool tool_guard_match_temperature_humidity_request(const char *message) {
   static const char *const keywords[] = {
       "temperature", "humidity", "temp", "hum", "aht20", "aht10",
@@ -752,6 +762,7 @@ static bool message_should_have_used_mesh(const char *message) {
          tool_guard_match_presence_request(message) ||
          tool_guard_match_gpio_read_request(message) ||
          tool_guard_match_gpio_write_request(message) ||
+         tool_guard_match_curtain_request(message) ||
          tool_guard_match_servo_request(message);
 }
 
@@ -1075,6 +1086,134 @@ static int extract_status_light_color_sequence(const char *message,
     cursor = best_pos + best_len;
   }
   return count;
+}
+
+typedef struct {
+  const char *state;
+  const char *const *aliases;
+  size_t alias_count;
+} curtain_state_alias_t;
+
+static const char *const curtain_alias_open[] = {
+    "open curtain", "open the curtain", "open curtains", "打开窗帘", "开窗帘",
+    "开启窗帘", "升起窗帘", "拉开窗帘",
+};
+static const char *const curtain_alias_closed[] = {
+    "close curtain", "close the curtain", "close curtains", "closed",
+    "关闭窗帘", "关窗帘", "合上窗帘", "拉上窗帘",
+};
+
+static const curtain_state_alias_t curtain_states[] = {
+    {"open", curtain_alias_open,
+     sizeof(curtain_alias_open) / sizeof(curtain_alias_open[0])},
+    {"closed", curtain_alias_closed,
+     sizeof(curtain_alias_closed) / sizeof(curtain_alias_closed[0])},
+};
+
+typedef struct {
+  const char *pos;
+  const char *action;
+  const char *label;
+  char args_json[96];
+} workflow_step_hint_t;
+
+static const char *find_first_alias_position(const char *message,
+                                             const char *const *aliases,
+                                             size_t alias_count);
+
+static const char *find_first_curtain_state_position(const char *message,
+                                                     const char **state_out) {
+  if (state_out) {
+    *state_out = NULL;
+  }
+  if (!message) {
+    return NULL;
+  }
+
+  const char *best_pos = NULL;
+  const char *best_state = NULL;
+  for (size_t i = 0; i < sizeof(curtain_states) / sizeof(curtain_states[0]); i++) {
+    const curtain_state_alias_t *state = &curtain_states[i];
+    for (size_t j = 0; j < state->alias_count; j++) {
+      const char *pos = find_substr_ci_ascii(message, state->aliases[j]);
+      if (pos && (!best_pos || pos < best_pos)) {
+        best_pos = pos;
+        best_state = state->state;
+      }
+    }
+  }
+  if (state_out) {
+    *state_out = best_state;
+  }
+  return best_pos;
+}
+
+static bool add_curtain_workflow_hints(workflow_step_hint_t *hints,
+                                       int *count,
+                                       int max_count,
+                                       const char *message) {
+  if (!hints || !count || !message) {
+    return false;
+  }
+
+  const char *cursor = message;
+  bool added = false;
+  while (*cursor && *count < max_count) {
+    const char *best_pos = NULL;
+    const char *best_state = NULL;
+    size_t best_len = 0;
+    for (size_t i = 0; i < sizeof(curtain_states) / sizeof(curtain_states[0]); i++) {
+      const curtain_state_alias_t *state = &curtain_states[i];
+      for (size_t j = 0; j < state->alias_count; j++) {
+        const char *alias = state->aliases[j];
+        const char *pos = find_substr_ci_ascii(cursor, alias);
+        if (pos && (!best_pos || pos < best_pos)) {
+          best_pos = pos;
+          best_state = state->state;
+          best_len = strlen(alias);
+        }
+      }
+    }
+    if (!best_pos || !best_state || best_len == 0) {
+      break;
+    }
+    workflow_step_hint_t *hint = &hints[*count];
+    hint->pos = best_pos;
+    hint->action = "set_curtain";
+    hint->label = strcmp(best_state, "open") == 0 ? "打开窗帘" : "关闭窗帘";
+    snprintf(hint->args_json, sizeof(hint->args_json),
+             "{\"state\":\"%s\"}", best_state);
+    (*count)++;
+    added = true;
+    cursor = best_pos + best_len;
+  }
+  return added;
+}
+
+static bool add_light_sensor_workflow_hint(workflow_step_hint_t *hints,
+                                           int *count,
+                                           int max_count,
+                                           const char *message) {
+  static const char *const aliases[] = {
+      "read_light_level", "read light", "light sensor", "illuminance",
+      "lux", "gy30", "gy-30", "bh1750", "读取光照", "读光照",
+      "光照传感器", "光照数据", "照度", "勒克斯",
+  };
+  if (!hints || !count || *count >= max_count || !message) {
+    return false;
+  }
+  const char *pos = find_first_alias_position(message, aliases,
+                                              sizeof(aliases) / sizeof(aliases[0]));
+  if (!pos) {
+    return false;
+  }
+  workflow_step_hint_t *hint = &hints[*count];
+  hint->pos = pos;
+  hint->action = "read_light_level";
+  hint->label = "读取光照";
+  snprintf(hint->args_json, sizeof(hint->args_json), "{}");
+  (*count)++;
+  return true;
 }
 
 static bool message_has_sequence_marker(const char *message) {
@@ -1462,6 +1601,8 @@ static bool extract_condition_threshold_token(const char *message,
       "大于",  "高于",    "超过", "小于",  "低于", "不超过",    "否则",
   };
 
+  double threshold = 0.0;
+  char local_token[32] = {0};
   const char *metric_pos =
       is_humidity
           ? find_first_keyword_position(
@@ -1470,31 +1611,32 @@ static bool extract_condition_threshold_token(const char *message,
           : find_first_keyword_position(
                 message, temperature_keywords,
                 sizeof(temperature_keywords) / sizeof(temperature_keywords[0]));
-  const char *comparator_pos =
-      find_first_keyword_position(
-          message, comparator_keywords,
-          sizeof(comparator_keywords) / sizeof(comparator_keywords[0]));
-  const char *cursor = metric_pos;
-  if (comparator_pos && (!cursor || comparator_pos < cursor)) {
-    cursor = comparator_pos;
-  }
-  if (!cursor) {
-    cursor = message;
-  }
-
-  double threshold = 0.0;
-  char local_token[32] = {0};
-  if (!extract_next_number_token(&cursor, &threshold, local_token,
-                                 sizeof(local_token))) {
-    return false;
-  }
-  if (!threshold_in_reasonable_range(threshold, is_humidity)) {
-    return false;
+  if (metric_pos) {
+    const char *cursor = metric_pos;
+    if (extract_next_number_token(&cursor, &threshold, local_token,
+                                  sizeof(local_token)) &&
+        threshold_in_reasonable_range(threshold, is_humidity)) {
+      snprintf(token_buf, token_buf_size, "%s", local_token);
+      *out_value = threshold;
+      return true;
+    }
   }
 
-  snprintf(token_buf, token_buf_size, "%s", local_token);
-  *out_value = threshold;
-  return true;
+  const char *comparator_pos = find_first_keyword_position(
+      message, comparator_keywords,
+      sizeof(comparator_keywords) / sizeof(comparator_keywords[0]));
+  if (comparator_pos) {
+    const char *cursor = comparator_pos;
+    if (extract_next_number_token(&cursor, &threshold, local_token,
+                                  sizeof(local_token)) &&
+        threshold_in_reasonable_range(threshold, is_humidity)) {
+      snprintf(token_buf, token_buf_size, "%s", local_token);
+      *out_value = threshold;
+      return true;
+    }
+  }
+
+  return false;
 }
 
 static bool try_execute_deterministic_number_compare(const espagent_msg_t *msg,
@@ -2149,6 +2291,130 @@ static bool try_execute_deterministic_skill_read_request(
   return *final_text != NULL;
 }
 
+static bool try_execute_deterministic_light_curtain_rule_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  const bool explicit_rule_request =
+      msg && msg->content &&
+      (contains_substr_ci(msg->content, "显式的 /rule") ||
+       contains_substr_ci(msg->content, "/rule"));
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      message_is_skill_or_knowledge_query(msg->content) ||
+      (!explicit_rule_request && !message_has_condition_rule_marker(msg->content)) ||
+      !tool_guard_match_light_sensor_request(msg->content) ||
+      !tool_guard_match_curtain_request(msg->content)) {
+    return false;
+  }
+
+  char threshold_token[32] = {0};
+  double threshold = 0.0;
+  if (!extract_condition_threshold_token(msg->content, false, &threshold,
+                                         threshold_token,
+                                         sizeof(threshold_token))) {
+    const char *p = msg->content;
+    bool found_number = false;
+    while (p && *p) {
+      if (isdigit((unsigned char)*p)) {
+        char *end = NULL;
+        threshold = strtod(p, &end);
+        if (end && end > p) {
+          size_t len = (size_t)(end - p);
+          if (len >= sizeof(threshold_token)) {
+            len = sizeof(threshold_token) - 1;
+          }
+          memcpy(threshold_token, p, len);
+          threshold_token[len] = '\0';
+          found_number = true;
+          break;
+        }
+      }
+      p++;
+    }
+    if (!found_number) {
+      return false;
+    }
+  }
+
+  const char *first_state = NULL;
+  if (!find_first_curtain_state_position(msg->content, &first_state) ||
+      !first_state) {
+    return false;
+  }
+  const char *second_state = strcmp(first_state, "open") == 0 ? "closed" : "open";
+  const bool first_branch_is_below =
+      contains_substr_ci(msg->content, "小于") ||
+      contains_substr_ci(msg->content, "低于") ||
+      contains_substr_ci(msg->content, "below") ||
+      contains_substr_ci(msg->content, "less");
+  const char *above_state = first_branch_is_below ? second_state : first_state;
+  const char *below_state = first_branch_is_below ? first_state : second_state;
+
+  cJSON *root = cJSON_CreateObject();
+  cJSON *above = cJSON_CreateObject();
+  cJSON *below = cJSON_CreateObject();
+  cJSON *above_args = cJSON_CreateObject();
+  cJSON *below_args = cJSON_CreateObject();
+  if (!root || !above || !below || !above_args || !below_args) {
+    cJSON_Delete(root);
+    cJSON_Delete(above);
+    cJSON_Delete(below);
+    cJSON_Delete(above_args);
+    cJSON_Delete(below_args);
+    return false;
+  }
+
+  cJSON_AddStringToObject(root, "name", "light_curtain_rule");
+  cJSON_AddStringToObject(root, "metric", "light_lux");
+  cJSON_AddNumberToObject(root, "threshold", threshold);
+  cJSON_AddNumberToObject(root, "interval_s", 10);
+  cJSON_AddNumberToObject(root, "cooldown_s", 20);
+  cJSON_AddNumberToObject(root, "hysteresis_c", 20.0);
+  cJSON_AddBoolToObject(root, "confirmed", true);
+
+  cJSON_AddStringToObject(above, "target_role", "control_agent");
+  cJSON_AddStringToObject(above, "action", "set_curtain");
+  cJSON_AddStringToObject(above_args, "state", above_state);
+  cJSON_AddItemToObject(above, "args", above_args);
+
+  cJSON_AddStringToObject(below, "target_role", "control_agent");
+  cJSON_AddStringToObject(below, "action", "set_curtain");
+  cJSON_AddStringToObject(below_args, "state", below_state);
+  cJSON_AddItemToObject(below, "args", below_args);
+
+  cJSON_AddItemToObject(root, "above", above);
+  cJSON_AddItemToObject(root, "below", below);
+
+  char *payload = cJSON_PrintUnformatted(root);
+  cJSON_Delete(root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("automation_create_rule", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG, "=== CONV === Deterministic light curtain rule => %s",
+           tool_output);
+
+  char reply_buf[640] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已创建光照窗帘规则：光照大于%s lux时%s窗帘，否则%s窗帘。%s",
+             threshold_token,
+             strcmp(above_state, "open") == 0 ? "打开" : "关闭",
+             strcmp(below_state, "open") == 0 ? "打开" : "关闭",
+             tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf), "光照窗帘规则创建失败：%s",
+             tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
 static bool try_execute_deterministic_condition_rule_request(
     const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
     char **final_text) {
@@ -2550,13 +2816,6 @@ static bool try_execute_deterministic_light_workflow(const espagent_msg_t *msg,
   return *final_text != NULL;
 }
 
-typedef struct {
-  const char *pos;
-  const char *action;
-  const char *label;
-  char args_json[96];
-} workflow_step_hint_t;
-
 static const char *find_first_alias_position(const char *message,
                                              const char *const *aliases,
                                              size_t alias_count) {
@@ -2736,6 +2995,12 @@ static bool try_execute_deterministic_mixed_control_workflow(
       hints, &count, ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
       msg->content, "set_device_led", "GPIO6 独立 LED", led_aliases,
       sizeof(led_aliases) / sizeof(led_aliases[0]));
+  add_curtain_workflow_hints(hints, &count,
+                             ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
+                             msg->content);
+  add_light_sensor_workflow_hint(hints, &count,
+                                 ESPAGENT_AUTOMATION_WORKFLOW_MAX_STEPS,
+                                 msg->content);
 
   if (count < 2) {
     return false;
@@ -2763,7 +3028,10 @@ static bool try_execute_deterministic_mixed_control_workflow(
       return false;
     }
     cJSON_AddNumberToObject(step, "delay_ms", i == 0 ? 0 : (double)delay_ms);
-    cJSON_AddStringToObject(step, "target_role", "control_agent");
+    cJSON_AddStringToObject(step, "target_role",
+                            strcmp(hints[i].action, "read_light_level") == 0
+                                ? "sensor_agent"
+                                : "control_agent");
     cJSON_AddStringToObject(step, "action", hints[i].action);
     cJSON_AddItemToObject(step, "args", args);
     cJSON_AddItemToArray(steps, step);
@@ -3033,6 +3301,7 @@ static bool is_mesh_related_tool_name(const char *name) {
           strcmp(name, "ws2812_set") == 0 ||
           strcmp(name, "set_humidifier") == 0 ||
           strcmp(name, "set_fan") == 0 ||
+          strcmp(name, "set_curtain") == 0 ||
           strcmp(name, "set_device_led") == 0 ||
           strcmp(name, "copper_gpio_write") == 0 ||
           strcmp(name, "gpio_write") == 0 ||
@@ -3057,6 +3326,8 @@ static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
                                                    char **final_text) {
   if (!msg || !msg->content || !tool_output || !final_text ||
       strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      contains_substr_ci(msg->content, "/rule") ||
+      message_has_condition_rule_marker(msg->content) ||
       message_is_skill_or_knowledge_query(msg->content) ||
       message_has_local_marker(msg->content)) {
     return false;
@@ -3086,6 +3357,21 @@ static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
       cJSON *args = cJSON_CreateObject();
       if (args) {
         cJSON_AddStringToObject(args, "color", color);
+        cJSON_AddItemToObject(payload_root, "args", args);
+      }
+    }
+  } else if (tool_guard_match_curtain_request(msg->content)) {
+    const char *state = NULL;
+    if (!find_first_curtain_state_position(msg->content, &state) || !state) {
+      return false;
+    }
+    payload_root = cJSON_CreateObject();
+    if (payload_root) {
+      cJSON_AddStringToObject(payload_root, "target_role", "control_agent");
+      cJSON_AddStringToObject(payload_root, "action", "set_curtain");
+      cJSON *args = cJSON_CreateObject();
+      if (args) {
+        cJSON_AddStringToObject(args, "state", state);
         cJSON_AddItemToObject(payload_root, "args", args);
       }
     }
@@ -3161,6 +3447,9 @@ static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *
     allowed = contains_substr_ci(message, "fan") ||
               contains_substr_ci(message, "风扇");
     expected = "fan control on GPIO5";
+  } else if (strcmp(tool_name, "set_curtain") == 0) {
+    allowed = tool_guard_match_curtain_request(message);
+    expected = "curtain servo open/close control on GPIO5";
   } else if (strcmp(tool_name, "set_device_led") == 0) {
     allowed = contains_substr_ci(message, "device led") ||
               contains_substr_ci(message, "gpio6 led") ||
@@ -4261,6 +4550,8 @@ static void agent_loop_task(void *arg) {
         !try_execute_deterministic_fixed_device_duration_workflow(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_temperature_fan_rule(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+        !try_execute_deterministic_light_curtain_rule_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_condition_rule_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&

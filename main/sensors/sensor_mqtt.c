@@ -1518,6 +1518,8 @@ static bool policy_is_sensor_action(const char *action)
 {
     return action &&
            (strcmp(action, "read_temperature_humidity") == 0 ||
+            strcmp(action, "read_environment") == 0 ||
+            strcmp(action, "read_light_level") == 0 ||
             strcmp(action, "virtual_device_read") == 0);
 }
 
@@ -1527,6 +1529,7 @@ static bool policy_is_control_action(const char *action)
            (strcmp(action, "set_status_light") == 0 ||
             strcmp(action, "ws2812_set") == 0 ||
             strcmp(action, "virtual_device_control") == 0 ||
+            strcmp(action, "set_curtain") == 0 ||
             strcmp(action, "servo_write") == 0 ||
             strcmp(action, "set_humidifier") == 0 ||
             strcmp(action, "set_fan") == 0 ||
@@ -2206,20 +2209,75 @@ static esp_err_t read_temperature_humidity_result(char *result, size_t result_si
     return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
 }
 
+static esp_err_t read_environment_result(char *result, size_t result_size)
+{
+    tool_environment_values_t values = {0};
+    char status[96] = {0};
+    esp_err_t err = tool_environment_read_values(&values, status, sizeof(status));
+    if (err == ESP_OK &&
+        values.temperature_c_x10 != -1 &&
+        values.humidity_percent_x10 != -1 &&
+        values.light_lux_x10 != -1) {
+        snprintf(result, result_size,
+                 "OK: environment -> temperature=%.1f C, humidity=%.1f%%, co2=%d ppm, tvoc=%d ppb, light_lux=%.1f lux [%s]",
+                 (double)values.temperature_c_x10 / 10.0,
+                 (double)values.humidity_percent_x10 / 10.0,
+                 values.co2eq_ppm,
+                 values.tvoc_ppb,
+                 (double)values.light_lux_x10 / 10.0,
+                 status);
+        return ESP_OK;
+    }
+
+    snprintf(result, result_size,
+             "Error: environment not fully readable [temp=%d humidity=%d light=%d status=%s]",
+             values.temperature_c_x10,
+             values.humidity_percent_x10,
+             values.light_lux_x10,
+             status[0] ? status : esp_err_to_name(err));
+    return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
+}
+
+static esp_err_t read_light_level_result(char *result, size_t result_size)
+{
+    tool_environment_values_t values = {0};
+    char status[96] = {0};
+    esp_err_t err = tool_environment_read_values(&values, status, sizeof(status));
+    if (err == ESP_OK && values.light_lux_x10 != -1) {
+        snprintf(result, result_size,
+                 "OK: GY-30/BH1750 light -> light_lux=%.1f lux [%s]",
+                 (double)values.light_lux_x10 / 10.0,
+                 status);
+        return ESP_OK;
+    }
+
+    snprintf(result, result_size,
+             "Error: GY-30/BH1750 light not readable [light=%d status=%s]",
+             values.light_lux_x10,
+             status[0] ? status : esp_err_to_name(err));
+    return err == ESP_OK ? ESP_ERR_NOT_FOUND : err;
+}
+
 static bool handle_sensor_mesh_command(const espagent_mesh_command_t *cmd)
 {
     if (!espagent_role_is_sensor()) {
         return false;
     }
     if (strcmp(cmd->action, "read_temperature_humidity") != 0 &&
+        strcmp(cmd->action, "read_environment") != 0 &&
+        strcmp(cmd->action, "read_light_level") != 0 &&
         strcmp(cmd->action, "virtual_device_read") != 0) {
         return false;
     }
 
-    char result[384] = {0};
+    char result[512] = {0};
     esp_err_t err = ESP_OK;
     if (strcmp(cmd->action, "virtual_device_read") == 0) {
         err = tool_virtual_device_read_execute(cmd->args_json[0] ? cmd->args_json : "{}", result, sizeof(result));
+    } else if (strcmp(cmd->action, "read_environment") == 0) {
+        err = read_environment_result(result, sizeof(result));
+    } else if (strcmp(cmd->action, "read_light_level") == 0) {
+        err = read_light_level_result(result, sizeof(result));
     } else {
         err = read_temperature_humidity_result(result, sizeof(result));
     }
@@ -2382,6 +2440,8 @@ static esp_err_t execute_control_mesh_command(const espagent_mesh_command_t *cmd
         err = tool_ws2812_set_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "virtual_device_control") == 0) {
         err = tool_virtual_device_control_execute(args, result, result_size);
+    } else if (strcmp(cmd->action, "set_curtain") == 0) {
+        err = tool_set_curtain_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "servo_write") == 0) {
         err = tool_servo_write_execute(args, result, result_size);
     } else if (strcmp(cmd->action, "set_humidifier") == 0) {
@@ -2429,6 +2489,7 @@ static bool handle_control_mesh_command(const espagent_mesh_command_t *cmd)
     if (strcmp(cmd->action, "set_status_light") != 0 &&
         strcmp(cmd->action, "ws2812_set") != 0 &&
         strcmp(cmd->action, "virtual_device_control") != 0 &&
+        strcmp(cmd->action, "set_curtain") != 0 &&
         strcmp(cmd->action, "servo_write") != 0 &&
         strcmp(cmd->action, "set_humidifier") != 0 &&
         strcmp(cmd->action, "set_fan") != 0 &&

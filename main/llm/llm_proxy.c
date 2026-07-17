@@ -30,6 +30,7 @@ static const char *TAG = "llm";
 #define LLM_MIN_INTERNAL_LARGEST_BLOCK  (32 * 1024)
 #define LLM_COORDINATOR_MAX_TOKENS_NORMAL 1536
 #define LLM_COORDINATOR_MAX_TOKENS_TIGHT   512
+#define LLM_RESPONSE_MAX_BYTES           (96 * 1024)
 
 static char s_api_key[LLM_API_KEY_MAX_LEN] = {0};
 static char s_model[LLM_MODEL_MAX_LEN] = ESPAGENT_LLM_DEFAULT_MODEL;
@@ -201,8 +202,17 @@ static esp_err_t resp_buf_init(resp_buf_t *rb, size_t initial_cap)
 
 static esp_err_t resp_buf_append(resp_buf_t *rb, const char *data, size_t len)
 {
+    if (rb->len + len >= LLM_RESPONSE_MAX_BYTES) {
+        return ESP_ERR_NO_MEM;
+    }
     while (rb->len + len >= rb->cap) {
         size_t new_cap = rb->cap * 2;
+        if (new_cap > LLM_RESPONSE_MAX_BYTES) {
+            new_cap = LLM_RESPONSE_MAX_BYTES;
+        }
+        if (new_cap <= rb->cap) {
+            return ESP_ERR_NO_MEM;
+        }
         char *tmp = heap_caps_realloc(rb->data, new_cap, MALLOC_CAP_SPIRAM);
         if (!tmp) return ESP_ERR_NO_MEM;
         rb->data = tmp;
@@ -276,7 +286,7 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 {
     resp_buf_t *rb = (resp_buf_t *)evt->user_data;
     if (evt->event_id == HTTP_EVENT_ON_DATA) {
-        resp_buf_append(rb, (const char *)evt->data, evt->data_len);
+        return resp_buf_append(rb, (const char *)evt->data, evt->data_len);
     }
     return ESP_OK;
 }

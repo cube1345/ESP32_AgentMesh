@@ -350,6 +350,14 @@ static esp_err_t tool_servo_write_routed_execute(const char *input_json,
                                         tool_servo_write_execute);
 }
 
+static esp_err_t tool_set_curtain_routed_execute(const char *input_json,
+                                                 char *output,
+                                                 size_t output_size)
+{
+    return coordinator_control_or_local("set_curtain", input_json, output, output_size,
+                                        tool_set_curtain_execute);
+}
+
 static esp_err_t tool_gree_ac_control_routed_execute(const char *input_json,
                                                      char *output,
                                                      size_t output_size)
@@ -656,12 +664,12 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "mesh_send_command",
-        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic hardware work. Use action=agent_task with args.task when the coordinator should delegate a natural-language subtask to a remote role's own local AI loop. For ordinary temperature/humidity requests such as '读取温湿度', use action=read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote RGB light, humidifier, fan, GPIO, or Gree air-conditioner requests, use target_role=control_agent with the matching action and structured args. Do not claim a Mesh command was sent unless this tool returns OK.",
+        .description = "Publish a standard MQTT Mesh command to another ESPAgent node or role. Use structured actions for deterministic hardware work. Use action=agent_task with args.task when the coordinator should delegate a natural-language subtask to a remote role's own local AI loop. For ordinary environment requests such as '读取温湿度/光照', use action=read_environment or read_temperature_humidity and target_role=sensor_agent; target_node is optional. For remote WS2812 light, curtain servo, GPIO, or Gree air-conditioner requests, use target_role=control_agent with the matching action and structured args. Do not claim a Mesh command was sent unless this tool returns OK.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id such as esp32s3-sensor-01. Overrides target_role when set.\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\",\"guardian_agent\"],\"description\":\"Optional target role. Use sensor_agent for reads, control_agent for actuators, guardian_agent for policy/audit subtasks.\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\",\"guardian_approval_list\",\"guardian_approval_confirm\",\"guardian_approval_deny\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop; guardian_approval_* actions resolve Guardian approval requests on the guardian_agent.\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"agent_task\",\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\",\"control_state\",\"control_emergency_stop\",\"control_clear_emergency_stop\",\"guardian_approval_list\",\"guardian_approval_confirm\",\"guardian_approval_deny\"],\"description\":\"Whitelisted mesh command action. agent_task delegates args.task to the target role's local AI loop; guardian_approval_* actions resolve Guardian approval requests on the guardian_agent.\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"Optional JSON arguments for the command. For agent_task, include task, reply_channel, and reply_chat_id when a user-facing response is needed.\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Optional raw JSON object string for arguments\"},"
             "\"command_id\":{\"type\":\"string\",\"description\":\"Optional command id. Auto-generated when omitted.\"},"
@@ -714,7 +722,7 @@ esp_err_t tool_registry_init(void)
             "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
             "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
             "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
+            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
             "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
             "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
             "\"required\":[\"action\"]}}},"
@@ -728,17 +736,17 @@ esp_err_t tool_registry_init(void)
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short rule name\"},"
-            "\"metric\":{\"type\":\"string\",\"enum\":[\"temperature_c\",\"humidity_percent\"],\"description\":\"Sensor metric to compare; defaults to temperature_c\"},"
+            "\"metric\":{\"type\":\"string\",\"enum\":[\"temperature_c\",\"humidity_percent\",\"light_lux\"],\"description\":\"Sensor metric to compare; defaults to temperature_c\"},"
             "\"threshold\":{\"type\":\"number\",\"description\":\"Threshold for above/below branching\"},"
             "\"interval_s\":{\"type\":\"integer\",\"description\":\"Polling interval in seconds, defaults to 10\"},"
             "\"cooldown_s\":{\"type\":\"integer\",\"description\":\"Minimum seconds between triggered actions, defaults to 30\"},"
             "\"hysteresis_c\":{\"type\":\"number\",\"description\":\"Deadband around threshold to prevent flapping; also used for humidity units\"},"
             "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this background condition rule\"},"
-            "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_temperature_humidity\"},"
+            "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_environment\"},"
             "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
             "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
+            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
             "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
         .execute = tool_automation_create_rule_execute,
     });
@@ -922,7 +930,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "set_fan",
-        .description = "Turn the fan on or off. The fan is wired to GPIO5 on the third/control role; HIGH turns it on and LOW turns it off. Prefer this over generic GPIO tools when the user says fan, 风扇, ventilation, or airflow. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Legacy fan control. The current demo profile leaves the fan GPIO disabled because GPIO5 is reserved for the curtain servo. Do not use this for current showcase tests unless a non-servo fan GPIO is explicitly configured. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"state\":{\"type\":\"integer\",\"enum\":[0,1],\"description\":\"0 for OFF/LOW, 1 for ON/HIGH\"},"
@@ -998,7 +1006,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "servo_write",
-        .description = "Disabled for the current demo hardware unless ESPAGENT_SECRET_SERVO_GPIO is explicitly configured. The current GPIO5 line is reserved for the active-high fan. Do not choose this tool for normal demonstrations. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .description = "Low-level PWM servo control on the configured servo GPIO. Use set_curtain for normal curtain open/close requests; use servo_write only when the user asks for an explicit angle or pulse width. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{"
@@ -1007,6 +1015,20 @@ esp_err_t tool_registry_init(void)
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
             "\"required\":[]}",
         .execute = tool_servo_write_routed_execute,
+    });
+
+    register_tool(&(espagent_tool_t){
+        .name = "set_curtain",
+        .description = "Open or close the curtain actuator driven by the GPIO5 PWM servo on the third/control role. Prefer this when the user says curtain, 窗帘, curtain opener, open curtain, close curtain, 打开窗帘, or 关闭窗帘. Defaults are closed=0 degrees and open=90 degrees; optional angle can be used for calibration. On a coordinator_agent, this defaults to the remote control_agent unless local=true is explicitly provided.",
+        .input_schema_json =
+            "{\"type\":\"object\","
+            "\"properties\":{"
+            "\"state\":{\"type\":\"string\",\"enum\":[\"open\",\"closed\",\"on\",\"off\",\"打开\",\"关闭\"],\"description\":\"Curtain state: open/打开 or closed/关闭\"},"
+            "\"position\":{\"type\":\"string\",\"enum\":[\"open\",\"closed\",\"打开\",\"关闭\"],\"description\":\"Alias for state\"},"
+            "\"angle\":{\"type\":\"integer\",\"minimum\":0,\"maximum\":180,\"description\":\"Optional calibration angle override\"},"
+            "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this coordinator board locally\"}},"
+            "\"required\":[]}",
+        .execute = tool_set_curtain_routed_execute,
     });
 
     register_tool(&(espagent_tool_t){

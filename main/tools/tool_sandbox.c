@@ -78,6 +78,7 @@ static const tool_sandbox_rule_t s_rules[] = {
     {"virtual_device_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"copper_gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gpio_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
+    {"set_curtain", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"servo_write", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"gree_ac_control", ESPAGENT_TOOL_RISK_MEDIUM_CONTROL, TOOL_CAP_CONTROL | TOOL_CAP_MESH},
     {"max98357_play_tone", ESPAGENT_TOOL_RISK_LOW_CONTROL, TOOL_CAP_CONTROL},
@@ -264,6 +265,7 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "set_humidifier") != 0 &&
         strcmp(action, "set_fan") != 0 &&
         strcmp(action, "set_device_led") != 0 &&
+        strcmp(action, "set_curtain") != 0 &&
         strcmp(action, "servo_write") != 0 &&
         strcmp(action, "ws2812_set") != 0 &&
         strcmp(action, "set_status_light") != 0 &&
@@ -273,6 +275,8 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         strcmp(action, "control_emergency_stop") != 0 &&
         strcmp(action, "control_clear_emergency_stop") != 0 &&
         strcmp(action, "read_temperature_humidity") != 0 &&
+        strcmp(action, "read_environment") != 0 &&
+        strcmp(action, "read_light_level") != 0 &&
         strcmp(action, "virtual_device_read") != 0 &&
         strcmp(action, "agent_task") != 0 &&
         strcmp(action, "guardian_approval_list") != 0 &&

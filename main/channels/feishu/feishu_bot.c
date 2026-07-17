@@ -43,6 +43,7 @@ static const char *TAG = "feishu";
 #define FEISHU_HTTP_BUFFER_SIZE_TX 512
 #define FEISHU_TOKEN_RESP_CAP 1024
 #define FEISHU_API_RESP_CAP 2048
+#define FEISHU_WS_MAX_FRAME_BYTES (16 * 1024)
 #define FEISHU_HTTP_RETRY_COUNT 3
 #define FEISHU_HTTP_RETRY_DELAY_MS 1500
 
@@ -75,6 +76,15 @@ static int clamp_ws_reconnect_ms(int value_ms)
 static bool s_ws_connected = false;
 static QueueHandle_t s_ack_queue = NULL;
 static TaskHandle_t s_ack_task = NULL;
+static uint8_t *s_ws_rx_buf = NULL;
+static size_t s_ws_rx_cap = 0;
+
+static void feishu_ws_rx_reset(void)
+{
+    free(s_ws_rx_buf);
+    s_ws_rx_buf = NULL;
+    s_ws_rx_cap = 0;
+}
 
 static void handle_message_event(cJSON *event);
 
@@ -861,13 +871,13 @@ static void feishu_ws_event_handler(void *arg, esp_event_base_t base, int32_t ev
     (void)arg;
     (void)base;
     esp_websocket_event_data_t *e = (esp_websocket_event_data_t *)event_data;
-    static uint8_t *rx_buf = NULL;
-    static size_t rx_cap = 0;
     if (event_id == WEBSOCKET_EVENT_CONNECTED) {
+        feishu_ws_rx_reset();
         s_ws_connected = true;
         ESP_LOGI(TAG, "Feishu WS connected");
     } else if (event_id == WEBSOCKET_EVENT_DISCONNECTED) {
         s_ws_connected = false;
+        feishu_ws_rx_reset();
         ESP_LOGW(TAG, "Feishu WS disconnected");
     } else if (event_id == WEBSOCKET_EVENT_DATA) {
         ESP_LOGI(TAG, "WS data: opcode=0x%x len=%d offset=%d total=%d",
@@ -876,26 +886,32 @@ static void feishu_ws_event_handler(void *arg, esp_event_base_t base, int32_t ev
             ESP_LOGW(TAG, "Ignoring non-binary WS data: opcode=0x%x", e->op_code);
             return;
         }
-        size_t need = e->payload_offset + e->data_len;
-        if (e->payload_offset == 0) {
-            if (rx_buf) free(rx_buf);
-            rx_cap = (e->payload_len > need) ? e->payload_len : need;
-            rx_buf = malloc(rx_cap);
-            if (!rx_buf) {
-                ESP_LOGW(TAG, "WS receive buffer allocation failed: %u bytes", (unsigned)rx_cap);
-                return;
-            }
-        } else if (!rx_buf || need > rx_cap) {
-            ESP_LOGW(TAG, "WS fragmented frame state invalid: need=%u cap=%u",
-                     (unsigned)need, (unsigned)rx_cap);
+        if (e->payload_len <= 0 || e->payload_len > FEISHU_WS_MAX_FRAME_BYTES) {
+            ESP_LOGW(TAG, "Dropping oversized/invalid WS frame: total=%d max=%u",
+                     e->payload_len, (unsigned)FEISHU_WS_MAX_FRAME_BYTES);
+            feishu_ws_rx_reset();
             return;
         }
-        memcpy(rx_buf + e->payload_offset, e->data_ptr, e->data_len);
+        size_t need = e->payload_offset + e->data_len;
+        if (e->payload_offset == 0) {
+            feishu_ws_rx_reset();
+            s_ws_rx_cap = (e->payload_len > need) ? e->payload_len : need;
+            s_ws_rx_buf = malloc(s_ws_rx_cap);
+            if (!s_ws_rx_buf) {
+                ESP_LOGW(TAG, "WS receive buffer allocation failed: %u bytes", (unsigned)s_ws_rx_cap);
+                s_ws_rx_cap = 0;
+                return;
+            }
+        } else if (!s_ws_rx_buf || need > s_ws_rx_cap) {
+            ESP_LOGW(TAG, "WS fragmented frame state invalid: need=%u cap=%u",
+                     (unsigned)need, (unsigned)s_ws_rx_cap);
+            feishu_ws_rx_reset();
+            return;
+        }
+        memcpy(s_ws_rx_buf + e->payload_offset, e->data_ptr, e->data_len);
         if (need >= e->payload_len) {
-            feishu_handle_ws_frame(rx_buf, e->payload_len);
-            free(rx_buf);
-            rx_buf = NULL;
-            rx_cap = 0;
+            feishu_handle_ws_frame(s_ws_rx_buf, e->payload_len);
+            feishu_ws_rx_reset();
         }
     }
 }
@@ -990,6 +1006,7 @@ static void feishu_ws_task(void *arg)
         esp_websocket_client_destroy(s_ws_client);
         s_ws_client = NULL;
         s_ws_connected = false;
+        feishu_ws_rx_reset();
         vTaskDelay(pdMS_TO_TICKS(s_ws_reconnect_interval_ms));
     }
 }

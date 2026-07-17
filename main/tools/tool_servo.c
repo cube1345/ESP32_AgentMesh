@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static const char *TAG = "tool_servo";
 
@@ -162,4 +163,94 @@ esp_err_t tool_servo_write_execute(const char *input_json, char *output, size_t 
              "Error: provide 'angle' (0-180) or 'pulse_us' (microseconds)");
     cJSON_Delete(root);
     return ESP_ERR_INVALID_ARG;
+}
+
+static bool parse_curtain_state(cJSON *root, bool *open)
+{
+    cJSON *item = cJSON_GetObjectItem(root, "state");
+    if (!item) {
+        item = cJSON_GetObjectItem(root, "position");
+    }
+    if (!item) {
+        item = cJSON_GetObjectItem(root, "value");
+    }
+    if (!item) {
+        return false;
+    }
+
+    if (cJSON_IsBool(item)) {
+        *open = cJSON_IsTrue(item);
+        return true;
+    }
+    if (cJSON_IsNumber(item)) {
+        if (item->valueint == 0) {
+            *open = false;
+            return true;
+        }
+        if (item->valueint == 1) {
+            *open = true;
+            return true;
+        }
+        return false;
+    }
+    if (!cJSON_IsString(item) || !item->valuestring) {
+        return false;
+    }
+
+    const char *s = item->valuestring;
+    if (strcasecmp(s, "open") == 0 || strcasecmp(s, "on") == 0 ||
+        strcmp(s, "打开") == 0 || strcmp(s, "开启") == 0 || strcmp(s, "开") == 0) {
+        *open = true;
+        return true;
+    }
+    if (strcasecmp(s, "closed") == 0 || strcasecmp(s, "close") == 0 ||
+        strcasecmp(s, "off") == 0 ||
+        strcmp(s, "关闭") == 0 || strcmp(s, "关") == 0 || strcmp(s, "合上") == 0) {
+        *open = false;
+        return true;
+    }
+    return false;
+}
+
+esp_err_t tool_set_curtain_execute(const char *input_json, char *output, size_t output_size)
+{
+    cJSON *root = cJSON_Parse(input_json && input_json[0] ? input_json : "{}");
+    if (!root) {
+        snprintf(output, output_size, "Error: invalid JSON input");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool open = false;
+    bool has_state = parse_curtain_state(root, &open);
+    int angle = has_state ? (open ? ESPAGENT_CURTAIN_OPEN_ANGLE : ESPAGENT_CURTAIN_CLOSED_ANGLE) : -1;
+
+    cJSON *angle_item = cJSON_GetObjectItem(root, "angle");
+    if (angle_item && cJSON_IsNumber(angle_item)) {
+        angle = angle_item->valueint;
+    }
+    if (angle < 0 || angle > 180) {
+        snprintf(output, output_size,
+                 "Error: curtain requires state=open/closed or angle=0-180");
+        cJSON_Delete(root);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = tool_servo_set_angle(angle);
+    if (err == ESP_OK) {
+        const char *label = has_state ? (open ? "opened" : "closed") : "positioned";
+        snprintf(output, output_size,
+                 "OK: curtain servo on GPIO%d %s at %d degrees",
+                 ESPAGENT_SERVO_DEFAULT_GPIO,
+                 label,
+                 angle);
+    } else {
+        snprintf(output, output_size,
+                 "Error: curtain servo write failed (%s)", esp_err_to_name(err));
+    }
+    ESP_LOGI(TAG, "set_curtain state=%s angle=%d -> %s",
+             has_state ? (open ? "open" : "closed") : "angle",
+             angle,
+             esp_err_to_name(err));
+    cJSON_Delete(root);
+    return err;
 }

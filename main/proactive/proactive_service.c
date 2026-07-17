@@ -19,6 +19,7 @@ static char s_channel[16] = {0};
 static char s_chat_id[96] = {0};
 static bool s_has_target = false;
 
+#if ESPAGENT_PROACTIVE_ENABLED
 static const char *PROACTIVE_PROMPT =
     "This is an internal proactive check. Decide whether ESPAgent should "
     "send the user a short proactive message now.\n"
@@ -29,6 +30,7 @@ static const char *PROACTIVE_PROMPT =
     "reasonable time, or a sensor state worth mentioning.\n"
     "If there is no useful reason to contact the user, reply exactly: "
     ESPAGENT_PROACTIVE_NO_MESSAGE;
+#endif
 
 static void proactive_load_target(void)
 {
@@ -126,6 +128,16 @@ esp_err_t proactive_service_trigger_now(void)
 #endif
 }
 
+esp_err_t proactive_service_init(void)
+{
+    proactive_load_target();
+    ESP_LOGI(TAG, "Proactive service initialized (enabled=%d interval=%ds)",
+             ESPAGENT_PROACTIVE_ENABLED,
+             ESPAGENT_PROACTIVE_INTERVAL_MS / 1000);
+    return ESP_OK;
+}
+
+#if ESPAGENT_PROACTIVE_ENABLED
 static void proactive_task_main(void *arg)
 {
     (void)arg;
@@ -137,15 +149,7 @@ static void proactive_task_main(void *arg)
         vTaskDelay(pdMS_TO_TICKS(ESPAGENT_PROACTIVE_INTERVAL_MS));
     }
 }
-
-esp_err_t proactive_service_init(void)
-{
-    proactive_load_target();
-    ESP_LOGI(TAG, "Proactive service initialized (enabled=%d interval=%ds)",
-             ESPAGENT_PROACTIVE_ENABLED,
-             ESPAGENT_PROACTIVE_INTERVAL_MS / 1000);
-    return ESP_OK;
-}
+#endif
 
 esp_err_t proactive_service_start(void)
 {
