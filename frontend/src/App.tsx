@@ -90,6 +90,14 @@ function isSandboxEvent(event: TimelineEvent): boolean {
   return `${event.stage} ${event.source} ${event.target} ${event.payload}`.toLowerCase().match(/sandbox|沙箱|denied|blocked by sandbox/) !== null;
 }
 
+function isIrEmergencyStopEvent(event: TimelineEvent): boolean {
+  const text = `${event.stage} ${event.source} ${event.target} ${event.payload}`.toLowerCase();
+  return text.includes('ir_emergency_stop') ||
+    text.includes('ir emergency stop') ||
+    text.includes('红外急停') ||
+    text.includes('红外') && text.includes('急停');
+}
+
 function defaultGatewayWsUrl(): string {
   if (typeof window === 'undefined') return 'ws://127.0.0.1:4173/ws';
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -264,6 +272,7 @@ function App() {
   const canUseChat = session?.role !== 'viewer';
   const isLive = Boolean(payload.mqtt);
   const sandboxEvents = useMemo(() => payload.timeline.filter(isSandboxEvent), [payload.timeline]);
+  const latestIrStopEvent = useMemo(() => payload.timeline.find(isIrEmergencyStopEvent) || null, [payload.timeline]);
   const filteredTimeline = useMemo(() => payload.timeline.filter((event) => {
     if (timelineFilter === '全部') return true;
     if (timelineFilter === 'telemetry') return event.stage.includes('telemetry');
@@ -504,6 +513,19 @@ function App() {
             <section className="summary-strip" aria-label="运行摘要">
               {statItems.map((item) => <div key={item.label} className={`summary-item tone-${item.tone}`}><span>{item.icon}</span><div><small>{item.label}</small><strong>{item.value}</strong></div></div>)}
               <div className="summary-source"><ApiOutlined /><div><small>Topic Prefix</small><strong>{payload.mqtt?.topicPrefix || 'local mock'}</strong></div></div>
+            </section>
+
+            <section className={`ir-stop-banner ${latestIrStopEvent ? 'is-triggered' : 'is-armed'}`} aria-live="polite">
+              <div className="ir-stop-indicator"><SafetyCertificateOutlined /></div>
+              <div className="ir-stop-copy">
+                <span>{latestIrStopEvent ? 'IR Emergency Stop' : 'IR Stop Armed'}</span>
+                <strong>{latestIrStopEvent ? '已接收到红外停止信号，硬件执行已强制急停' : '红外急停监听中，等待遥控器停止信号'}</strong>
+                <p>{latestIrStopEvent ? latestIrStopEvent.payload : '第三角色 control_agent 本地监听 GPIO0，触发后会关闭 WS2812、停止舵机 PWM 并锁定 emergency_stop。'}</p>
+              </div>
+              <div className="ir-stop-meta">
+                <small>{latestIrStopEvent ? latestIrStopEvent.time : 'WAITING'}</small>
+                <code>{latestIrStopEvent ? `${latestIrStopEvent.source} → ${latestIrStopEvent.target}` : 'GPIO0 / NEC'}</code>
+              </div>
             </section>
 
             <div className="workspace-content">

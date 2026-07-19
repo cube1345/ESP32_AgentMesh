@@ -2,6 +2,8 @@
 #include "espagent_config.h"
 #include "wifi/wifi_manager.h"
 #include "channels/feishu/feishu_bot.h"
+#include "control/command_queue.h"
+#include "control/ir_emergency_stop.h"
 #include "llm/llm_proxy.h"
 #include "cache/cache_store.h"
 #include "bus/message_bus.h"
@@ -819,6 +821,28 @@ static int cmd_proactive_trigger(int argc, char **argv)
     return err == ESP_OK ? 0 : 1;
 }
 
+static int cmd_control_state(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    char output[1024] = {0};
+    esp_err_t err = control_command_queue_state_json(output, sizeof(output));
+    printf("control_state status: %s\n", esp_err_to_name(err));
+    printf("%s\n", output[0] ? output : "(empty)");
+    return err == ESP_OK ? 0 : 1;
+}
+
+static int cmd_ir_stop_status(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    char output[512] = {0};
+    esp_err_t err = ir_emergency_stop_status(output, sizeof(output));
+    printf("ir_stop_status status: %s\n", esp_err_to_name(err));
+    printf("%s\n", output[0] ? output : "(empty)");
+    return err == ESP_OK ? 0 : 1;
+}
+
 static int cmd_tool_exec(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1603,6 +1627,20 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_proactive_trigger,
     };
     esp_console_cmd_register(&proactive_trigger_cmd);
+
+    esp_console_cmd_t control_state_cmd = {
+        .command = "control_state",
+        .help = "Show local control queue state without MQTT",
+        .func = &cmd_control_state,
+    };
+    esp_console_cmd_register(&control_state_cmd);
+
+    esp_console_cmd_t ir_stop_status_cmd = {
+        .command = "ir_stop_status",
+        .help = "Show local IR emergency-stop receiver state and last decoded NEC frame",
+        .func = &cmd_ir_stop_status,
+    };
+    esp_console_cmd_register(&ir_stop_status_cmd);
 
     /* tool_exec */
     esp_console_cmd_t tool_exec_cmd = {

@@ -39,6 +39,7 @@ set(ESPAGENT_MESH_ROLE_SRCS
     "roles/guardian_node.c"
     "guardian/approval_queue.c"
     "control/command_queue.c"
+    "control/ir_emergency_stop.c"
     "sensors/sensor_history.c"
     "sensors/sensor_mqtt.c"
     "espnow/espnow_sender.c"

@@ -25,6 +25,7 @@
 #include "cache/cache_store.h"
 #include "channels/feishu/feishu_bot.h"
 #include "cli/serial_cli.h"
+#include "control/ir_emergency_stop.h"
 #include "cron/cron_service.h"
 #include "device/device_registry.h"
 #include "dynamic/dynamic_extension.h"
@@ -389,6 +390,7 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(coordinator_node_init(), TAG, "coordinator_node_init failed");
     ESP_RETURN_ON_ERROR(sensor_node_init(), TAG, "sensor_node_init failed");
     ESP_RETURN_ON_ERROR(control_node_init(), TAG, "control_node_init failed");
+    ESP_RETURN_ON_ERROR(ir_emergency_stop_init(), TAG, "ir_emergency_stop_init failed");
     ESP_RETURN_ON_ERROR(display_node_init(), TAG, "display_node_init failed");
     ESP_RETURN_ON_ERROR(guardian_node_init(), TAG, "guardian_node_init failed");
 
@@ -400,6 +402,7 @@ esp_err_t espagent_app_start_local_services(void)
     ESP_RETURN_ON_ERROR(serial_cli_init(), TAG, "serial_cli_init failed");
 
     if (espagent_role_runs_control_outputs()) {
+        ESP_RETURN_ON_ERROR(ir_emergency_stop_start(), TAG, "ir_emergency_stop_start failed");
         ESP_RETURN_ON_ERROR(create_pinned_task(boot_servo_task, "boot_servo",
                                               ESPAGENT_BOOT_SERVO_STACK,
                                               ESPAGENT_BOOT_SERVO_PRIO,

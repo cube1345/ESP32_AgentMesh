@@ -330,6 +330,106 @@ select {
 .status-light.is-online { background: #1a8b70; box-shadow: 0 0 0 3px #e3f4ef; }
 .status-light.is-idle { background: #d88b26; box-shadow: 0 0 0 3px #fbf0df; }
 
+.ir-stop-banner {
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 14px;
+  margin: 14px 32px 0;
+  padding: 14px 16px;
+  border: 1px solid #dfe5e2;
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.ir-stop-banner.is-armed {
+  border-color: #dfe5e2;
+  background: #f8faf9;
+}
+
+.ir-stop-banner.is-triggered {
+  border-color: #d45d58;
+  background: #fff3f2;
+  box-shadow: inset 4px 0 0 #c94b4b;
+}
+
+.ir-stop-indicator {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border-radius: 6px;
+  color: #1a8b70;
+  background: #e5f4ef;
+  font-size: 18px;
+}
+
+.ir-stop-banner.is-triggered .ir-stop-indicator {
+  color: #a9423e;
+  background: #f9dedc;
+}
+
+.ir-stop-copy {
+  min-width: 0;
+}
+
+.ir-stop-copy span,
+.ir-stop-copy strong,
+.ir-stop-copy p,
+.ir-stop-meta small,
+.ir-stop-meta code {
+  display: block;
+}
+
+.ir-stop-copy span {
+  color: #7a857f;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.ir-stop-copy strong {
+  margin-top: 2px;
+  color: #18211d;
+  font-size: 13px;
+}
+
+.ir-stop-banner.is-triggered .ir-stop-copy strong {
+  color: #8f2f2b;
+}
+
+.ir-stop-copy p {
+  overflow: hidden;
+  margin: 4px 0 0;
+  color: #66716b;
+  font-family: "Cascadia Code", Consolas, monospace;
+  font-size: 10px;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ir-stop-meta {
+  min-width: 120px;
+  text-align: right;
+}
+
+.ir-stop-meta small {
+  color: #8a948f;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.ir-stop-meta code {
+  overflow: hidden;
+  max-width: 220px;
+  margin-top: 3px;
+  color: #536059;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .console-main {
   min-width: 0;
 }
