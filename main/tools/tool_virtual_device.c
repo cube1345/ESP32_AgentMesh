@@ -1997,7 +1997,7 @@ esp_err_t tool_virtual_device_read_execute(const char *input_json,
         return err;
     }
 
-    char signature_reason[160] = {0};
+    char signature_reason[192] = {0};
     err = verify_manifest_sha256(device_name, manifest_buf, false, signature_reason, sizeof(signature_reason));
     if (err != ESP_OK) {
         cJSON_Delete(root);
@@ -2117,7 +2117,7 @@ esp_err_t tool_virtual_device_control_execute(const char *input_json,
         return err;
     }
 
-    char signature_reason[160] = {0};
+    char signature_reason[192] = {0};
     err = verify_manifest_sha256(device_name, manifest_buf, true, signature_reason, sizeof(signature_reason));
     if (err != ESP_OK) {
         cJSON_Delete(root);

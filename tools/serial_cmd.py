@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import os
 import select
 import sys
@@ -24,6 +25,7 @@ def drain(fd: int, seconds: float, echo: bool, stop_markers: tuple[str, ...] = (
     end = time.time() + seconds
     stop_at: float | None = None
     out: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     while time.time() < end:
         readable, _, _ = select.select([fd], [], [], 0.2)
         if not readable:
@@ -34,7 +36,7 @@ def drain(fd: int, seconds: float, echo: bool, stop_markers: tuple[str, ...] = (
             data = b""
         if not data:
             continue
-        text = data.decode("utf-8", "replace")
+        text = decoder.decode(data, final=False)
         out.append(text)
         if echo:
             sys.stdout.write(text)
@@ -43,6 +45,12 @@ def drain(fd: int, seconds: float, echo: bool, stop_markers: tuple[str, ...] = (
             stop_at = time.time() + 0.75
         if stop_at is not None and time.time() >= stop_at:
             break
+    tail = decoder.decode(b"", final=True)
+    if tail:
+        out.append(tail)
+        if echo:
+            sys.stdout.write(tail)
+            sys.stdout.flush()
     return "".join(out)
 
 

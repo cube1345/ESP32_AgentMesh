@@ -137,6 +137,71 @@ static bool contains_ci(const char *haystack, const char *needle)
     return false;
 }
 
+static void trim_in_place(char *s);
+
+static int skill_match_directive_score(const char *query, const char *content)
+{
+    if (!query || !query[0] || !content || !content[0]) {
+        return 0;
+    }
+
+    int score = 0;
+    const char *line = content;
+    while (*line) {
+        const char *line_end = strpbrk(line, "\r\n");
+        size_t line_len = line_end ? (size_t)(line_end - line) : strlen(line);
+        if (line_len > 0 && line_len < 384) {
+            char directive[384] = {0};
+            memcpy(directive, line, line_len);
+            directive[line_len] = '\0';
+
+            char *value = strstr(directive, "@match");
+            if (value) {
+                value += strlen("@match");
+                while (*value && isspace((unsigned char)*value)) value++;
+                if (strncmp(value, "trigger=", 8) == 0) {
+                    value += 8;
+                } else if (*value == ':' || *value == '=') {
+                    value++;
+                }
+                while (*value && isspace((unsigned char)*value)) value++;
+
+                char quote = '\0';
+                if (*value == '"' || *value == '\'') {
+                    quote = *value++;
+                }
+                char *value_end = quote ? strchr(value, quote) : NULL;
+                if (value_end) {
+                    *value_end = '\0';
+                }
+
+                char *cursor = value;
+                while (cursor && *cursor) {
+                    char *next = strpbrk(cursor, "|,");
+                    if (next) {
+                        *next++ = '\0';
+                    }
+                    trim_in_place(cursor);
+                    size_t alias_len = strlen(cursor);
+                    if (alias_len >= 2 && contains_ci(query, cursor)) {
+                        score += 40 + (int)(alias_len > 24 ? 24 : alias_len);
+                    }
+                    cursor = next;
+                }
+            }
+        }
+
+        if (!line_end) {
+            break;
+        }
+        line = line_end + 1;
+        if (line_end[0] == '\r' && line[0] == '\n') {
+            line++;
+        }
+    }
+    return score;
+}
+
 static int skill_query_score(const char *query,
                              const char *name,
                              const char *title,
@@ -147,7 +212,35 @@ static int skill_query_score(const char *query,
         return 0;
     }
 
-    int score = 0;
+    int score = skill_match_directive_score(query, content);
+
+    /* Score ASCII words independently so mixed queries such as
+       "cube最喜欢吃什么" still match a skill named "cube-favorite". */
+    char ascii_token[48] = {0};
+    size_t ascii_len = 0;
+    for (const unsigned char *p = (const unsigned char *)query; ; p++) {
+        unsigned char c = *p;
+        bool ascii_word = (c >= '0' && c <= '9') ||
+                          (c >= 'A' && c <= 'Z') ||
+                          (c >= 'a' && c <= 'z') ||
+                          c == '_' || c == '-';
+        if (ascii_word && ascii_len + 1 < sizeof(ascii_token)) {
+            ascii_token[ascii_len++] = (char)c;
+        } else {
+            if (ascii_len >= 2) {
+                ascii_token[ascii_len] = '\0';
+                if (contains_ci(name, ascii_token)) score += 4;
+                if (contains_ci(title, ascii_token)) score += 6;
+                if (contains_ci(desc, ascii_token)) score += 3;
+                if (contains_ci(content, ascii_token)) score += 2;
+            }
+            ascii_len = 0;
+        }
+        if (c == '\0') {
+            break;
+        }
+    }
+
     char token[48];
     size_t ti = 0;
     for (const unsigned char *p = (const unsigned char *)query; ; p++) {
@@ -175,6 +268,217 @@ static int skill_query_score(const char *query,
         }
     }
     return score;
+}
+
+static void trim_in_place(char *s)
+{
+    if (!s) {
+        return;
+    }
+    char *start = s;
+    while (*start && isspace((unsigned char)*start)) {
+        start++;
+    }
+    if (start != s) {
+        memmove(s, start, strlen(start) + 1);
+    }
+    size_t len = strlen(s);
+    while (len > 0 && isspace((unsigned char)s[len - 1])) {
+        s[--len] = '\0';
+    }
+}
+
+static bool parse_rule_value(const char *line,
+                             const char *key,
+                             char *out,
+                             size_t out_size)
+{
+    if (!line || !key || !out || out_size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+
+    char pattern[32] = {0};
+    snprintf(pattern, sizeof(pattern), "%s=", key);
+    const char *p = strstr(line, pattern);
+    if (!p) {
+        return false;
+    }
+    p += strlen(pattern);
+
+    char quote = '\0';
+    if (*p == '"' || *p == '\'') {
+        quote = *p++;
+    }
+
+    size_t off = 0;
+    bool truncated = false;
+    while (*p) {
+        if (quote) {
+            if (*p == quote) {
+                break;
+            }
+        } else if (isspace((unsigned char)*p)) {
+            break;
+        }
+        if (off + 1 < out_size) {
+            out[off++] = *p;
+        } else {
+            truncated = true;
+        }
+        p++;
+    }
+    out[off] = '\0';
+    if (truncated) {
+        ESP_LOGW(TAG, "Ignoring oversized skill rule value key=%s", key);
+        out[0] = '\0';
+        return false;
+    }
+    trim_in_place(out);
+    return out[0] != '\0';
+}
+
+static bool role_is_allowed_for_skill_rule(const char *role)
+{
+    return role &&
+           (strcmp(role, "sensor_agent") == 0 ||
+            strcmp(role, "control_agent") == 0 ||
+            strcmp(role, "guardian_agent") == 0);
+}
+
+static bool action_is_allowed_for_skill_rule(const char *action)
+{
+    return action &&
+           (strcmp(action, "read_temperature_humidity") == 0 ||
+            strcmp(action, "read_environment") == 0 ||
+            strcmp(action, "read_light_level") == 0 ||
+            strcmp(action, "set_status_light") == 0 ||
+            strcmp(action, "ws2812_set") == 0 ||
+            strcmp(action, "set_curtain") == 0 ||
+            strcmp(action, "servo_write") == 0 ||
+            strcmp(action, "control_state") == 0 ||
+            strcmp(action, "control_emergency_stop") == 0 ||
+            strcmp(action, "control_clear_emergency_stop") == 0);
+}
+
+static bool args_json_looks_safe_object(const char *args_json)
+{
+    if (!args_json || args_json[0] == '\0') {
+        return true;
+    }
+    size_t len = strlen(args_json);
+    return len >= 2 && len < 240 && args_json[0] == '{' &&
+           args_json[len - 1] == '}' && strstr(args_json, "..") == NULL;
+}
+
+static const char *find_trigger_delim(const char *s, size_t *delim_len)
+{
+    if (!s || !delim_len) {
+        return NULL;
+    }
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p == '|' || *p == ',') {
+            *delim_len = 1;
+            return (const char *)p;
+        }
+        if (p[0] == 0xEF && p[1] != '\0' && p[2] != '\0' &&
+            p[1] == 0xBC && p[2] == 0x8C) {
+            *delim_len = 3;
+            return (const char *)p;
+        }
+    }
+    return NULL;
+}
+
+static bool trigger_token_matches_message(const char *trigger,
+                                          const char *message,
+                                          char *matched,
+                                          size_t matched_size)
+{
+    if (!trigger || !message) {
+        return false;
+    }
+
+    const char *cursor = trigger;
+    while (cursor && *cursor) {
+        size_t delim_len = 0;
+        const char *next = find_trigger_delim(cursor, &delim_len);
+        size_t token_len = next ? (size_t)(next - cursor) : strlen(cursor);
+        while (token_len > 0 && isspace((unsigned char)cursor[0])) {
+            cursor++;
+            token_len--;
+        }
+        while (token_len > 0 && isspace((unsigned char)cursor[token_len - 1])) {
+            token_len--;
+        }
+        if (token_len >= 2 && token_len < matched_size) {
+            char token[256] = {0};
+            if (token_len >= sizeof(token)) {
+                ESP_LOGW(TAG, "Ignoring oversized skill rule trigger token");
+            } else {
+                memcpy(token, cursor, token_len);
+                token[token_len] = '\0';
+                if (contains_ci(message, token)) {
+                    if (matched && matched_size > 0) {
+                        memcpy(matched, token, token_len + 1);
+                    }
+                    return true;
+                }
+            }
+        } else if (token_len >= matched_size) {
+            ESP_LOGW(TAG, "Ignoring trigger token too large for match buffer");
+        }
+        if (!next) {
+            break;
+        }
+        cursor = next + delim_len;
+    }
+    return false;
+}
+
+static bool parse_skill_rule_line(const char *line,
+                                  const char *skill_name,
+                                  const char *message,
+                                  skill_rule_match_t *match)
+{
+    if (!line || !skill_name || !message || !match ||
+        strstr(line, "@rule") == NULL) {
+        return false;
+    }
+
+    skill_rule_match_t local = {0};
+    snprintf(local.skill_name, sizeof(local.skill_name), "%s", skill_name);
+
+    if (!parse_rule_value(line, "trigger", local.trigger,
+                          sizeof(local.trigger)) ||
+        !parse_rule_value(line, "target_role", local.target_role,
+                          sizeof(local.target_role)) ||
+        !parse_rule_value(line, "action", local.action,
+                          sizeof(local.action))) {
+        return false;
+    }
+    if (!parse_rule_value(line, "args", local.args_json,
+                          sizeof(local.args_json))) {
+        snprintf(local.args_json, sizeof(local.args_json), "{}");
+    }
+
+    char matched_trigger[sizeof(local.trigger)] = {0};
+    if (!trigger_token_matches_message(local.trigger, message,
+                                       matched_trigger,
+                                       sizeof(matched_trigger))) {
+        return false;
+    }
+    if (!role_is_allowed_for_skill_rule(local.target_role) ||
+        !action_is_allowed_for_skill_rule(local.action) ||
+        !args_json_looks_safe_object(local.args_json)) {
+        ESP_LOGW(TAG, "Ignoring invalid skill rule skill=%s role=%s action=%s",
+                 skill_name, local.target_role, local.action);
+        return false;
+    }
+
+    snprintf(local.trigger, sizeof(local.trigger), "%s", matched_trigger);
+    *match = local;
+    return true;
 }
 
 static int enumerate_skill_files(skill_file_info_t *items, int max_items)
@@ -626,6 +930,67 @@ esp_err_t skill_loader_build_relevant_details(const char *query,
     free(items);
     free(file_text);
     return off > 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t skill_loader_find_matching_rule(const char *user_message,
+                                          skill_rule_match_t *match)
+{
+    if (!user_message || !user_message[0] || !match) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    memset(match, 0, sizeof(*match));
+
+    skill_file_info_t *items = NULL;
+    int count = 0;
+    esp_err_t err = load_skill_file_infos(&items, &count);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char *file_text = calloc(1, SKILL_LOADER_MAX_FILE_TEXT);
+    if (!file_text) {
+        free(items);
+        return ESP_ERR_NO_MEM;
+    }
+
+    bool found = false;
+    size_t best_trigger_len = 0;
+    skill_rule_match_t best = {0};
+
+    for (int i = 0; i < count; i++) {
+        file_text[0] = '\0';
+        FILE *f = fopen(items[i].path, "r");
+        if (!f) {
+            continue;
+        }
+        size_t n = fread(file_text, 1, SKILL_LOADER_MAX_FILE_TEXT - 1, f);
+        file_text[n] = '\0';
+        fclose(f);
+
+        char *saveptr = NULL;
+        for (char *line = strtok_r(file_text, "\r\n", &saveptr);
+             line != NULL;
+             line = strtok_r(NULL, "\r\n", &saveptr)) {
+            skill_rule_match_t candidate = {0};
+            if (parse_skill_rule_line(line, items[i].rel_name,
+                                      user_message, &candidate)) {
+                size_t trigger_len = strlen(candidate.trigger);
+                if (!found || trigger_len > best_trigger_len) {
+                    best = candidate;
+                    best_trigger_len = trigger_len;
+                    found = true;
+                }
+            }
+        }
+    }
+
+    free(file_text);
+    free(items);
+    if (!found) {
+        return ESP_ERR_NOT_FOUND;
+    }
+    *match = best;
+    return ESP_OK;
 }
 
 void skill_loader_invalidate_cache(void)

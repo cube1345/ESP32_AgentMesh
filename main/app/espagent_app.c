@@ -20,24 +20,20 @@
 
 #include "espagent_config.h"
 #include "agent/agent_loop.h"
-#include "automation/automation_engine.h"
 #include "bus/message_bus.h"
 #include "cache/cache_store.h"
 #include "channels/feishu/feishu_bot.h"
 #include "cli/serial_cli.h"
 #include "control/ir_emergency_stop.h"
-#include "cron/cron_service.h"
 #include "device/device_registry.h"
 #include "dynamic/dynamic_extension.h"
 #include "events/espagent_event.h"
 #include "gateway/ws_server.h"
-#include "heartbeat/heartbeat.h"
 #include "llm/llm_proxy.h"
 #include "memory/memory_store.h"
 #include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "onboard/wifi_onboard.h"
-#include "proactive/proactive_service.h"
 #include "proxy/http_proxy.h"
 #include "roles/control_node.h"
 #include "roles/coordinator_node.h"
@@ -161,6 +157,7 @@ static void publish_feishu_outbound_event(const char *chat_id,
     cJSON_free(json);
 }
 
+#if ESPAGENT_BOOT_SERVO_DEMO_ENABLED
 static void boot_servo_task(void *arg)
 {
     (void)arg;
@@ -183,6 +180,7 @@ static void boot_servo_task(void *arg)
     ESP_LOGI(TAG, "Boot servo demo complete");
     vTaskDelete(NULL);
 }
+#endif
 
 static void environment_monitor_task(void *arg)
 {
@@ -372,15 +370,6 @@ esp_err_t espagent_app_init_subsystems(void)
 
     ESP_RETURN_ON_ERROR(tool_registry_init(), TAG, "tool_registry_init failed");
 
-    if (espagent_role_runs_scheduler()) {
-        ESP_RETURN_ON_ERROR(automation_engine_init(), TAG, "automation_engine_init failed");
-        ESP_RETURN_ON_ERROR(cron_service_init(), TAG, "cron_service_init failed");
-        ESP_RETURN_ON_ERROR(heartbeat_init(), TAG, "heartbeat_init failed");
-        ESP_RETURN_ON_ERROR(proactive_service_init(), TAG, "proactive_service_init failed");
-    } else {
-        ESP_LOGI(TAG, "Scheduler/proactive init skipped for role=%s", ESPAGENT_NODE_ROLE);
-    }
-
     if (espagent_role_runs_llm()) {
         ESP_RETURN_ON_ERROR(agent_loop_init(), TAG, "agent_loop_init failed");
     } else {
@@ -403,12 +392,16 @@ esp_err_t espagent_app_start_local_services(void)
 
     if (espagent_role_runs_control_outputs()) {
         ESP_RETURN_ON_ERROR(ir_emergency_stop_start(), TAG, "ir_emergency_stop_start failed");
+#if ESPAGENT_BOOT_SERVO_DEMO_ENABLED
         ESP_RETURN_ON_ERROR(create_pinned_task(boot_servo_task, "boot_servo",
                                               ESPAGENT_BOOT_SERVO_STACK,
                                               ESPAGENT_BOOT_SERVO_PRIO,
                                               ESPAGENT_BOOT_SERVO_CORE,
                                               false),
                             TAG, "boot_servo task failed");
+#else
+        ESP_LOGI(TAG, "Boot servo demo disabled; servo moves only on explicit curtain/servo command");
+#endif
     } else {
         ESP_LOGI(TAG, "Boot servo demo skipped for role=%s", ESPAGENT_NODE_ROLE);
     }
@@ -519,38 +512,6 @@ esp_err_t espagent_app_start_network_services(void)
         ESP_RETURN_ON_ERROR(agent_loop_start(), TAG, "agent_loop_start failed");
     } else {
         ESP_LOGI(TAG, "Agent loop start skipped for role=%s", ESPAGENT_NODE_ROLE);
-    }
-
-    if (espagent_role_runs_scheduler()) {
-        if (espagent_role_is_coordinator()) {
-            esp_err_t automation_err = automation_engine_start();
-            if (automation_err != ESP_OK) {
-                ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
-            }
-            ESP_LOGI(TAG, "Coordinator cron/heartbeat/proactive tasks deferred to preserve Feishu/LLM memory headroom");
-        } else {
-            esp_err_t automation_err = automation_engine_start();
-            if (automation_err != ESP_OK) {
-                ESP_LOGW(TAG, "Automation engine start failed: %s", esp_err_to_name(automation_err));
-            }
-
-            esp_err_t cron_err = cron_service_start();
-            if (cron_err != ESP_OK) {
-                ESP_LOGW(TAG, "Cron service start failed: %s", esp_err_to_name(cron_err));
-            }
-
-            esp_err_t heartbeat_err = heartbeat_start();
-            if (heartbeat_err != ESP_OK) {
-                ESP_LOGW(TAG, "Heartbeat start failed: %s", esp_err_to_name(heartbeat_err));
-            }
-
-            esp_err_t proactive_err = proactive_service_start();
-            if (proactive_err != ESP_OK) {
-                ESP_LOGW(TAG, "Proactive service start failed: %s", esp_err_to_name(proactive_err));
-            }
-        }
-    } else {
-        ESP_LOGI(TAG, "Scheduler/proactive start skipped for role=%s", ESPAGENT_NODE_ROLE);
     }
 
 #if ESPAGENT_ENABLE_LOCAL_WS_GATEWAY

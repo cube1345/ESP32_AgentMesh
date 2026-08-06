@@ -137,22 +137,6 @@ static const slash_command_spec_t s_commands[] = {
             "然后由主 Agent 用简短结果总结返回。用户原始请求：%s",
     },
     {
-        .name = "workflow",
-        .usage = "/workflow <自然语言任务>",
-        .template_text =
-            "这是一个显式的 /workflow 指令。请优先把下面的请求实现为 deterministic 多步 workflow，"
-            "而不是只执行最后一步。Workflow step 应使用结构化 step 列表，每一步都可以调用 automation 白名单内的任意工具/动作，"
-            "并显式写出 action、args 和 delay_s；不要把能力限制为状态灯或单一设备。优先考虑 automation_create_workflow。用户原始请求：%s",
-    },
-    {
-        .name = "rule",
-        .usage = "/rule <自然语言任务>",
-        .template_text =
-            "这是一个显式的 /rule 指令。请优先把下面的请求实现为 persistent 条件规则，"
-            "而不是一次性动作。优先考虑 automation_create_rule；若属于持久后台规则，需要明确确认要求。"
-            "用户原始请求：%s",
-    },
-    {
         .name = "local",
         .usage = "/local <自然语言任务>",
         .template_text =
@@ -172,9 +156,8 @@ static const slash_command_spec_t s_commands[] = {
         .name = "status",
         .usage = "/status <自然语言任务>",
         .template_text =
-            "这是一个显式的 /status 指令。请优先检查状态、连接、队列、自动化、Guardian 或控制面状态。"
-            "优先考虑 automation_list，"
-            "以及对 control_agent 使用 mesh_send_command(action=control_state)。用户原始请求：%s",
+            "这是一个显式的 /status 指令。单工具模式下只检查用户指定的一项状态、连接、Guardian 或控制面状态。"
+            "若用户要求控制状态，对 control_agent 使用一次 mesh_send_command(action=control_state)。用户原始请求：%s",
     },
     {
         .name = "stop",
@@ -229,9 +212,8 @@ static const slash_command_spec_t s_commands[] = {
         .name = "trace",
         .usage = "/trace <自然语言任务>",
         .template_text =
-            "这是一个显式的 /trace 指令。请优先从 timeline、StateBoard、Mesh trace、控制状态、"
-            "自动化状态角度处理下面请求。必要时组合 automation_list、"
-            "以及对 control_agent 的 control_state 查询。用户原始请求：%s",
+            "这是一个显式的 /trace 指令。请从 timeline、StateBoard、Mesh trace 或控制状态中选择最匹配的一项检查，"
+            "本轮最多调用一个工具。用户原始请求：%s",
     },
 };
 
@@ -248,7 +230,7 @@ static void build_help_text(espagent_slash_result_t *result)
     off += snprintf(result->text + off, sizeof(result->text) - off,
                     "Slash commands:\n"
                     "Direct: /help /init /doctor /mcp /compact /clear /clear_all_memory /context_status /skills_list /skills_show <skill_name> /estop /stop /control_state /resume_control /resume /approve <approval_id> /deny <approval_id>\n"
-                    "Routing: /sensor /control /guardian /subagent /workflow /rule /local /mesh /status /device /profile /skills /privacy /lua /trace\n");
+                    "Routing: /sensor /control /guardian /subagent /local /mesh /status /device /profile /skills /privacy /lua /trace\n");
     snprintf(result->text + off, sizeof(result->text) - off,
              "Example: /control 把状态灯设为蓝色");
 }
@@ -285,6 +267,15 @@ bool espagent_slash_try_handle(const char *input, espagent_slash_result_t *resul
 
     if (command[0] == '\0' || strcmp(command, "help") == 0) {
         build_help_text(result);
+        return true;
+    }
+
+    if (strcmp(command, "workflow") == 0 || strcmp(command, "rule") == 0) {
+        result->type = ESPAGENT_SLASH_ERROR;
+        snprintf(result->command, sizeof(result->command), "%s", command);
+        snprintf(result->text, sizeof(result->text),
+                 "单工具模式已启用，/%s 和后台自动化已停用。请每次发送一个需要立即执行的动作。",
+                 command);
         return true;
     }
 

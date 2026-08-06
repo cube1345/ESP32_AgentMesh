@@ -1,6 +1,9 @@
 # ESPAgent - Common Default Configuration
 # Target-specific settings are in sdkconfig.defaults.esp32s3
 
+# Optimize the application for flash footprint on memory-constrained nodes.
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
 # Network hostname
 CONFIG_LWIP_LOCAL_HOSTNAME="espagent"
 CONFIG_LWIP_MAX_SOCKETS=12

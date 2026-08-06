@@ -58,8 +58,6 @@ const slashCommands: SlashCommandOption[] = [
   { command: '/control', description: '显式路由到执行角色', needsPrompt: true },
   { command: '/guardian', description: '显式路由到安全审查角色', needsPrompt: true },
   { command: '/subagent', description: '调用子代理处理任务', needsPrompt: true },
-  { command: '/workflow', description: '创建或查看多步任务', needsPrompt: true },
-  { command: '/rule', description: '创建或查看条件任务', needsPrompt: true },
   { command: '/mesh', description: '显式执行 Mesh 调度', needsPrompt: true },
   { command: '/status', description: '查看系统状态' },
   { command: '/device', description: '查看运行时设备' },

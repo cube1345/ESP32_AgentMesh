@@ -18,6 +18,8 @@
 static const char *TAG = "subagent";
 
 static char *s_subagent_tools_json = NULL;
+static portMUX_TYPE s_subagent_state_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool s_subagent_active = false;
 static void subagent_task(void *arg);
 
 typedef struct {
@@ -26,7 +28,27 @@ typedef struct {
     char *result;
     SemaphoreHandle_t done_sem;
     SemaphoreHandle_t cleanup_sem;
+    bool owns_single_flight;
 } subagent_ctx_t;
+
+static bool subagent_single_flight_try_acquire(void)
+{
+    bool acquired = false;
+    portENTER_CRITICAL(&s_subagent_state_lock);
+    if (!s_subagent_active) {
+        s_subagent_active = true;
+        acquired = true;
+    }
+    portEXIT_CRITICAL(&s_subagent_state_lock);
+    return acquired;
+}
+
+static void subagent_single_flight_release(void)
+{
+    portENTER_CRITICAL(&s_subagent_state_lock);
+    s_subagent_active = false;
+    portEXIT_CRITICAL(&s_subagent_state_lock);
+}
 
 static bool contains_substr_ci(const char *haystack, const char *needle)
 {
@@ -245,6 +267,7 @@ static void subagent_cleanup_ctx(subagent_ctx_t *ctx)
     if (!ctx) {
         return;
     }
+    const bool release_single_flight = ctx->owns_single_flight;
     if (ctx->done_sem) {
         vSemaphoreDelete(ctx->done_sem);
     }
@@ -255,6 +278,10 @@ static void subagent_cleanup_ctx(subagent_ctx_t *ctx)
     free(ctx->context);
     free(ctx->result);
     free(ctx);
+    if (release_single_flight) {
+        subagent_single_flight_release();
+        ESP_LOGI(TAG, "Subagent single-flight slot released");
+    }
 }
 
 static void subagent_run(subagent_ctx_t *ctx)
@@ -500,6 +527,16 @@ esp_err_t tool_subagent_execute(const char *input_json, char *output, size_t out
         return ESP_ERR_NO_MEM;
     }
 
+    if (!subagent_single_flight_try_acquire()) {
+        snprintf(output, output_size,
+                 "Error: another subagent is still running; wait for it to finish before retrying");
+        ESP_LOGW(TAG, "Rejected overlapping subagent request");
+        subagent_cleanup_ctx(ctx);
+        return ESP_ERR_INVALID_STATE;
+    }
+    ctx->owns_single_flight = true;
+    ESP_LOGI(TAG, "Subagent single-flight slot acquired");
+
     const uint32_t free_internal =
         (uint32_t)heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
     const uint32_t largest_internal =
@@ -555,6 +592,8 @@ esp_err_t tool_subagent_execute(const char *input_json, char *output, size_t out
                                      pdMS_TO_TICKS(ESPAGENT_SUBAGENT_TIMEOUT_MS));
     if (done != pdTRUE) {
         xSemaphoreGive(ctx->cleanup_sem);
+        ESP_LOGW(TAG,
+                 "Subagent timed out; single-flight remains occupied until worker cleanup");
         snprintf(output, output_size, "Error: subagent timed out after %d seconds",
                  ESPAGENT_SUBAGENT_TIMEOUT_MS / 1000);
         return ESP_ERR_TIMEOUT;

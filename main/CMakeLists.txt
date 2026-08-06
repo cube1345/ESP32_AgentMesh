@@ -53,18 +53,9 @@ set(ESPAGENT_CHANNEL_SRCS
     "onboard/wifi_onboard.c"
 )
 
-set(ESPAGENT_BACKGROUND_SRCS
-    "automation/automation_engine.c"
-    "proactive/proactive_service.c"
-    "cron/cron_service.c"
-    "heartbeat/heartbeat.c"
-)
-
 set(ESPAGENT_TOOL_SRCS
     "tools/tool_registry.c"
     "tools/tool_sandbox.c"
-    "tools/tool_automation.c"
-    "tools/tool_cron.c"
     "tools/tool_amap_weather.c"
     "tools/tool_web_search.c"
     "tools/tool_get_time.c"
@@ -100,7 +91,6 @@ idf_component_register(
         ${ESPAGENT_AGENT_SRCS}
         ${ESPAGENT_MESH_ROLE_SRCS}
         ${ESPAGENT_CHANNEL_SRCS}
-        ${ESPAGENT_BACKGROUND_SRCS}
         ${ESPAGENT_TOOL_SRCS}
         ${ESPAGENT_DRIVER_SRCS}
     INCLUDE_DIRS

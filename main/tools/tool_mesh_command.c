@@ -21,7 +21,7 @@
 #include <string.h>
 
 typedef struct {
-    char task_id[48];
+    char task_id[64];
     char command_id[ESPAGENT_MESH_ID_MAX];
     char trace_id[ESPAGENT_MESH_TRACE_MAX];
     char target_role[ESPAGENT_MESH_ROLE_MAX];
@@ -843,7 +843,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
             uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
             if (async_wait) {
                 if (reply_channel_copy[0] && reply_chat_id_copy[0]) {
-                    char task_id[48] = {0};
+                    char task_id[64] = {0};
                     esp_err_t task_err = start_mesh_wait_task(command_id_copy,
                                                               trace_id_copy,
                                                               target_role_copy,

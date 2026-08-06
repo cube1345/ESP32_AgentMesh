@@ -151,13 +151,25 @@ Skills Studio 的“安装到 Runtime”会把草稿转换为 Markdown，并写�
 /spiffs/skills/<normalized-name>.md
 ```
 
-默认上位机服务直接通过串口连接 coordinator：
+默认上位机服务通过 MQTT Mesh 与 coordinator 通信，不需要 USB 串口连接：
 
 ```bash
-ESPAGENT_SKILLS_SERIAL_PORT=/dev/ttyUSB0 npm run server
+npm run server
 ```
 
-可配置环境变量：
+Runtime Skill 的列表、正文读取、安装、更新和删除均使用
+`espagent/<mesh>/runtime/skills/request` 与 `runtime/skills/reply`。列表和正文采用
+分页拉取，避免较长 Markdown 占满 coordinator 的 MQTT 发布队列。
+
+MQTT 可配置环境变量：
+
+```bash
+ESPAGENT_SKILLS_MQTT_ENABLED=1
+ESPAGENT_SKILLS_MQTT_TIMEOUT_MS=15000
+ESPAGENT_SKILLS_MQTT_MAX_CONTENT_BYTES=1100
+```
+
+只有需要兼容旧固件时才显式启用串口回退：
 
 ```bash
 ESPAGENT_SKILLS_SERIAL_ENABLED=1
@@ -167,14 +179,14 @@ ESPAGENT_SKILLS_SERIAL_LIST_CACHE_MS=30000
 ESPAGENT_SKILLS_SERIAL_MAX_CONTENT_BYTES=4096
 ```
 
-安装时服务会执行等价串口命令：
+串口回退安装会执行等价命令：
 
 ```bash
 python3 tools/serial_cmd.py /dev/ttyUSB0 'tool_exec write_file {"path":"/spiffs/skills/<name>.md","content":"...","confirmed":true}' --timeout 20
 ```
 
-刷新 Runtime Skill 列表时会读取 `/spiffs/skills/`，并带 30 秒缓存，避免前端轮询频繁打到串口。
-默认串口安装限制单个 skill Markdown 不超过 4096 bytes，避免超长单行 JSON 命令给板端 console 带来额外内存压力；更大的 skill 建议拆分或改走独立 HTTP gateway。
+串口回退默认不启用。启用后，列表读取带 30 秒缓存，单个 Skill Markdown
+写入限制为 4096 bytes，避免超长单行 JSON 命令给板端 console 带来额外内存压力。
 
 如果需要外接独立 gateway，可设置：
 

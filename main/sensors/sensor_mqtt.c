@@ -52,6 +52,7 @@ static const char *TAG = "sensor_mqtt";
 #define MQTT_PUB_TOPIC_SIZE    160
 #define MQTT_PUB_PAYLOAD_SIZE   1024
 #define MQTT_PUB_QUEUE_DEPTH    32
+#define MQTT_SKILL_REPLY_CHUNK_BYTES 384
 #define MQTT_OUTPUT_CACHE_DEPTH 8
 #define MQTT_OUTPUT_JSON_SIZE   1024
 #define MQTT_POLICY_CACHE_DEPTH 8
@@ -599,12 +600,16 @@ static esp_err_t mqtt_queue_publish(const char *topic, const char *payload)
     snprintf(item.payload, sizeof(item.payload), "%s", payload);
 
     const bool critical = mqtt_topic_is_critical(topic);
+    const bool ordered_reply =
+        strcmp(topic, ESPAGENT_MESH_TOPIC_RUNTIME_SKILL_REPLY) == 0;
     TickType_t wait_ticks = 0;
     if (critical ||
         (topic && (strcmp(topic, ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS) == 0 ||
                   strcmp(topic, ESPAGENT_MESH_TOPIC_ALERTS) == 0 ||
                   strcmp(topic, ESPAGENT_MESH_TOPIC_DISPATCH) == 0))) {
         wait_ticks = pdMS_TO_TICKS(40);
+    } else if (ordered_reply) {
+        wait_ticks = pdMS_TO_TICKS(100);
     } else if (topic && (strcmp(topic, ESPAGENT_MESH_TOPIC_TIMELINE) == 0 ||
                          strcmp(topic, ESPAGENT_MESH_TOPIC_GUARDIAN_STATEBOARD) == 0 ||
                          strcmp(topic, ESPAGENT_SENSOR_MQTT_TOPIC_STATE) == 0 ||
@@ -786,14 +791,14 @@ static void guardian_publish_policy_notice(const char *reply_channel,
         return;
     }
 
-    char text[360] = {0};
+    char text[512] = {0};
     if (approval_id && approval_id[0]) {
         snprintf(text, sizeof(text),
                  "Guardian 请求确认硬件动作。\n"
-                 "动作：%s -> %s\n"
+                 "动作：%.48s -> %.32s\n"
                  "风险：%d/100\n"
-                 "原因：%s\n"
-                 "回复 /approve %s 批准，或 /deny %s 取消。",
+                 "原因：%.96s\n"
+                 "回复 /approve %.64s 批准，或 /deny %.64s 取消。",
                  action && action[0] ? action : "(unknown)",
                  target_role && target_role[0] ? target_role : "(unknown)",
                  risk_score,
@@ -803,9 +808,9 @@ static void guardian_publish_policy_notice(const char *reply_channel,
     } else {
         snprintf(text, sizeof(text),
                  "Guardian 已拦截风险动作。\n"
-                 "动作：%s -> %s\n"
+                 "动作：%.48s -> %.32s\n"
                  "风险：%d/100\n"
-                 "原因：%s\n"
+                 "原因：%.96s\n"
                  "请改用安全工具或降低风险后重试。",
                  action && action[0] ? action : "(unknown)",
                  target_role && target_role[0] ? target_role : "(unknown)",
@@ -2103,6 +2108,66 @@ static void publish_runtime_skill_reply(const char *request_id,
     cJSON_free(json);
 }
 
+static size_t runtime_skill_utf8_chunk_size(const char *data, size_t remaining,
+                                            size_t limit)
+{
+    size_t size = remaining < limit ? remaining : limit;
+    if (size == remaining) {
+        return size;
+    }
+    while (size > 0 && (((unsigned char)data[size] & 0xc0) == 0x80)) {
+        size--;
+    }
+    return size;
+}
+
+static esp_err_t publish_runtime_skill_data_reply(const char *request_id,
+                                                  const char *operation,
+                                                  const char *name,
+                                                  const char *data,
+                                                  size_t offset)
+{
+    const char *text = data ? data : "";
+    size_t total = strlen(text);
+    if (offset > total ||
+        (offset > 0 && (((unsigned char)text[offset] & 0xc0) == 0x80))) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    size_t remaining = total - offset;
+    size_t chunk_size = runtime_skill_utf8_chunk_size(
+        text + offset, remaining, MQTT_SKILL_REPLY_CHUNK_BYTES);
+    char chunk[MQTT_SKILL_REPLY_CHUNK_BYTES + 1] = {0};
+    memcpy(chunk, text + offset, chunk_size);
+    size_t next_offset = offset + chunk_size;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddBoolToObject(root, "ok", true);
+    cJSON_AddStringToObject(root, "request_id", request_id);
+    cJSON_AddStringToObject(root, "operation", operation);
+    cJSON_AddStringToObject(root, "name", name ? name : "");
+    cJSON_AddNumberToObject(root, "offset", (double)offset);
+    cJSON_AddNumberToObject(root, "next_offset", (double)next_offset);
+    cJSON_AddBoolToObject(root, "final", next_offset == total);
+    cJSON_AddStringToObject(root, "data", chunk);
+    cJSON_AddStringToObject(root, "esp_err", "ESP_OK");
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        return ESP_ERR_NO_MEM;
+    }
+    if (strlen(json) >= MQTT_PUB_PAYLOAD_SIZE) {
+        cJSON_free(json);
+        return ESP_ERR_INVALID_SIZE;
+    }
+    esp_err_t err = mqtt_queue_publish(
+        ESPAGENT_MESH_TOPIC_RUNTIME_SKILL_REPLY, json);
+    cJSON_free(json);
+    return err;
+}
+
 static void handle_runtime_skill_request(const char *payload, size_t payload_len)
 {
     if (!espagent_role_is_coordinator() || !payload || payload_len == 0) {
@@ -2123,7 +2188,11 @@ static void handle_runtime_skill_request(const char *payload, size_t payload_len
     const char *expected_sha = json_optional_string(root, "sha256");
     const char *signature = json_optional_string(root, "signature");
     cJSON *ts_item = cJSON_GetObjectItem(root, "ts_ms");
+    cJSON *offset_item = cJSON_GetObjectItem(root, "offset");
     int64_t ts_ms = cJSON_IsNumber(ts_item) ? (int64_t)ts_item->valuedouble : 0;
+    int64_t requested_offset = cJSON_IsNumber(offset_item)
+                                   ? (int64_t)offset_item->valuedouble
+                                   : 0;
     bool confirmed = cJSON_IsTrue(cJSON_GetObjectItem(root, "confirmed"));
 
     char message[256] = {0};
@@ -2131,16 +2200,23 @@ static void handle_runtime_skill_request(const char *payload, size_t payload_len
     if (!request_id[0] || strlen(request_id) >= ESPAGENT_MESH_ID_MAX) {
         snprintf(message, sizeof(message), "invalid runtime skill request_id");
         err = ESP_ERR_INVALID_ARG;
-    } else if (strcmp(operation, "upsert") != 0) {
+    } else if (strcmp(operation, "upsert") != 0 &&
+               strcmp(operation, "list") != 0 &&
+               strcmp(operation, "get") != 0 &&
+               strcmp(operation, "delete") != 0) {
         snprintf(message, sizeof(message), "unsupported runtime skill operation");
         err = ESP_ERR_NOT_SUPPORTED;
-    } else if (!name[0] || !content[0] || strlen(expected_sha) != 64 || ts_ms <= 0) {
+    } else if (ts_ms <= 0 || requested_offset < 0 ||
+               ((strcmp(operation, "get") == 0 ||
+                 strcmp(operation, "delete") == 0) && !name[0]) ||
+               (strcmp(operation, "upsert") == 0 &&
+                (!name[0] || !content[0] || strlen(expected_sha) != 64))) {
         snprintf(message, sizeof(message), "runtime skill request missing name/content/sha256/ts_ms");
         err = ESP_ERR_INVALID_ARG;
     }
 
     char actual_sha[65] = {0};
-    if (err == ESP_OK) {
+    if (err == ESP_OK && strcmp(operation, "upsert") == 0) {
         err = runtime_skill_content_sha256(content, actual_sha, sizeof(actual_sha));
         if (err == ESP_OK && strcmp(actual_sha, expected_sha) != 0) {
             snprintf(message, sizeof(message), "runtime skill sha256 mismatch");
@@ -2150,9 +2226,16 @@ static void handle_runtime_skill_request(const char *payload, size_t payload_len
 
     char canonical[256] = {0};
     if (err == ESP_OK) {
-        int n = snprintf(canonical, sizeof(canonical), "%s\n%s\n%s\n%s\n%lld",
-                         request_id, operation, name, expected_sha,
-                         (long long)ts_ms);
+        int n = (strcmp(operation, "list") == 0 ||
+                 strcmp(operation, "get") == 0)
+                    ? snprintf(canonical, sizeof(canonical),
+                               "%s\n%s\n%s\n%s\n%lld\n%lld",
+                               request_id, operation, name, expected_sha,
+                               (long long)ts_ms, (long long)requested_offset)
+                    : snprintf(canonical, sizeof(canonical),
+                               "%s\n%s\n%s\n%s\n%lld",
+                               request_id, operation, name, expected_sha,
+                               (long long)ts_ms);
         if (n < 0 || (size_t)n >= sizeof(canonical)) {
             snprintf(message, sizeof(message), "runtime skill auth payload too long");
             err = ESP_ERR_INVALID_SIZE;
@@ -2168,16 +2251,42 @@ static void handle_runtime_skill_request(const char *payload, size_t payload_len
         }
     }
 
-    if (err == ESP_OK) {
-        err = skill_runtime_upsert(name, content, confirmed,
-                                   message, sizeof(message));
+    char *response_json = NULL;
+    char list_json[4096] = {0};
+    if (err == ESP_OK && strcmp(operation, "upsert") == 0) {
+        err = skill_runtime_upsert(name, content, confirmed, message,
+                                   sizeof(message));
+    } else if (err == ESP_OK && strcmp(operation, "list") == 0) {
+        err = skill_runtime_list_json(list_json, sizeof(list_json));
+        if (err == ESP_ERR_NOT_FOUND) {
+            err = ESP_OK;
+        }
+        response_json = list_json;
+    } else if (err == ESP_OK && strcmp(operation, "get") == 0) {
+        err = skill_runtime_get_json(name, &response_json);
+    } else if (err == ESP_OK && strcmp(operation, "delete") == 0) {
+        err = skill_runtime_delete(name, confirmed, message, sizeof(message));
     }
 
-    ESP_LOGI(TAG, "Runtime skill MQTT upsert: id=%s name=%s status=%s",
+    ESP_LOGI(TAG, "Runtime skill MQTT %s: id=%s name=%s status=%s",
+             operation[0] ? operation : "unknown",
              request_id[0] ? request_id : "(none)",
              name[0] ? name : "(none)", esp_err_to_name(err));
-    publish_runtime_skill_reply(request_id, name, err,
-                                message[0] ? message : esp_err_to_name(err));
+    if (err == ESP_OK && response_json) {
+        esp_err_t publish_err = publish_runtime_skill_data_reply(
+            request_id, operation, name, response_json,
+            (size_t)requested_offset);
+        if (publish_err != ESP_OK) {
+            publish_runtime_skill_reply(request_id, name, publish_err,
+                                        "runtime skill response publish failed");
+        }
+    } else {
+        publish_runtime_skill_reply(request_id, name, err,
+                                    message[0] ? message : esp_err_to_name(err));
+    }
+    if (response_json && response_json != list_json) {
+        cJSON_free(response_json);
+    }
     cJSON_Delete(root);
 }
 

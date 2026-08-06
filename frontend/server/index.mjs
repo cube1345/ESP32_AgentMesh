@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
 
@@ -33,7 +34,7 @@ const FEISHU_BRIDGE_SECRET_FILE = process.env.ESPAGENT_FEISHU_BRIDGE_SECRET_FILE
 const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal';
 const FEISHU_SEND_MSG_URL = 'https://open.feishu.cn/open-apis/im/v1/messages';
 const SKILLS_API_BASE = (process.env.ESPAGENT_SKILLS_API_BASE || '').replace(/\/+$/, '');
-const SKILLS_SERIAL_ENABLED = process.env.ESPAGENT_SKILLS_SERIAL_ENABLED !== '0';
+const SKILLS_SERIAL_ENABLED = process.env.ESPAGENT_SKILLS_SERIAL_ENABLED === '1';
 const SKILLS_SERIAL_PORT = process.env.ESPAGENT_SKILLS_SERIAL_PORT || '/dev/ttyUSB0';
 const SKILLS_SERIAL_TIMEOUT_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_TIMEOUT_MS || 20000);
 const SKILLS_SERIAL_READ_TIMEOUT_MS = Number(process.env.ESPAGENT_SKILLS_SERIAL_READ_TIMEOUT_MS || 30000);
@@ -50,6 +51,7 @@ const DEVICE_SERIAL_MAX_CONTENT_BYTES = Number(process.env.ESPAGENT_DEVICE_SERIA
 const DEVICE_SERIAL_LIST_CACHE_MS = Number(process.env.ESPAGENT_DEVICE_SERIAL_LIST_CACHE_MS || 30000);
 const SERIAL_CMD_PATH = process.env.ESPAGENT_SERIAL_CMD_PATH ||
   path.join(REPO_ROOT, 'tools', 'serial_cmd.py');
+const LOCAL_SPIFFS_SKILLS_DIR = path.join(REPO_ROOT, 'spiffs_data', 'skills');
 const CHAT_GATEWAY_PATH = '/ws';
 const runtimeSkills = new Map();
 let runtimeSkillsCacheAt = 0;
@@ -223,6 +225,10 @@ function spiffsSkillPath(name) {
   return `/spiffs/skills/${runtimeSkillName(name)}.md`;
 }
 
+function localSpiffsSkillPath(name) {
+  return path.join(LOCAL_SPIFFS_SKILLS_DIR, `${runtimeSkillName(name)}.md`);
+}
+
 function spiffsDevicePath(name) {
   return `/spiffs/devices/${runtimeDeviceName(name)}.json`;
 }
@@ -290,6 +296,17 @@ function serialSkillToRuntimeRecord(item) {
   });
 }
 
+function mqttSkillToRuntimeRecord(item) {
+  const record = upstreamSkillToRuntimeRecord(item);
+  return {
+    ...record,
+    source: 'mqtt',
+    lastMessage: typeof item?.size_bytes === 'number'
+      ? `listed wirelessly from ESP32 SPIFFS, ${item.size_bytes} bytes`
+      : 'listed wirelessly from ESP32 SPIFFS'
+  };
+}
+
 function listRuntimeSkills() {
   return Array.from(runtimeSkills.values()).sort((a, b) => {
     return String(b.installedAt).localeCompare(String(a.installedAt));
@@ -347,16 +364,18 @@ function executeSerialCommand(command, timeoutMs) {
     });
     let stdout = '';
     let stderr = '';
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
       reject(new Error(`serial command timed out after ${timeoutMs}ms`));
     }, timeoutMs + 3000);
 
     child.stdout.on('data', (chunk) => {
-      stdout += chunk.toString('utf8');
+      stdout += stdoutDecoder.write(chunk);
     });
     child.stderr.on('data', (chunk) => {
-      stderr += chunk.toString('utf8');
+      stderr += stderrDecoder.write(chunk);
     });
     child.on('error', (error) => {
       clearTimeout(timer);
@@ -364,6 +383,8 @@ function executeSerialCommand(command, timeoutMs) {
     });
     child.on('close', (code) => {
       clearTimeout(timer);
+      stdout += stdoutDecoder.end();
+      stderr += stderrDecoder.end();
       if (code === 0) {
         resolve(stdout);
         return;
@@ -483,7 +504,14 @@ async function fetchSerialSkillContent(record) {
     path: record.path || spiffsSkillPath(record.runtimeName)
   })}`, SKILLS_SERIAL_READ_TIMEOUT_MS);
   const rawContent = extractSerialToolOutput(output);
-  const content = rawContent ? `${rawContent.trimEnd()}\n` : rawContent;
+  let content = rawContent ? `${rawContent.trimEnd()}\n` : rawContent;
+  if (content.includes('�')) {
+    try {
+      content = await fs.readFile(localSpiffsSkillPath(record.runtimeName), 'utf8');
+    } catch {
+      // Keep the device response when the skill only exists on the board.
+    }
+  }
   return serialSkillToRuntimeRecord({
     ...record,
     name: record.runtimeName,
@@ -574,17 +602,27 @@ async function upsertSerialRuntimeSkillContentIfChanged(runtimeName, content) {
 
 function runtimeSkillRequestSignature(request) {
   if (!MESH_AUTH_KEY) return '';
-  const canonical = [
+  const fields = [
     request.request_id,
     request.operation,
     request.name,
     request.sha256,
     request.ts_ms
-  ].join('\n');
+  ];
+  if (request.operation === 'list' || request.operation === 'get') {
+    fields.push(request.offset || 0);
+  }
+  const canonical = fields.join('\n');
   return createHmac('sha256', MESH_AUTH_KEY).update(canonical, 'utf8').digest('hex');
 }
 
-function runMqttRuntimeSkillUpsert(runtimeName, content, sha256) {
+function runMqttRuntimeSkillRequest(operation, {
+  runtimeName = '',
+  content = '',
+  sha256 = '',
+  confirmed = false,
+  offset = 0
+} = {}) {
   if (!SKILLS_MQTT_ENABLED) {
     return Promise.reject(new Error('MQTT runtime skill transport disabled'));
   }
@@ -596,11 +634,12 @@ function runMqttRuntimeSkillUpsert(runtimeName, content, sha256) {
   const requestId = `skill-${suffix}`;
   const request = {
     request_id: requestId,
-    operation: 'upsert',
+    operation,
     name: runtimeName,
     content,
     sha256,
-    confirmed: true,
+    confirmed,
+    offset,
     ts_ms: Date.now(),
   };
   const signature = runtimeSkillRequestSignature(request);
@@ -609,9 +648,16 @@ function runMqttRuntimeSkillUpsert(runtimeName, content, sha256) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       pendingSkillRequests.delete(requestId);
-      reject(new Error(`MQTT runtime skill request timed out after ${SKILLS_MQTT_TIMEOUT_MS}ms`));
+      reject(new Error(
+        `MQTT runtime skill request timed out after ${SKILLS_MQTT_TIMEOUT_MS}ms ` +
+        `(operation=${operation}, offset=${offset})`
+      ));
     }, SKILLS_MQTT_TIMEOUT_MS);
-    pendingSkillRequests.set(requestId, { resolve, reject, timer });
+    pendingSkillRequests.set(requestId, {
+      resolve,
+      reject,
+      timer
+    });
     client.publish(SKILLS_MQTT_REQUEST_TOPIC, JSON.stringify(request), { qos: 0 }, (error) => {
       if (!error) return;
       clearTimeout(timer);
@@ -634,12 +680,99 @@ async function upsertMqttRuntimeSkillContentIfChanged(runtimeName, content) {
     return buildUnchangedSkillMessage(runtimeName, desiredHash);
   }
 
-  const result = await runMqttRuntimeSkillUpsert(runtimeName, content, desiredHash);
+  const result = await runMqttRuntimeSkillRequest('upsert', {
+    runtimeName,
+    content,
+    sha256: desiredHash,
+    confirmed: true
+  });
   const message = String(result?.message || '');
   if (!result?.ok || !message.startsWith('OK:')) {
     throw new Error(message || 'MQTT runtime skill install failed');
   }
   return message;
+}
+
+async function fetchMqttRuntimeSkillData(operation, runtimeName = '') {
+  let offset = 0;
+  const chunks = [];
+  for (let page = 0; page < 64; page += 1) {
+    const result = await runMqttRuntimeSkillRequest(operation, {
+      runtimeName,
+      offset
+    });
+    if (!result?.ok || typeof result.data !== 'string') {
+      throw new Error(result?.message || `MQTT runtime skill ${operation} failed`);
+    }
+    if (Number(result.offset) !== offset) {
+      throw new Error(`MQTT runtime skill ${operation} offset mismatch`);
+    }
+    chunks.push(result.data);
+    if (result.final === true) {
+      return chunks.join('');
+    }
+    const nextOffset = Number(result.next_offset);
+    if (!Number.isInteger(nextOffset) || nextOffset <= offset) {
+      throw new Error(`MQTT runtime skill ${operation} returned invalid next_offset`);
+    }
+    offset = nextOffset;
+  }
+  throw new Error(`MQTT runtime skill ${operation} exceeded 64 pages`);
+}
+
+function parseMqttRuntimeSkillData(data, operation) {
+  const payload = safeJsonParse(data);
+  if (!payload || payload.ok === false) {
+    throw new Error(payload?.error || `invalid MQTT runtime skill ${operation} response`);
+  }
+  return payload;
+}
+
+async function fetchMqttRuntimeSkills() {
+  const data = await fetchMqttRuntimeSkillData('list');
+  const payload = parseMqttRuntimeSkillData(data, 'list');
+  if (!Array.isArray(payload.skills)) {
+    throw new Error('MQTT runtime skill list response has no skills array');
+  }
+
+  const previous = new Map(runtimeSkills);
+  runtimeSkills.clear();
+  for (const item of payload.skills) {
+    let record = mqttSkillToRuntimeRecord(item);
+    const cached = previous.get(record.runtimeName);
+    if (!record.content && cached?.content) {
+      record = attachContentHash({
+        ...record,
+        content: cached.content,
+        title: cached.title || record.title
+      });
+    }
+    runtimeSkills.set(record.runtimeName, record);
+  }
+  runtimeSkillsCacheAt = Date.now();
+  return listRuntimeSkills();
+}
+
+async function fetchMqttRuntimeSkillContent(runtimeName) {
+  const data = await fetchMqttRuntimeSkillData('get', runtimeName);
+  const payload = parseMqttRuntimeSkillData(data, 'get');
+  if (!payload.skill || typeof payload.skill !== 'object') {
+    throw new Error('MQTT runtime skill get response has no skill object');
+  }
+  return mqttSkillToRuntimeRecord(payload.skill);
+}
+
+async function deleteMqttRuntimeSkill(runtimeName) {
+  const result = await runMqttRuntimeSkillRequest('delete', {
+    runtimeName,
+    confirmed: true
+  });
+  if (!result?.ok) {
+    throw new Error(result?.message || 'MQTT runtime skill delete failed');
+  }
+  runtimeSkills.delete(runtimeName);
+  invalidateRuntimeSkillCache();
+  return result.message || `OK: skill ${runtimeName} deleted`;
 }
 
 async function fetchUpstreamRuntimeSkills() {
@@ -1460,7 +1593,7 @@ function sendJson(res, statusCode, payload) {
   res.writeHead(statusCode, {
     'Content-Type': 'application/json; charset=utf-8',
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type'
   });
   res.end(JSON.stringify(payload));
@@ -1652,6 +1785,21 @@ const server = http.createServer(async (req, res) => {
             path: spiffsSkillPath(runtimeName)
           });
           source = 'proxy';
+        } else if (SKILLS_MQTT_ENABLED && client.connected) {
+          try {
+            skill = await fetchMqttRuntimeSkillContent(runtimeName);
+            source = 'mqtt';
+          } catch (mqttError) {
+            if (!SKILLS_SERIAL_ENABLED) {
+              throw mqttError;
+            }
+            skill = await fetchSerialSkillContent({
+              runtimeName,
+              title: runtimeName,
+              path: spiffsSkillPath(runtimeName)
+            });
+            source = 'serial';
+          }
         } else if (SKILLS_SERIAL_ENABLED) {
           skill = await fetchSerialSkillContent({
             runtimeName,
@@ -1695,6 +1843,40 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (SKILLS_MQTT_ENABLED && client.connected) {
+      fetchMqttRuntimeSkills()
+        .then((skills) => {
+          sendJson(res, 200, {
+            skills,
+            source: 'mqtt'
+          });
+        })
+        .catch((error) => {
+          if (SKILLS_SERIAL_ENABLED) {
+            fetchSerialRuntimeSkills()
+              .then((skills) => sendJson(res, 200, {
+                skills,
+                source: 'serial',
+                error: error instanceof Error ? error.message : 'MQTT runtime list failed'
+              }))
+              .catch((serialError) => sendJson(res, 200, {
+                skills: listRuntimeSkills(),
+                source: 'mqtt',
+                error: [error, serialError]
+                  .map((item) => item instanceof Error ? item.message : String(item))
+                  .join('; ')
+              }));
+            return;
+          }
+          sendJson(res, 200, {
+            skills: listRuntimeSkills(),
+            source: 'mqtt',
+            error: error instanceof Error ? error.message : 'MQTT runtime list failed'
+          });
+        });
+      return;
+    }
+
     if (SKILLS_SERIAL_ENABLED) {
       fetchSerialRuntimeSkills()
         .then((skills) => {
@@ -1717,6 +1899,52 @@ const server = http.createServer(async (req, res) => {
       skills: listRuntimeSkills(),
       source: 'local_mock'
     });
+    return;
+  }
+
+  if (req.method === 'DELETE' && url.pathname === '/api/skills/runtime') {
+    const runtimeName = normalizeSkillName(url.searchParams.get('name'));
+    const confirmed = ['1', 'true'].includes(url.searchParams.get('confirmed'));
+    if (!runtimeName) {
+      sendJson(res, 400, { ok: false, message: 'invalid runtime skill name' });
+      return;
+    }
+    if (!confirmed) {
+      sendJson(res, 400, { ok: false, message: 'runtime skill delete requires confirmed=true' });
+      return;
+    }
+
+    try {
+      let message;
+      let source;
+      if (SKILLS_API_BASE) {
+        const response = await fetch(
+          `${SKILLS_API_BASE}/api/skills?name=${encodeURIComponent(runtimeName)}&confirmed=true`,
+          { method: 'DELETE' }
+        );
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || payload?.ok === false) {
+          throw new Error(payload?.error || payload?.message || `HTTP ${response.status}`);
+        }
+        message = payload?.message || `OK: skill ${runtimeName} deleted`;
+        source = 'proxy';
+      } else if (SKILLS_MQTT_ENABLED && client.connected) {
+        message = await deleteMqttRuntimeSkill(runtimeName);
+        source = 'mqtt';
+      } else {
+        throw new Error('MQTT is not connected; wireless skill delete unavailable');
+      }
+      runtimeSkills.delete(runtimeName);
+      invalidateRuntimeSkillCache();
+      sendJson(res, 200, { ok: true, source, message, runtimeName });
+    } catch (error) {
+      sendJson(res, 502, {
+        ok: false,
+        source: SKILLS_API_BASE ? 'proxy' : 'mqtt',
+        message: 'runtime skill delete failed',
+        error: error instanceof Error ? error.message : 'runtime skill delete failed'
+      });
+    }
     return;
   }
 

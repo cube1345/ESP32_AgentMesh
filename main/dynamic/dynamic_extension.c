@@ -32,7 +32,13 @@ static bool is_manifest_file(const char *name)
 
 static void strip_json_suffix(const char *name, char *out, size_t out_size)
 {
-    snprintf(out, out_size, "%s", name ? name : "");
+    if (!out || out_size == 0) {
+        return;
+    }
+    const char *source = name ? name : "";
+    size_t copy_len = strnlen(source, out_size - 1);
+    memcpy(out, source, copy_len);
+    out[copy_len] = '\0';
     char *suffix = strstr(out, ".json");
     if (suffix) {
         *suffix = '\0';

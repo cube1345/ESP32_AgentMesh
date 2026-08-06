@@ -3,6 +3,14 @@
 #include "esp_err.h"
 #include <stddef.h>
 
+typedef struct {
+    char skill_name[96];
+    char trigger[256];
+    char target_role[32];
+    char action[48];
+    char args_json[256];
+} skill_rule_match_t;
+
 /**
  * Initialize skills system.
  * Scans SPIFFS for available skill markdown files.
@@ -31,6 +39,18 @@ esp_err_t skill_loader_build_relevant_details(const char *query,
                                               char *buf,
                                               size_t size,
                                               int max_skills);
+
+/**
+ * Find the first single-tool rule declared in any Runtime Skill.
+ *
+ * Rule syntax inside a skill markdown file:
+ *   @rule trigger="phrase|alias" target_role=control_agent action=set_status_light args={"color":"blue"}
+ *
+ * The first trigger phrase that appears in user_message wins. Rules are
+ * intentionally one-shot: callers should execute at most one tool.
+ */
+esp_err_t skill_loader_find_matching_rule(const char *user_message,
+                                          skill_rule_match_t *match);
 
 /**
  * Drop cached skill metadata so the next prompt rebuild sees SPIFFS changes.

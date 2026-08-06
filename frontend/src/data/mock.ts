@@ -17,7 +17,7 @@ const nodes: AgentNode[] = [
     transport: ['Feishu WS', 'WebSocket', 'MQTT Mesh'],
     status: 'online',
     location: '/dev/ttyUSB0',
-    responsibilities: ['LLM 调度', '工具调用', '任务编排', 'Timeline 聚合'],
+    responsibilities: ['LLM 调度', '单工具调用', 'Runtime Skills 命中', 'Timeline 聚合'],
     surfaces: ['飞书', 'Web 控制台', '串口 CLI']
   },
   {
@@ -27,7 +27,7 @@ const nodes: AgentNode[] = [
     status: 'online',
     location: '/dev/ttyUSB1',
     responsibilities: ['AHT20', 'SGP30', 'BH1750', 'PIR/存在感知'],
-    surfaces: ['环境数据上报', '规则触发输入']
+    surfaces: ['环境数据上报', '单次触发输入']
   },
   {
     id: 'esp32s3-control-01',
@@ -61,20 +61,20 @@ const nodes: AgentNode[] = [
 const capabilities: Capability[] = [
   { name: 'read_environment', category: '感知', role: 'sensor_agent', maturity: '已验证', summary: '聚合温湿度、空气质量、光照等环境数据。' },
   { name: 'sgp30_read_air_quality', category: '感知', role: 'sensor_agent', maturity: '已验证', summary: '读取 eCO2 / TVOC，并参与环境规则判断。' },
-  { name: 'mesh_send_command', category: '协同', role: 'coordinator_agent', maturity: '已验证', summary: '将自然语言意图路由为跨节点控制任务。' },
-  { name: 'automation_create_rule', category: '协同', role: 'coordinator_agent', maturity: '已验证', summary: '创建持久化条件规则，脱离单轮对话持续运行。' },
+  { name: 'mesh_send_command', category: '协同', role: 'coordinator_agent', maturity: '已验证', summary: '将自然语言意图路由为一次跨节点控制任务。' },
+  { name: 'runtime_skill_rule', category: '协同', role: 'coordinator_agent', maturity: '已验证', summary: '从 SPIFFS Runtime Skills 匹配 @rule，并触发一次 Mesh 命令。' },
   { name: 'set_status_light', category: '控制', role: 'control_agent', maturity: '已验证', summary: '控制 WS2812 状态灯或 RGB 指示行为。' },
   { name: 'servo_write', category: '控制', role: 'control_agent', maturity: '已验证', summary: '通过 PWM 驱动舵机执行角度控制。' },
   { name: 'gree_ac_control', category: '控制', role: 'control_agent', maturity: '已验证', summary: '格力空调 IR 发射控制，支持常用模式和温度调整。' },
   { name: 'policy_check', category: '安全', role: 'guardian_agent', maturity: '已验证', summary: '对远程控制请求进行风险判定与审计。' },
-  { name: 'lua_run_script', category: '扩展', role: 'coordinator_agent', maturity: '已验证', summary: '通过受限 Lua 运行时扩展板端能力。' },
+  { name: 'skills_show', category: '扩展', role: 'coordinator_agent', maturity: '已验证', summary: '读取 SPIFFS Runtime Skills 内容，支持无线 MQTT 或串口回退。' },
   { name: 'virtual_device_control', category: '扩展', role: 'control_agent', maturity: '进行中', summary: '以 manifest 驱动受控设备，统一权限与 cooldown。' }
 ];
 
 const timeline: TimelineEvent[] = [
-  { time: '09:14:02', stage: 'intent_ingest', source: 'Feishu', target: 'coordinator_agent', payload: '请读取环境数据并根据湿度调整状态灯', status: 'ok' },
-  { time: '09:14:03', stage: 'reasoning', source: 'coordinator_agent', target: 'tool_registry', payload: '选择 read_environment + automation_create_rule', status: 'ok' },
-  { time: '09:14:04', stage: 'policy_check', source: 'coordinator_agent', target: 'guardian_agent', payload: '请求执行规则: humidity > 60 -> set_status_light orange', status: 'queued' },
+  { time: '09:14:02', stage: 'intent_ingest', source: 'Feishu', target: 'coordinator_agent', payload: '技能蓝灯', status: 'ok' },
+  { time: '09:14:03', stage: 'runtime_skill_match', source: 'coordinator_agent', target: 'SPIFFS skills', payload: '@rule trigger=技能蓝灯 -> set_status_light blue', status: 'ok' },
+  { time: '09:14:04', stage: 'policy_check', source: 'coordinator_agent', target: 'guardian_agent', payload: '请求执行单次动作: set_status_light blue', status: 'queued' },
   { time: '09:14:04', stage: 'policy_decision', source: 'guardian_agent', target: 'control_agent', payload: 'allow, risk_score=0.32, privacy_mode=metadata_only', status: 'ok' },
   { time: '09:14:04', stage: 'sandbox_denied', source: 'tool_registry', target: 'write_file', payload: 'sandbox denied write_file: skill changes require explicit confirmed=true', status: 'warn' },
   { time: '09:14:05', stage: 'telemetry_publish', source: 'sensor_agent', target: 'MQTT Mesh', payload: 'temp=27.4C humidity=64.2% tvoc=21ppb lux=185', status: 'ok' },

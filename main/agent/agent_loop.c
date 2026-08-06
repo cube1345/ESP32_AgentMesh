@@ -7,7 +7,6 @@
 #include "memory/memory_v2.h"
 #include "memory/session_mgr.h"
 #include "net/net_guard.h"
-#include "proactive/proactive_service.h"
 #include "roles/role_config.h"
 #include "sensors/sensor_mqtt.h"
 #include "skills/skill_loader.h"
@@ -32,6 +31,218 @@ static const char *TAG = "agent";
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_SUMMARY_SIZE 4096
 #define AGENT_LLM_BACKGROUND_DEFER_MS 20000
+#define AGENT_HEAP_TREND_DROP_BYTES 1024
+#define AGENT_HEAP_TREND_ALERT_STREAK 3
+#define AGENT_HEAP_INTEGRITY_INTERVAL_TURNS 8
+#define AGENT_HEAP_LOW_INTERNAL_BYTES (64 * 1024)
+#define AGENT_HEAP_LOW_LARGEST_BYTES (24 * 1024)
+
+typedef struct {
+  size_t internal_free;
+  size_t internal_largest;
+  size_t internal_minimum;
+  size_t psram_free;
+  size_t psram_largest;
+  size_t psram_minimum;
+  UBaseType_t task_count;
+} agent_heap_snapshot_t;
+
+typedef struct {
+  bool initialized;
+  bool low_memory_active;
+  uint32_t completed_turns;
+  uint32_t internal_decline_streak;
+  uint32_t largest_decline_streak;
+  uint32_t task_elevated_streak;
+  size_t internal_streak_start;
+  size_t largest_streak_start;
+  agent_heap_snapshot_t previous_end;
+  UBaseType_t minimum_task_count;
+} agent_heap_trend_t;
+
+static agent_heap_trend_t s_agent_heap_trend;
+static volatile uint32_t s_heap_alloc_failure_count;
+static volatile size_t s_heap_last_failed_size;
+static volatile uint32_t s_heap_last_failed_caps;
+static const char *volatile s_heap_last_failed_function;
+static uint32_t s_heap_reported_failure_count;
+
+static void agent_heap_alloc_failed_hook(size_t requested_size, uint32_t caps,
+                                         const char *function_name) {
+  __atomic_store_n(&s_heap_last_failed_size, requested_size, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_heap_last_failed_caps, caps, __ATOMIC_RELAXED);
+  __atomic_store_n(&s_heap_last_failed_function, function_name,
+                   __ATOMIC_RELAXED);
+  __atomic_add_fetch(&s_heap_alloc_failure_count, 1, __ATOMIC_RELAXED);
+}
+
+static agent_heap_snapshot_t agent_heap_snapshot(void) {
+  return (agent_heap_snapshot_t){
+      .internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+      .internal_largest =
+          heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+      .internal_minimum =
+          heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+      .psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+      .psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
+      .psram_minimum = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM),
+      .task_count = uxTaskGetNumberOfTasks(),
+  };
+}
+
+static void agent_log_heap_stage(const char *stage,
+                                 const agent_heap_snapshot_t *turn_start) {
+  const agent_heap_snapshot_t now = agent_heap_snapshot();
+  const int64_t internal_delta =
+      turn_start ? (int64_t)now.internal_free -
+                       (int64_t)turn_start->internal_free
+                 : 0;
+  const int64_t largest_delta =
+      turn_start ? (int64_t)now.internal_largest -
+                       (int64_t)turn_start->internal_largest
+                 : 0;
+  const int64_t psram_delta =
+      turn_start ? (int64_t)now.psram_free -
+                       (int64_t)turn_start->psram_free
+                 : 0;
+
+  ESP_LOGI(TAG,
+           "HEAP_STAGE stage=%s internal_free=%u internal_largest=%u "
+           "internal_min=%u psram_free=%u psram_largest=%u psram_min=%u "
+           "tasks=%u delta_internal=%lld delta_largest=%lld delta_psram=%lld",
+           stage ? stage : "unknown", (unsigned)now.internal_free,
+           (unsigned)now.internal_largest, (unsigned)now.internal_minimum,
+           (unsigned)now.psram_free, (unsigned)now.psram_largest,
+           (unsigned)now.psram_minimum, (unsigned)now.task_count,
+           (long long)internal_delta, (long long)largest_delta,
+           (long long)psram_delta);
+
+  const uint32_t failure_count =
+      __atomic_load_n(&s_heap_alloc_failure_count, __ATOMIC_RELAXED);
+  if (failure_count != s_heap_reported_failure_count) {
+    const size_t failed_size =
+        __atomic_load_n(&s_heap_last_failed_size, __ATOMIC_RELAXED);
+    const uint32_t failed_caps =
+        __atomic_load_n(&s_heap_last_failed_caps, __ATOMIC_RELAXED);
+    const char *failed_function =
+        __atomic_load_n(&s_heap_last_failed_function, __ATOMIC_RELAXED);
+    ESP_LOGE(TAG,
+             "HEAP_ALLOC_FAIL count=%u new=%u size=%u caps=0x%08x function=%s stage=%s",
+             (unsigned)failure_count,
+             (unsigned)(failure_count - s_heap_reported_failure_count),
+             (unsigned)failed_size, (unsigned)failed_caps,
+             failed_function ? failed_function : "unknown",
+             stage ? stage : "unknown");
+    s_heap_reported_failure_count = failure_count;
+  }
+}
+
+static void agent_check_heap_trend(const agent_heap_snapshot_t *now) {
+  if (!now) {
+    return;
+  }
+
+  agent_heap_trend_t *trend = &s_agent_heap_trend;
+  if (!trend->initialized) {
+    trend->initialized = true;
+    trend->completed_turns = 1;
+    trend->previous_end = *now;
+    trend->minimum_task_count = now->task_count;
+    trend->low_memory_active =
+        now->internal_free < AGENT_HEAP_LOW_INTERNAL_BYTES ||
+        now->internal_largest < AGENT_HEAP_LOW_LARGEST_BYTES;
+    if (trend->low_memory_active) {
+      ESP_LOGW(TAG,
+               "HEAP_ALERT kind=low_internal entered=1 internal_free=%u internal_largest=%u",
+               (unsigned)now->internal_free,
+               (unsigned)now->internal_largest);
+    }
+    return;
+  }
+
+  trend->completed_turns++;
+  if (now->task_count < trend->minimum_task_count) {
+    trend->minimum_task_count = now->task_count;
+  }
+
+  if (now->internal_free + AGENT_HEAP_TREND_DROP_BYTES <
+      trend->previous_end.internal_free) {
+    if (trend->internal_decline_streak == 0) {
+      trend->internal_streak_start = trend->previous_end.internal_free;
+    }
+    trend->internal_decline_streak++;
+  } else {
+    trend->internal_decline_streak = 0;
+  }
+  if (now->internal_largest + AGENT_HEAP_TREND_DROP_BYTES <
+      trend->previous_end.internal_largest) {
+    if (trend->largest_decline_streak == 0) {
+      trend->largest_streak_start = trend->previous_end.internal_largest;
+    }
+    trend->largest_decline_streak++;
+  } else {
+    trend->largest_decline_streak = 0;
+  }
+  trend->task_elevated_streak =
+      now->task_count > trend->minimum_task_count
+          ? trend->task_elevated_streak + 1
+          : 0;
+
+  if (trend->internal_decline_streak == AGENT_HEAP_TREND_ALERT_STREAK) {
+    ESP_LOGW(TAG,
+             "HEAP_ALERT kind=suspected_leak turns=%u internal_free=%u streak_start=%u drop=%u",
+             (unsigned)trend->internal_decline_streak,
+             (unsigned)now->internal_free,
+             (unsigned)trend->internal_streak_start,
+             (unsigned)(trend->internal_streak_start - now->internal_free));
+  }
+  if (trend->largest_decline_streak == AGENT_HEAP_TREND_ALERT_STREAK &&
+      trend->internal_decline_streak < AGENT_HEAP_TREND_ALERT_STREAK) {
+    ESP_LOGW(TAG,
+             "HEAP_ALERT kind=fragmentation turns=%u internal_largest=%u streak_start=%u drop=%u",
+             (unsigned)trend->largest_decline_streak,
+             (unsigned)now->internal_largest,
+             (unsigned)trend->largest_streak_start,
+             (unsigned)(trend->largest_streak_start - now->internal_largest));
+  }
+  if (trend->task_elevated_streak == AGENT_HEAP_TREND_ALERT_STREAK) {
+    ESP_LOGW(TAG,
+             "HEAP_ALERT kind=task_retention turns=%u tasks=%u baseline_tasks=%u",
+             (unsigned)trend->task_elevated_streak,
+             (unsigned)now->task_count,
+             (unsigned)trend->minimum_task_count);
+  }
+
+  const bool low_memory =
+      now->internal_free < AGENT_HEAP_LOW_INTERNAL_BYTES ||
+      now->internal_largest < AGENT_HEAP_LOW_LARGEST_BYTES;
+  if (low_memory && !trend->low_memory_active) {
+    ESP_LOGW(TAG,
+             "HEAP_ALERT kind=low_internal entered=1 internal_free=%u internal_largest=%u",
+             (unsigned)now->internal_free,
+             (unsigned)now->internal_largest);
+  } else if (!low_memory && trend->low_memory_active) {
+    ESP_LOGI(TAG,
+             "HEAP_ALERT kind=low_internal recovered=1 internal_free=%u internal_largest=%u",
+             (unsigned)now->internal_free,
+             (unsigned)now->internal_largest);
+  }
+  trend->low_memory_active = low_memory;
+  trend->previous_end = *now;
+
+  if (trend->completed_turns % AGENT_HEAP_INTEGRITY_INTERVAL_TURNS == 0 &&
+      !heap_caps_check_integrity_all(true)) {
+    ESP_LOGE(TAG, "HEAP_ALERT kind=corruption integrity=failed turn=%u",
+             (unsigned)trend->completed_turns);
+  }
+}
+
+static void agent_finish_heap_turn(const char *stage,
+                                   const agent_heap_snapshot_t *turn_start) {
+  agent_log_heap_stage(stage, turn_start);
+  const agent_heap_snapshot_t now = agent_heap_snapshot();
+  agent_check_heap_trend(&now);
+}
 
 static bool message_prefers_direct_reply_no_tools(const char *message);
 static size_t append_prompt_format(char *prompt, size_t size, const char *fmt,
@@ -1968,7 +2179,7 @@ static bool message_is_skill_or_knowledge_query(const char *message) {
   }
 
   static const char *const ascii_words[] = {
-      "skill", "skills", "profile", "preference", "preferences",
+      "skill", "skills",
   };
   if (message_has_any_ascii_word(
           message, ascii_words,
@@ -3120,15 +3331,6 @@ static bool try_execute_deterministic_time_weather_request(
     return false;
   }
 
-  char time_output[192] = {0};
-  tool_registry_execute("get_current_time", "{}", time_output,
-                        sizeof(time_output));
-  if (strncmp(time_output, "Error:", 6) == 0 || time_output[0] == '\0') {
-    snprintf(tool_output, tool_output_size, "%s",
-             time_output[0] ? time_output : "Error: failed to get current time");
-    return false;
-  }
-
   if (tool_guard_match_weather_request(msg->content)) {
     char weather_output[512] = {0};
     tool_registry_execute("get_weather", "{}", weather_output,
@@ -3140,11 +3342,17 @@ static bool try_execute_deterministic_time_weather_request(
       return false;
     }
 
-    char reply_buf[768] = {0};
-    snprintf(reply_buf, sizeof(reply_buf), "当前时间：%s\n%s", time_output,
-             weather_output);
-    *final_text = strdup(reply_buf);
+    *final_text = strdup(weather_output);
     return *final_text != NULL;
+  }
+
+  char time_output[192] = {0};
+  tool_registry_execute("get_current_time", "{}", time_output,
+                        sizeof(time_output));
+  if (strncmp(time_output, "Error:", 6) == 0 || time_output[0] == '\0') {
+    snprintf(tool_output, tool_output_size, "%s",
+             time_output[0] ? time_output : "Error: failed to get current time");
+    return false;
   }
 
   *final_text = strdup(time_output);
@@ -3401,6 +3609,66 @@ static bool try_execute_deterministic_mesh_request(const espagent_msg_t *msg,
     snprintf(reply_buf, sizeof(reply_buf), "已通过 MQTT Mesh 下发命令：%s", tool_output);
   } else {
     snprintf(reply_buf, sizeof(reply_buf), "MQTT Mesh 命令下发失败：%s", tool_output);
+  }
+  *final_text = strdup(reply_buf);
+  return *final_text != NULL;
+}
+
+static bool try_execute_deterministic_skill_rule_request(
+    const espagent_msg_t *msg, char *tool_output, size_t tool_output_size,
+    char **final_text) {
+  if (!msg || !msg->content || !tool_output || !final_text ||
+      strcmp(msg->channel, ESPAGENT_CHAN_SYSTEM) == 0 ||
+      message_has_local_marker(msg->content) ||
+      message_requests_skill_file_read(msg->content) ||
+      message_requests_skill_mutation_or_tool_execution(msg->content)) {
+    return false;
+  }
+
+  skill_rule_match_t rule = {0};
+  if (skill_loader_find_matching_rule(msg->content, &rule) != ESP_OK) {
+    return false;
+  }
+
+  cJSON *payload_root = cJSON_CreateObject();
+  cJSON *args = cJSON_Parse(rule.args_json[0] ? rule.args_json : "{}");
+  if (!payload_root || !args || !cJSON_IsObject(args)) {
+    cJSON_Delete(payload_root);
+    cJSON_Delete(args);
+    return false;
+  }
+
+  cJSON_AddStringToObject(payload_root, "target_role", rule.target_role);
+  cJSON_AddStringToObject(payload_root, "action", rule.action);
+  cJSON_AddItemToObject(payload_root, "args", args);
+  cJSON_AddBoolToObject(payload_root, "async", true);
+  cJSON_AddStringToObject(payload_root, "reply_channel", msg->channel);
+  cJSON_AddStringToObject(payload_root, "reply_chat_id", msg->chat_id);
+
+  char *payload = cJSON_PrintUnformatted(payload_root);
+  cJSON_Delete(payload_root);
+  if (!payload) {
+    return false;
+  }
+
+  tool_output[0] = '\0';
+  tool_registry_execute("mesh_send_command", payload, tool_output,
+                        tool_output_size);
+  cJSON_free(payload);
+  ESP_LOGI(TAG,
+           "=== CONV === Deterministic skill rule skill=%s trigger=%s action=%s => %s",
+           rule.skill_name, rule.trigger, rule.action, tool_output);
+
+  char reply_buf[640] = {0};
+  if (strncmp(tool_output, "OK:", 3) == 0) {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已命中 skill 规则 %s（trigger=%s），并通过 MQTT Mesh 下发 %s：%s",
+             rule.skill_name, rule.trigger, rule.action, tool_output);
+  } else {
+    snprintf(reply_buf, sizeof(reply_buf),
+             "已命中 skill 规则 %s（trigger=%s），但下发 %s 失败：%s",
+             rule.skill_name, rule.trigger, rule.action,
+             tool_output[0] ? tool_output : "unknown error");
   }
   *final_text = strdup(reply_buf);
   return *final_text != NULL;
@@ -4345,6 +4613,9 @@ static void agent_loop_task(void *arg) {
     if (err != ESP_OK)
       continue;
 
+    const agent_heap_snapshot_t turn_heap_start = agent_heap_snapshot();
+    agent_log_heap_stage("turn_start", &turn_heap_start);
+
     ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
     ESP_LOGI(TAG,
              "=== CONV ==================================================");
@@ -4355,10 +4626,6 @@ static void agent_loop_task(void *arg) {
     bool proactive_turn = (msg.flags & ESPAGENT_MSG_FLAG_PROACTIVE) != 0;
     bool internal_result_turn =
         (msg.flags & ESPAGENT_MSG_FLAG_INTERNAL_RESULT) != 0;
-    if (!proactive_turn && !internal_result_turn) {
-      proactive_service_note_contact(msg.channel, msg.chat_id);
-    }
-
     espagent_slash_result_t slash = {0};
     if (!proactive_turn && !internal_result_turn &&
         espagent_slash_try_handle(msg.content, &slash)) {
@@ -4368,8 +4635,7 @@ static void agent_loop_task(void *arg) {
         (void)send_direct_text_reply(&msg, slash.text);
         (void)tool_status_indicator_thinking_stop();
         free(msg.content);
-        ESP_LOGI(TAG, "Free PSRAM: %d bytes",
-                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        agent_finish_heap_turn("turn_end_slash", &turn_heap_start);
         continue;
       }
 
@@ -4378,8 +4644,7 @@ static void agent_loop_task(void *arg) {
         (void)handle_slash_action(&msg, &slash);
         (void)tool_status_indicator_thinking_stop();
         free(msg.content);
-        ESP_LOGI(TAG, "Free PSRAM: %d bytes",
-                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        agent_finish_heap_turn("turn_end_slash", &turn_heap_start);
         continue;
       }
 
@@ -4403,13 +4668,31 @@ static void agent_loop_task(void *arg) {
         espagent_role_is_coordinator() &&
         !project_explanation_turn &&
         message_is_general_qa_turn(msg.content);
-    bool runtime_skill_qa_turn =
-        espagent_role_is_coordinator() &&
-        message_is_skill_or_knowledge_query(msg.content) &&
-        !message_requests_skill_file_read(msg.content) &&
-        !message_requests_skill_mutation_or_tool_execution(msg.content);
     bool coordinator_transport_tight =
         espagent_role_is_coordinator() && llm_transport_heap_is_tight();
+    bool runtime_skill_lookup_allowed =
+        espagent_role_is_coordinator() &&
+        strcmp(msg.channel, ESPAGENT_CHAN_SYSTEM) != 0 &&
+        !message_requests_skill_file_read(msg.content) &&
+        !message_requests_skill_mutation_or_tool_execution(msg.content);
+    bool runtime_skill_candidate_found = false;
+    if (runtime_skill_lookup_allowed) {
+      size_t skill_context_size = coordinator_transport_tight ? 1024 : 2048;
+      int skill_limit = coordinator_transport_tight
+                            ? 1
+                            : ESPAGENT_RELEVANT_SKILLS_MAX;
+      memset(turn_buf, 0, 2048);
+      runtime_skill_candidate_found =
+          skill_loader_build_relevant_details(
+              msg.content, turn_buf, skill_context_size, skill_limit) == ESP_OK &&
+          turn_buf[0] != '\0';
+    }
+    bool runtime_skill_qa_turn =
+        espagent_role_is_coordinator() &&
+        (runtime_skill_candidate_found ||
+         message_is_skill_or_knowledge_query(msg.content)) &&
+        !message_requests_skill_file_read(msg.content) &&
+        !message_requests_skill_mutation_or_tool_execution(msg.content);
     bool prefer_direct_reply = message_prefers_direct_reply_no_tools(
                                    msg.content) ||
                                smalltalk_turn || general_qa_turn ||
@@ -4449,6 +4732,19 @@ static void agent_loop_task(void *arg) {
     bool exact_runtime_skill_context = append_exact_runtime_skill_context(
         system_prompt, ESPAGENT_CONTEXT_BUF_SIZE, msg.content,
         coordinator_transport_tight);
+    if (runtime_skill_candidate_found && !exact_runtime_skill_context) {
+      append_prompt_format(
+          system_prompt, ESPAGENT_CONTEXT_BUF_SIZE,
+          "\n## Relevant Runtime Skill Knowledge\n\n"
+          "Use the following runtime facts as the source of truth for this turn. "
+          "Answer the user's question directly and do not replace these facts "
+          "with assumptions from general knowledge or conversation history.\n\n%s\n",
+          turn_buf);
+      ESP_LOGI(TAG, "Injected generic runtime skill candidates tight=%d",
+               coordinator_transport_tight ? 1 : 0);
+    }
+    bool runtime_skill_context_available =
+        exact_runtime_skill_context || runtime_skill_candidate_found;
 
     /* 2. Load session history into cJSON array */
     session_get_history_json(msg.chat_id, history_json,
@@ -4497,24 +4793,13 @@ static void agent_loop_task(void *arg) {
                                  turn_buf);
         }
       }
-      memset(turn_buf, 0, 2048);
-      if (skill_loader_build_relevant_details(relevance_query,
-                                              turn_buf,
-                                              2048,
-                                              2) == ESP_OK &&
-          turn_buf[0]) {
-        append_prompt_format(system_prompt,
-                             ESPAGENT_CONTEXT_BUF_SIZE,
-                             "\n## Relevant Skill Details For This Turn\n\n%s\n",
-                             turn_buf);
-      }
         append_pending_clarification_prompt(system_prompt,
                                           ESPAGENT_CONTEXT_BUF_SIZE,
                                           history_json);
     } else if (coordinator_transport_tight) {
-      if (exact_runtime_skill_context) {
+      if (runtime_skill_context_available) {
         ESP_LOGI(TAG,
-                 "Coordinator transport heap is tight; injected exact runtime skill context only");
+                 "Coordinator transport heap is tight; injected one bounded runtime skill context");
       } else {
       ESP_LOGW(TAG,
                "Coordinator transport heap is tight; skipping skill/memory context expansion for this turn");
@@ -4540,38 +4825,41 @@ static void agent_loop_task(void *arg) {
     tool_summary[0] = '\0';
     tool_fallback[0] = '\0';
 
-    if (!try_execute_deterministic_number_compare(&msg, &final_text) &&
-        !try_execute_deterministic_skill_read_request(&msg, &final_text) &&
+    agent_log_heap_stage("before_route", &turn_heap_start);
+    if (!try_execute_deterministic_skill_read_request(&msg, &final_text) &&
+        !try_execute_deterministic_skill_rule_request(
+            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_runtime_skill_fact_reply(&msg, &final_text) &&
-        !try_execute_deterministic_task_list_request(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_task_remove_request(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_fixed_device_duration_workflow(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_temperature_fan_rule(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_light_curtain_rule_request(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_condition_rule_request(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_light_workflow(&msg, tool_output,
-                                                  TOOL_OUTPUT_SIZE,
-                                                  &final_text) &&
-        !try_execute_deterministic_mixed_control_workflow(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_scheduled_light_request(
-            &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
-        !try_execute_deterministic_cron_clarification(&msg, &final_text) &&
-        !try_execute_deterministic_subagent_request(&msg, tool_output,
-                                                    TOOL_OUTPUT_SIZE,
-                                                    &final_text) &&
-        !try_execute_deterministic_time_weather_request(&msg, tool_output,
-                                                        TOOL_OUTPUT_SIZE,
-                                                        &final_text)) {
+        (!runtime_skill_context_available &&
+         !try_execute_deterministic_number_compare(&msg, &final_text) &&
+         (ESPAGENT_SINGLE_TOOL_MODE ||
+          (!try_execute_deterministic_task_list_request(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_task_remove_request(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_fixed_device_duration_workflow(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_temperature_fan_rule(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_light_curtain_rule_request(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_condition_rule_request(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_light_workflow(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_mixed_control_workflow(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_scheduled_light_request(
+               &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+           !try_execute_deterministic_cron_clarification(&msg, &final_text))) &&
+         !try_execute_deterministic_subagent_request(
+             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
+         !try_execute_deterministic_time_weather_request(
+             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text))) {
       try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
                                              &final_text);
     }
+    agent_log_heap_stage("after_route", &turn_heap_start);
 
     while (!final_text && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
       /* Send "working" indicator before each API call */
@@ -4633,11 +4921,13 @@ static void agent_loop_task(void *arg) {
       if (espagent_role_is_coordinator()) {
         espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
       }
+      agent_log_heap_stage("before_llm", &turn_heap_start);
       err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
       if (compact_messages) {
         cJSON_Delete(compact_messages);
         compact_messages = NULL;
       }
+      agent_log_heap_stage("after_llm", &turn_heap_start);
 
       if (err != ESP_OK) {
         last_llm_err = err;
@@ -4648,7 +4938,9 @@ static void agent_loop_task(void *arg) {
           if (espagent_role_is_coordinator()) {
             espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
           }
+          agent_log_heap_stage("before_llm_retry", &turn_heap_start);
           err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+          agent_log_heap_stage("after_llm_retry", &turn_heap_start);
           if (err == ESP_OK) {
             prefer_direct_reply = true;
             last_llm_err = ESP_OK;
@@ -4671,7 +4963,9 @@ static void agent_loop_task(void *arg) {
         if (espagent_role_is_coordinator()) {
           espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
         }
+        agent_log_heap_stage("before_llm_empty_retry", &turn_heap_start);
         err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+        agent_log_heap_stage("after_llm_empty_retry", &turn_heap_start);
         if (err == ESP_OK) {
           prefer_direct_reply = true;
           last_llm_err = ESP_OK;
@@ -4721,10 +5015,12 @@ static void agent_loop_task(void *arg) {
       cJSON_AddItemToArray(messages, asst_msg);
 
       /* Execute tools and append results */
+      agent_log_heap_stage("before_tool", &turn_heap_start);
       cJSON *tool_results =
           build_tool_results(&resp, &msg, tool_output, TOOL_OUTPUT_SIZE,
                              tool_summary, TOOL_SUMMARY_SIZE,
                              tool_fallback, TOOL_OUTPUT_SIZE + 512);
+      agent_log_heap_stage("after_tool", &turn_heap_start);
       cJSON *result_msg = cJSON_CreateObject();
       cJSON_AddStringToObject(result_msg, "role", "user");
       cJSON_AddItemToObject(result_msg, "content", tool_results);
@@ -4784,8 +5080,7 @@ static void agent_loop_task(void *arg) {
         final_text = NULL;
         free(msg.content);
         (void)tool_status_indicator_thinking_stop();
-        ESP_LOGI(TAG, "Free PSRAM: %d bytes",
-                 (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+        agent_finish_heap_turn("turn_end_proactive", &turn_heap_start);
         continue;
       }
 
@@ -4880,13 +5175,19 @@ static void agent_loop_task(void *arg) {
     free(msg.content);
     (void)tool_status_indicator_thinking_stop();
 
-    /* Log memory status */
-    ESP_LOGI(TAG, "Free PSRAM: %d bytes",
-             (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    agent_finish_heap_turn("turn_end", &turn_heap_start);
   }
 }
 
 esp_err_t agent_loop_init(void) {
+  esp_err_t hook_err =
+      heap_caps_register_failed_alloc_callback(agent_heap_alloc_failed_hook);
+  if (hook_err != ESP_OK) {
+    ESP_LOGW(TAG, "Heap allocation failure hook registration failed: %s",
+             esp_err_to_name(hook_err));
+  } else {
+    ESP_LOGI(TAG, "Heap allocation failure hook registered");
+  }
   ESP_LOGI(TAG, "Agent loop initialized");
   return ESP_OK;
 }

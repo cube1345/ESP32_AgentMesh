@@ -1,6 +1,5 @@
 #include "message_bus.h"
 #include "espagent_config.h"
-#include "events/espagent_event.h"
 #include "esp_log.h"
 #include <string.h>
 
@@ -29,16 +28,14 @@ esp_err_t message_bus_init(void)
 */
 esp_err_t message_bus_push_inbound(const espagent_msg_t *msg)
 {
+    if (!msg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (xQueueSend(s_inbound_queue, msg, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGW(TAG, "Inbound queue full, dropping message");
         return ESP_ERR_NO_MEM;
     }
-    espagent_event_emit_simple("message.inbound",
-                               "message_bus",
-                               msg ? msg->channel : "",
-                               msg ? msg->chat_id : "",
-                               "",
-                               msg && msg->content ? msg->content : "");
     return ESP_OK;
 }
 
@@ -62,16 +59,14 @@ esp_err_t message_bus_pop_inbound(espagent_msg_t *msg, uint32_t timeout_ms)
 */
 esp_err_t message_bus_push_outbound(const espagent_msg_t *msg)
 {
+    if (!msg) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     if (xQueueSend(s_outbound_queue, msg, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGW(TAG, "Outbound queue full, dropping message");
         return ESP_ERR_NO_MEM;
     }
-    espagent_event_emit_simple("message.outbound",
-                               "message_bus",
-                               msg ? msg->channel : "",
-                               msg ? msg->chat_id : "",
-                               "",
-                               msg && msg->content ? msg->content : "");
     return ESP_OK;
 }
 

@@ -14,9 +14,6 @@
 #include "tools/tool_web_search.h"
 #include "tools/tool_amap_weather.h"
 #include "drivers/max98357.h"
-#include "cron/cron_service.h"
-#include "heartbeat/heartbeat.h"
-#include "proactive/proactive_service.h"
 #include "skills/skill_loader.h"
 #include "sensors/sensor_mqtt.h"
 #include "guardian/approval_queue.h"
@@ -255,12 +252,23 @@ static int cmd_session_clear(int argc, char **argv)
 /* --- heap_info command --- */
 static int cmd_heap_info(int argc, char **argv)
 {
-    printf("Internal free: %d bytes\n",
+    printf("Internal free:    %d bytes\n",
            (int)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-    printf("PSRAM free:    %d bytes\n",
+    printf("Internal largest: %d bytes\n",
+           (int)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    printf("Internal minimum: %d bytes\n",
+           (int)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    printf("PSRAM free:       %d bytes\n",
            (int)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    printf("Total free:    %d bytes\n",
+    printf("PSRAM largest:    %d bytes\n",
+           (int)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
+    printf("PSRAM minimum:    %d bytes\n",
+           (int)heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM));
+    printf("Total free:       %d bytes\n",
            (int)esp_get_free_heap_size());
+    printf("Task count:       %u\n", (unsigned)uxTaskGetNumberOfTasks());
+    printf("Heap integrity:   %s\n",
+           heap_caps_check_integrity_all(true) ? "OK" : "CORRUPTED");
     return 0;
 }
 
@@ -761,64 +769,6 @@ static int cmd_config_reset(int argc, char **argv)
     }
     printf("All NVS config cleared. Build-time defaults will be used on restart.\n");
     return 0;
-}
-
-/* --- heartbeat_trigger command --- */
-static int cmd_heartbeat_trigger(int argc, char **argv)
-{
-    printf("Checking HEARTBEAT.md...\n");
-    if (heartbeat_trigger()) {
-        printf("Heartbeat: agent prompted with pending tasks.\n");
-    } else {
-        printf("Heartbeat: no actionable tasks found.\n");
-    }
-    return 0;
-}
-
-/* --- cron_start command --- */
-static int cmd_cron_start(int argc, char **argv)
-{
-    esp_err_t err = cron_service_start();
-    if (err == ESP_OK) {
-        printf("Cron service started.\n");
-        return 0;
-    }
-
-    printf("Failed to start cron service: %s\n", esp_err_to_name(err));
-    return 1;
-}
-
-static int cmd_proactive_status(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-
-    char status[192] = {0};
-    proactive_service_status(status, sizeof(status));
-    printf("Proactive: %s\n", status);
-    return 0;
-}
-
-static int cmd_proactive_set_target(int argc, char **argv)
-{
-    if (argc < 3) {
-        printf("Usage: proactive_set_target <channel> <chat_id>\n");
-        return 1;
-    }
-
-    esp_err_t err = proactive_service_note_contact(argv[1], argv[2]);
-    printf("proactive_set_target status: %s\n", esp_err_to_name(err));
-    return err == ESP_OK ? 0 : 1;
-}
-
-static int cmd_proactive_trigger(int argc, char **argv)
-{
-    (void)argc;
-    (void)argv;
-
-    esp_err_t err = proactive_service_trigger_now();
-    printf("proactive_trigger status: %s\n", esp_err_to_name(err));
-    return err == ESP_OK ? 0 : 1;
 }
 
 static int cmd_control_state(int argc, char **argv)
@@ -1469,7 +1419,7 @@ esp_err_t serial_cli_init(void)
     /* heap_info */
     esp_console_cmd_t heap_cmd = {
         .command = "heap_info",
-        .help = "Show heap memory usage",
+        .help = "Show heap fragmentation, low-water marks, tasks, and integrity",
         .func = &cmd_heap_info,
     };
     esp_console_cmd_register(&heap_cmd);
@@ -1587,46 +1537,6 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_config_reset,
     };
     esp_console_cmd_register(&config_reset_cmd);
-
-    /* heartbeat_trigger */
-    esp_console_cmd_t heartbeat_cmd = {
-        .command = "heartbeat_trigger",
-        .help = "Manually trigger a heartbeat check",
-        .func = &cmd_heartbeat_trigger,
-    };
-    esp_console_cmd_register(&heartbeat_cmd);
-
-    /* cron_start */
-    esp_console_cmd_t cron_start_cmd = {
-        .command = "cron_start",
-        .help = "Start cron scheduler timer now",
-        .func = &cmd_cron_start,
-    };
-    esp_console_cmd_register(&cron_start_cmd);
-
-    /* proactive_status */
-    esp_console_cmd_t proactive_status_cmd = {
-        .command = "proactive_status",
-        .help = "Show proactive agent target and interval",
-        .func = &cmd_proactive_status,
-    };
-    esp_console_cmd_register(&proactive_status_cmd);
-
-    /* proactive_set_target */
-    esp_console_cmd_t proactive_set_target_cmd = {
-        .command = "proactive_set_target",
-        .help = "Set proactive target: proactive_set_target <channel> <chat_id>",
-        .func = &cmd_proactive_set_target,
-    };
-    esp_console_cmd_register(&proactive_set_target_cmd);
-
-    /* proactive_trigger */
-    esp_console_cmd_t proactive_trigger_cmd = {
-        .command = "proactive_trigger",
-        .help = "Trigger a proactive LLM check now",
-        .func = &cmd_proactive_trigger,
-    };
-    esp_console_cmd_register(&proactive_trigger_cmd);
 
     esp_console_cmd_t control_state_cmd = {
         .command = "control_state",

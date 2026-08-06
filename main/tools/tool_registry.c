@@ -1,8 +1,6 @@
 #include "tool_registry.h"
 
 #include "espagent_config.h"
-#include "tools/tool_automation.h"
-#include "tools/tool_cron.h"
 #include "tools/tool_files.h"
 #include "tools/tool_get_time.h"
 #include "tools/tool_lua.h"
@@ -391,24 +389,13 @@ static bool coordinator_compact_tool_allowed(const char *name)
         "web_search",
         "get_weather",
         "get_current_time",
-        "spawn_subagent",
         "mesh_send_command",
-        "automation_create_workflow",
-        "automation_create_rule",
-        "automation_list",
-        "automation_remove",
         "read_file",
         "list_dir",
-        "cron_add",
-        "cron_list",
-        "cron_remove",
         "memory_profile_set",
         "skill_observation_add",
         "lua_runtime_info",
         "lua_list_scripts",
-        "lua_list_jobs",
-        "lua_get_job",
-        "lua_stop_job",
     };
 
     if (!name) {
@@ -709,63 +696,6 @@ esp_err_t tool_registry_init(void)
             "\"local\":{\"type\":\"boolean\",\"description\":\"Set true only when explicitly controlling this board locally instead of routing to control_agent\"}},"
             "\"required\":[\"device\"],\"additionalProperties\":false}",
         .execute = tool_virtual_device_control_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "automation_create_workflow",
-        .description = "Create and start a deterministic multi-step automation workflow. Use this instead of direct single hardware calls when the user asks for ordered actions, delays, or sequences, such as 'turn red, wait 10 seconds, then turn blue'. Each step is executed by the automation runtime through MQTT Mesh and Guardian policy, so the agent loop is not blocked.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short workflow name\"},"
-            "\"steps\":{\"type\":\"array\",\"description\":\"Ordered delayed mesh actions\","
-            "\"items\":{\"type\":\"object\",\"properties\":{"
-            "\"delay_ms\":{\"type\":\"integer\",\"description\":\"Delay before this step in milliseconds\"},"
-            "\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"],\"description\":\"Optional target role; defaults to control_agent for control actions\"},"
-            "\"target_node\":{\"type\":\"string\",\"description\":\"Optional target node id\"},"
-            "\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"],\"description\":\"Whitelisted mesh action\"},"
-            "\"args\":{\"type\":\"object\",\"description\":\"JSON arguments for this action\"},"
-            "\"args_json\":{\"type\":\"string\",\"description\":\"Raw JSON object string for arguments\"}},"
-            "\"required\":[\"action\"]}}},"
-            "\"required\":[\"name\",\"steps\"],\"additionalProperties\":false}",
-        .execute = tool_automation_create_workflow_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "automation_create_rule",
-        .description = "Create a one-shot condition-action automation rule. Use this when the user asks for conditional linkage such as 'if temperature is above 35 set the light red, otherwise blue'. The runtime periodically reads sensor_agent telemetry, triggers one control_agent branch through MQTT Mesh and Guardian policy, then auto-removes the rule.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short rule name\"},"
-            "\"metric\":{\"type\":\"string\",\"enum\":[\"temperature_c\",\"humidity_percent\",\"light_lux\"],\"description\":\"Sensor metric to compare; defaults to temperature_c\"},"
-            "\"threshold\":{\"type\":\"number\",\"description\":\"Threshold for above/below branching\"},"
-            "\"interval_s\":{\"type\":\"integer\",\"description\":\"Polling interval in seconds, defaults to 10\"},"
-            "\"cooldown_s\":{\"type\":\"integer\",\"description\":\"Minimum seconds between triggered actions, defaults to 30\"},"
-            "\"hysteresis_c\":{\"type\":\"number\",\"description\":\"Deadband around threshold to prevent flapping; also used for humidity units\"},"
-            "\"confirmed\":{\"type\":\"boolean\",\"description\":\"Set true only when the user explicitly confirmed creating this background condition rule\"},"
-            "\"sensor_args\":{\"type\":\"object\",\"description\":\"Optional args for read_environment\"},"
-            "\"above\":{\"type\":\"object\",\"description\":\"Action when metric is above threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]},"
-            "\"below\":{\"type\":\"object\",\"description\":\"Action when metric is at or below threshold\","
-            "\"properties\":{\"target_role\":{\"type\":\"string\",\"enum\":[\"sensor_agent\",\"control_agent\"]},\"target_node\":{\"type\":\"string\"},\"action\":{\"type\":\"string\",\"enum\":[\"read_temperature_humidity\",\"read_environment\",\"read_light_level\",\"virtual_device_read\",\"virtual_device_control\",\"set_status_light\",\"ws2812_set\",\"set_curtain\",\"servo_write\",\"set_humidifier\",\"set_fan\",\"set_device_led\",\"copper_gpio_write\",\"gpio_write\",\"gree_ac_control\"]},\"args\":{\"type\":\"object\"},\"args_json\":{\"type\":\"string\"}},\"required\":[\"action\"]}},"
-            "\"required\":[\"name\",\"threshold\",\"above\",\"below\"],\"additionalProperties\":false}",
-        .execute = tool_automation_create_rule_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "automation_list",
-        .description = "List active workflows and pending condition rules.",
-        .input_schema_json = "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
-        .execute = tool_automation_list_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "automation_remove",
-        .description = "Remove an automation workflow or rule by id.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Workflow or rule id returned by automation_list/create\"}},"
-            "\"required\":[\"id\"]}",
-        .execute = tool_automation_remove_execute,
     });
 
     register_tool(&(espagent_tool_t){
@@ -1108,42 +1038,6 @@ esp_err_t tool_registry_init(void)
             "\"hardware_i2c\":{\"type\":\"boolean\",\"description\":\"Force ESP-IDF hardware I2C path for diagnostics; may fail if the port is already acquired\"}},"
             "\"required\":[]}",
         .execute = tool_bh1750_read_light_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "cron_add",
-        .description = "Schedule a recurring, daily, or one-shot proactive task. The message will trigger an agent turn when the job fires.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"name\":{\"type\":\"string\",\"description\":\"Short name for the job\"},"
-            "\"schedule_type\":{\"type\":\"string\",\"description\":\"'every' for recurring interval, 'at' for one-shot at a unix timestamp, or 'daily' for a local-time daily task\"},"
-            "\"interval_s\":{\"type\":\"integer\",\"description\":\"Interval in seconds (required for 'every')\"},"
-            "\"at_epoch\":{\"type\":\"integer\",\"description\":\"Unix timestamp to fire at (required for 'at')\"},"
-            "\"hour\":{\"type\":\"integer\",\"description\":\"Local hour 0-23 (required for 'daily')\"},"
-            "\"minute\":{\"type\":\"integer\",\"description\":\"Local minute 0-59 (required for 'daily')\"},"
-            "\"message\":{\"type\":\"string\",\"description\":\"Message to inject when the job fires, triggering an agent turn\"},"
-            "\"channel\":{\"type\":\"string\",\"description\":\"Optional reply channel (e.g. 'feishu' or 'websocket'). If omitted, current turn channel is used when available\"},"
-            "\"chat_id\":{\"type\":\"string\",\"description\":\"Optional reply chat_id. If omitted during an active turn, current chat_id is used\"}},"
-            "\"required\":[\"name\",\"schedule_type\",\"message\"]}",
-        .execute = tool_cron_add_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "cron_list",
-        .description = "List all scheduled cron jobs with their status, schedule, and IDs.",
-        .input_schema_json =
-            "{\"type\":\"object\",\"properties\":{},\"required\":[]}",
-        .execute = tool_cron_list_execute,
-    });
-
-    register_tool(&(espagent_tool_t){
-        .name = "cron_remove",
-        .description = "Remove a scheduled cron job by its ID.",
-        .input_schema_json =
-            "{\"type\":\"object\","
-            "\"properties\":{\"job_id\":{\"type\":\"string\",\"description\":\"The 8-character job ID to remove\"}},"
-            "\"required\":[\"job_id\"]}",
-        .execute = tool_cron_remove_execute,
     });
 
     build_tools_json();
