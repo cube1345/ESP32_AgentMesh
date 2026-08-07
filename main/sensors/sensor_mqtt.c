@@ -39,6 +39,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 static const char *TAG = "sensor_mqtt";
@@ -62,6 +63,10 @@ static const char *TAG = "sensor_mqtt";
 #define MQTT_SENSOR_CACHE_DEPTH 8
 #define MQTT_WATCHDOG_DEPTH     8
 #define MQTT_COMMAND_DEDUP_DEPTH 16
+#define MQTT_GUARDIAN_RATE_DEPTH 16
+#define MQTT_GUARDIAN_RATE_WINDOW_MS 10000
+#define MQTT_GUARDIAN_COOLDOWN_MS 1000
+#define MQTT_GUARDIAN_LOCKOUT_MS 30000
 #define MQTT_CONNECTED_BIT      BIT0
 #define MQTT_WATCHDOG_STATEBOARD_STATE_MS     30000
 #define MQTT_WATCHDOG_STATEBOARD_TELEMETRY_MS 30000
@@ -144,6 +149,22 @@ static watchdog_node_t s_watchdog_nodes[MQTT_WATCHDOG_DEPTH];
 static uint32_t s_watchdog_next = 0;
 static char s_seen_command_ids[MQTT_COMMAND_DEDUP_DEPTH][ESPAGENT_MESH_ID_MAX];
 static uint32_t s_seen_command_next = 0;
+
+typedef struct {
+    bool used;
+    int64_t window_ms;
+    int64_t last_ms;
+    int64_t lockout_until_ms;
+    uint8_t count;
+    uint8_t rejects;
+    char command_id[ESPAGENT_MESH_ID_MAX];
+    char nonce[ESPAGENT_MESH_NONCE_MAX];
+    char action[ESPAGENT_MESH_ACTION_MAX];
+    char target_role[ESPAGENT_MESH_ROLE_MAX];
+} guardian_rate_entry_t;
+
+static guardian_rate_entry_t s_guardian_rate[MQTT_GUARDIAN_RATE_DEPTH];
+static uint32_t s_guardian_rate_next;
 
 static bool mqtt_topic_is_critical(const char *topic);
 static void json_add_optional_string(cJSON *root, const char *key, const char *value);
@@ -1597,6 +1618,91 @@ static bool guardian_agent_task_args_allowed(const char *args_json,
     return true;
 }
 
+static bool guardian_hex64(const char *value)
+{
+    if (!value || strlen(value) != 64) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char c = value[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) return false;
+    }
+    return true;
+}
+
+static bool guardian_args_sha256_matches(const char *args_json, const char *expected)
+{
+    if (!guardian_hex64(expected)) return false;
+    unsigned char digest[32] = {0};
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    const char *input = args_json && args_json[0] ? args_json : "{}";
+    if (!info || mbedtls_md(info, (const unsigned char *)input, strlen(input), digest) != 0) return false;
+    char actual[65] = {0};
+    for (size_t i = 0; i < sizeof(digest); i++) snprintf(actual + i * 2, 3, "%02x", digest[i]);
+    return strcasecmp(actual, expected) == 0;
+}
+
+static bool guardian_rate_check(const char *command_id,
+                                const char *nonce,
+                                const char *action,
+                                const char *target_role,
+                                int64_t now_ms,
+                                char *reason,
+                                size_t reason_size,
+                                bool *rate_limited,
+                                int64_t *lockout_until_ms)
+{
+    guardian_rate_entry_t *slot = NULL;
+    for (size_t i = 0; i < MQTT_GUARDIAN_RATE_DEPTH; i++) {
+        if (s_guardian_rate[i].used &&
+            strcmp(s_guardian_rate[i].action, action) == 0 &&
+            strcmp(s_guardian_rate[i].target_role, target_role) == 0) {
+            slot = &s_guardian_rate[i];
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &s_guardian_rate[s_guardian_rate_next++ % MQTT_GUARDIAN_RATE_DEPTH];
+        memset(slot, 0, sizeof(*slot));
+        slot->used = true;
+        snprintf(slot->action, sizeof(slot->action), "%s", action);
+        snprintf(slot->target_role, sizeof(slot->target_role), "%s", target_role);
+    }
+    if (slot->lockout_until_ms > now_ms) {
+        if (rate_limited) *rate_limited = true;
+        if (lockout_until_ms) *lockout_until_ms = slot->lockout_until_ms;
+        snprintf(reason, reason_size, "Guardian temporary lockout until %lld", (long long)slot->lockout_until_ms);
+        return false;
+    }
+    if (slot->command_id[0] && strcmp(slot->command_id, command_id) == 0) {
+        if (rate_limited) *rate_limited = true;
+        snprintf(reason, reason_size, "duplicate command_id rejected");
+        return false;
+    }
+    if (slot->nonce[0] && nonce && strcmp(slot->nonce, nonce) == 0) {
+        if (rate_limited) *rate_limited = true;
+        snprintf(reason, reason_size, "replayed nonce rejected");
+        return false;
+    }
+    if (slot->window_ms == 0 || now_ms - slot->window_ms > MQTT_GUARDIAN_RATE_WINDOW_MS) {
+        slot->window_ms = now_ms;
+        slot->count = 0;
+    }
+    if (now_ms - slot->last_ms < MQTT_GUARDIAN_COOLDOWN_MS || slot->count >= 8) {
+        slot->rejects++;
+        if (slot->rejects >= 3) slot->lockout_until_ms = now_ms + MQTT_GUARDIAN_LOCKOUT_MS;
+        if (rate_limited) *rate_limited = true;
+        if (lockout_until_ms) *lockout_until_ms = slot->lockout_until_ms;
+        snprintf(reason, reason_size, "rate or cooldown limit exceeded");
+        return false;
+    }
+    snprintf(slot->command_id, sizeof(slot->command_id), "%s", command_id);
+    snprintf(slot->nonce, sizeof(slot->nonce), "%s", nonce ? nonce : "");
+    slot->last_ms = now_ms;
+    slot->count++;
+    slot->rejects = 0;
+    return true;
+}
+
 static bool guardian_control_args_allowed(const char *action,
                                           const char *args_json,
                                           char *reason,
@@ -1624,6 +1730,29 @@ static bool guardian_control_args_allowed(const char *action,
     if (duration_ms < 0 || duration_ms > 30000) {
         allowed = false;
         snprintf(reason, reason_size, "duration_ms must be 0..30000");
+    }
+
+    int duty_pct = json_optional_int(args, "duty_pct", -1);
+    int angle = json_optional_int(args, "angle", -1);
+    int pulse_us = json_optional_int(args, "pulse_us", -1);
+    int read_len = json_optional_int(args, "read_len", -1);
+    int read_count = json_optional_int(args, "read_count", -1);
+    int gpio = json_optional_int(args, "gpio", -1);
+    int i2c_address = json_optional_int(args, "i2c_address", -1);
+    if (allowed && duty_pct >= 0 && duty_pct > 100) {
+        allowed = false; snprintf(reason, reason_size, "duty_pct must be 0..100");
+    } else if (allowed && angle >= 0 && angle > 180) {
+        allowed = false; snprintf(reason, reason_size, "servo angle must be 0..180");
+    } else if (allowed && pulse_us >= 0 && (pulse_us < 500 || pulse_us > 2500)) {
+        allowed = false; snprintf(reason, reason_size, "pulse_us must be 500..2500");
+    } else if (allowed && read_len >= 0 && read_len > 64) {
+        allowed = false; snprintf(reason, reason_size, "I2C read length must be 0..64");
+    } else if (allowed && read_count >= 0 && (read_count < 1 || read_count > 8)) {
+        allowed = false; snprintf(reason, reason_size, "read_count must be 1..8");
+    } else if (allowed && gpio >= 0 && (gpio > 48 || gpio == 0)) {
+        allowed = false; snprintf(reason, reason_size, "GPIO is outside the role allowlist");
+    } else if (allowed && i2c_address >= 0 && (i2c_address < 0x08 || i2c_address > 0x77)) {
+        allowed = false; snprintf(reason, reason_size, "I2C address is outside 0x08..0x77");
     }
 
     if (allowed && strcmp(action, "virtual_device_control") == 0) {
@@ -1660,6 +1789,24 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         return;
     }
 
+    /* MQTT retries are idempotent and must not consume the rate budget again. */
+    const char *cached_command_id = json_optional_string(root, "command_id");
+    if (cached_command_id[0] && policy_cache_ensure() == ESP_OK &&
+        xSemaphoreTake(s_policy_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        for (size_t i = 0; i < MQTT_POLICY_CACHE_DEPTH; i++) {
+            if (s_policy_cache[i].used && strcmp(s_policy_cache[i].command_id, cached_command_id) == 0) {
+                char cached[MQTT_POLICY_JSON_SIZE] = {0};
+                snprintf(cached, sizeof(cached), "%s", s_policy_cache[i].decision_json);
+                xSemaphoreGive(s_policy_mutex);
+                (void)mqtt_queue_publish(ESPAGENT_MESH_TOPIC_POLICY_DECISION, cached);
+                (void)mqtt_queue_publish(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, cached);
+                cJSON_Delete(root);
+                return;
+            }
+        }
+        xSemaphoreGive(s_policy_mutex);
+    }
+
     const char *command_id = json_optional_string(root, "command_id");
     const char *trace_id = json_optional_string(root, "trace_id");
     const char *action = json_optional_string(root, "action");
@@ -1668,6 +1815,13 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     const char *args_json = json_optional_string(root, "args_json");
     const char *reply_channel = json_optional_string(root, "reply_channel");
     const char *reply_chat_id = json_optional_string(root, "reply_chat_id");
+    const char *nonce = json_optional_string(root, "nonce");
+    const char *args_sha256 = json_optional_string(root, "args_sha256");
+    const char *source_type = json_optional_string(root, "source_type");
+    const char *source_id = json_optional_string(root, "source_id");
+    const char *manifest_name = json_optional_string(root, "manifest_name");
+    const char *manifest_sha256 = json_optional_string(root, "manifest_sha256");
+    int ttl_ms = json_optional_int(root, "ttl_ms", 30000);
     int safety_level = json_optional_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
 
     char command_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
@@ -1691,21 +1845,67 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     char approval_id[32] = {0};
     bool allowed = false;
     int risk_score = safety_level * 20;
+    bool rate_limited = false;
+    int64_t lockout_until_ms = 0;
+    const char *reason_code = "default_deny";
+    const char *privacy_mode = "metadata_only";
+    int64_t now_ms = esp_timer_get_time() / 1000;
 
     if (command_id_copy[0] == '\0') {
         reason = "missing command_id";
+        reason_code = "missing_command_id";
         risk_score += 30;
+    } else if (trace_id_copy[0] == '\0' || nonce[0] == '\0') {
+        reason = "missing trace_id or nonce";
+        reason_code = "missing_context";
+        risk_score += 30;
+    } else if (source_type[0] && strcmp(source_type, "coordinator") != 0 &&
+               strcmp(source_type, "mcp") != 0) {
+        reason = "unsupported request source_type";
+        reason_code = "source_not_allowed";
+        risk_score += 30;
+    } else if (strcmp(source_type, "mcp") == 0 &&
+               (!source_id[0] || !strstr(source_id, "allowlisted:"))) {
+        reason = "MCP source requires an allowlisted tool mapping";
+        reason_code = "mcp_untrusted_metadata";
+        risk_score += 40;
+    } else if (args_sha256[0] && !guardian_args_sha256_matches(args_json, args_sha256)) {
+        reason = "args_sha256 mismatch";
+        reason_code = "args_hash_mismatch";
+        risk_score += 40;
+    } else if (ttl_ms < 1000 || ttl_ms > 30000) {
+        /* ts_ms is local monotonic time on each MCU; TTL is bounded here and
+         * enforced again by the receiving role without comparing MCU clocks. */
+        reason = "request TTL is outside bounds";
+        reason_code = "ttl_invalid";
+        risk_score += 30;
+    } else if (!guardian_rate_check(command_id_copy, nonce, action_copy, target_role_copy,
+                                    now_ms, dynamic_reason, sizeof(dynamic_reason),
+                                    &rate_limited, &lockout_until_ms)) {
+        reason = dynamic_reason;
+        reason_code = "rate_or_replay";
     } else if (action_copy[0] == '\0') {
         reason = "missing action";
+        reason_code = "missing_action";
         risk_score += 30;
     } else if (safety_level > ESPAGENT_MESH_SAFETY_MEDIUM) {
         reason = "safety_level requires human confirmation";
         risk_score += 40;
     } else if (policy_is_sensor_action(action_copy)) {
         risk_score += 5;
+        if (strcmp(action_copy, "read_presence") == 0 || strstr(action_copy, "history") != NULL) {
+            privacy_mode = "restricted";
+            if (safety_level < ESPAGENT_MESH_SAFETY_MEDIUM) {
+                reason = "privacy-sensitive sensor read requires medium safety level";
+                reason_code = "privacy_level";
+                risk_score += 25;
+                goto policy_done;
+            }
+        }
         if (strcmp(target_role_copy, ESPAGENT_ROLE_SENSOR) == 0) {
             decision = "allow";
             reason = "allowed low-risk sensor read";
+            reason_code = "sensor_read_allowed";
             allowed = true;
         } else {
             reason = "sensor action must target sensor_agent";
@@ -1722,6 +1922,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 decision = "allow";
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s", arg_reason);
                 reason = dynamic_reason;
+                reason_code = "agent_task_allowed";
                 allowed = true;
             } else {
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
@@ -1735,6 +1936,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         if (strcmp(target_role_copy, ESPAGENT_ROLE_GUARDIAN) == 0) {
             decision = "allow";
             reason = "allowed Guardian approval queue action";
+            reason_code = "guardian_queue_allowed";
             allowed = true;
         } else {
             reason = "Guardian approval action must target guardian_agent";
@@ -1742,6 +1944,13 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         }
     } else if (policy_is_control_action(action_copy)) {
         risk_score += 30;
+        if (strcmp(action_copy, "virtual_device_control") == 0 &&
+            (!manifest_name[0] || !guardian_hex64(manifest_sha256))) {
+            reason = "device manifest name and SHA256 are required";
+            reason_code = "manifest_missing";
+            risk_score += 35;
+            goto policy_done;
+        }
         if (strcmp(target_role_copy, ESPAGENT_ROLE_CONTROL) == 0) {
             char arg_reason[160] = {0};
             if (guardian_control_args_allowed(action_copy, args_json, arg_reason, sizeof(arg_reason))) {
@@ -1749,6 +1958,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
                          arg_reason[0] ? arg_reason : "allowed whitelisted low/medium-risk control action");
                 reason = dynamic_reason;
+                reason_code = "control_action_allowed";
                 allowed = true;
             } else {
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
@@ -1762,8 +1972,11 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         }
     } else {
         reason = "unsupported action";
+        reason_code = "unsupported_action";
         risk_score += 40;
     }
+
+policy_done:
 
     if (policy_is_control_action(action_copy) && args_json && args_json[0]) {
         cJSON *args = cJSON_Parse(args_json);
@@ -1805,6 +2018,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
             reason = dynamic_reason;
             if (approval_err == ESP_OK) {
                 decision = "allow";
+                reason_code = "human_approval_consumed";
                 allowed = true;
             }
         } else {
@@ -1854,12 +2068,22 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     cJSON_AddStringToObject(out, "decision", decision);
     cJSON_AddBoolToObject(out, "allowed", allowed);
     cJSON_AddStringToObject(out, "reason", reason);
+    cJSON_AddStringToObject(out, "reason_code", reason_code);
     json_add_optional_string(out, "approval_id", approval_id);
     json_add_optional_string(out, "reply_channel", reply_channel_copy);
     json_add_optional_string(out, "reply_chat_id", reply_chat_id_copy);
     cJSON_AddNumberToObject(out, "safety_level", safety_level);
     cJSON_AddNumberToObject(out, "risk_score", risk_score);
-    cJSON_AddStringToObject(out, "privacy_mode", "metadata_only");
+    cJSON_AddStringToObject(out, "privacy_mode", privacy_mode);
+    cJSON_AddStringToObject(out, "policy_version", "guardian-policy.v2");
+    cJSON_AddStringToObject(out, "args_sha256", args_sha256);
+    cJSON_AddStringToObject(out, "nonce", nonce);
+    cJSON_AddBoolToObject(out, "rate_limited", rate_limited);
+    cJSON_AddNumberToObject(out, "lockout_until_ms", (double)lockout_until_ms);
+    json_add_optional_string(out, "source_type", source_type);
+    json_add_optional_string(out, "source_id", source_id);
+    json_add_optional_string(out, "manifest_name", manifest_name);
+    json_add_optional_string(out, "manifest_sha256", manifest_sha256);
     cJSON_AddNumberToObject(out, "ts_ms", (double)ts_ms);
 
     char *json = cJSON_PrintUnformatted(out);
@@ -1869,6 +2093,7 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
         return;
     }
 
+    policy_cache_maybe_store_payload(json, strlen(json));
     (void)mqtt_queue_publish(ESPAGENT_MESH_TOPIC_POLICY_DECISION, json);
     (void)mqtt_queue_publish(ESPAGENT_SENSOR_MQTT_TOPIC_EVENTS, json);
     (void)sensor_mqtt_publish_timeline_event("policy",
@@ -2436,6 +2661,8 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
     const char *action = json_optional_string(root, "action");
     const char *target_role = json_optional_string(root, "target_role");
     const char *target_node = json_optional_string(root, "target_node");
+    const char *decision_nonce = json_optional_string(root, "nonce");
+    const char *decision_args_sha256 = json_optional_string(root, "args_sha256");
 
     bool allowed = strcmp(decision, "allow") == 0;
     if (allowed && action[0] && strcmp(action, cmd->action) != 0) {
@@ -2453,6 +2680,13 @@ static bool control_command_has_guardian_allow(const espagent_mesh_command_t *cm
         snprintf(reason, reason_size,
                  "Guardian decision target_node mismatch: decision=%s local=%s",
                  target_node, espagent_node_id());
+    } else if (allowed && decision_nonce[0] && strcmp(decision_nonce, cmd->nonce) != 0) {
+        allowed = false;
+        snprintf(reason, reason_size, "Guardian decision nonce mismatch");
+    } else if (allowed && decision_args_sha256[0] &&
+               !guardian_args_sha256_matches(cmd->args_json, decision_args_sha256)) {
+        allowed = false;
+        snprintf(reason, reason_size, "Guardian decision args_sha256 mismatch");
     } else if (allowed) {
         snprintf(reason, reason_size, "Guardian allow decision verified");
     } else {

@@ -2151,11 +2151,11 @@ static bool message_requests_skill_file_read(const char *message) {
   }
 
   static const char *const ascii_words[] = {
-      "read", "show", "display", "open", "content", "contents",
+      "read", "show", "display", "content", "contents",
       "source", "raw", "full", "summary", "summarize", "purpose",
   };
   static const char *const cjk_keywords[] = {
-      "读取", "查看", "展示", "打开", "内容", "原文",
+      "读取", "查看", "展示", "内容", "原文",
       "全文", "文件", "总结", "概括", "用途", "说明",
   };
 
@@ -4830,8 +4830,7 @@ static void agent_loop_task(void *arg) {
         !try_execute_deterministic_skill_rule_request(
             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
         !try_execute_deterministic_runtime_skill_fact_reply(&msg, &final_text) &&
-        (!runtime_skill_context_available &&
-         !try_execute_deterministic_number_compare(&msg, &final_text) &&
+        !try_execute_deterministic_number_compare(&msg, &final_text) &&
          (ESPAGENT_SINGLE_TOOL_MODE ||
           (!try_execute_deterministic_task_list_request(
                &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
@@ -4855,7 +4854,7 @@ static void agent_loop_task(void *arg) {
          !try_execute_deterministic_subagent_request(
              &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text) &&
          !try_execute_deterministic_time_weather_request(
-             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text))) {
+             &msg, tool_output, TOOL_OUTPUT_SIZE, &final_text)) {
       try_execute_deterministic_mesh_request(&msg, tool_output, TOOL_OUTPUT_SIZE,
                                              &final_text);
     }

@@ -140,6 +140,7 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     copy_field(out->target_role, sizeof(out->target_role), json_string(root, "target_role"));
     copy_field(out->action, sizeof(out->action), action);
     copy_field(out->signature, sizeof(out->signature), json_string(root, "signature"));
+    copy_field(out->nonce, sizeof(out->nonce), json_string(root, "nonce"));
     out->ts_ms = json_i64(root, "ts_ms", 0);
     out->ttl_ms = json_int(root, "ttl_ms", 30000);
     out->safety_level = json_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);

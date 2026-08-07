@@ -13,6 +13,8 @@
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#define MBEDTLS_DECLARE_PRIVATE_IDENTIFIERS
+#include "mbedtls/md.h"
 
 #include <stdio.h>
 #include <stdbool.h>
@@ -35,7 +37,7 @@ typedef struct {
 #define MESH_OUTPUT_JSON_SIZE 1024
 #define MESH_POLICY_JSON_SIZE 1024
 #define MESH_BACKGROUND_NET_DEFER_MS 15000
-#define MESH_ACK_RETRY_COUNT 4
+#define MESH_ACK_RETRY_COUNT 2
 #define MESH_POLICY_RETRY_COUNT 3
 
 static const char *json_string(cJSON *root, const char *key)
@@ -277,7 +279,7 @@ static esp_err_t publish_mesh_command_payload(const char *topic,
      * and it removes the last observed stress-test gap where Guardian had
      * allowed a sensor command but the sensor board never saw the role topic.
      */
-    static const uint16_t retry_delay_ms[MESH_ACK_RETRY_COUNT - 1] = {80, 180, 350};
+    static const uint16_t retry_delay_ms[MESH_ACK_RETRY_COUNT - 1] = {180};
     for (size_t i = 0; i < MESH_ACK_RETRY_COUNT - 1; i++) {
         vTaskDelay(pdMS_TO_TICKS(retry_delay_ms[i]));
         esp_err_t retry_err = sensor_mqtt_publish_text(topic, payload);
@@ -308,6 +310,12 @@ static esp_err_t request_policy_decision(const char *command_id,
                                          const char *args_json,
                                          int safety_level,
                                          int ttl_ms,
+                                         const char *nonce,
+                                         const char *args_sha256,
+                                         const char *source_type,
+                                         const char *source_id,
+                                         const char *manifest_name,
+                                         const char *manifest_sha256,
                                          const char *reply_channel,
                                          const char *reply_chat_id,
                                          char *decision_json,
@@ -330,6 +338,12 @@ static esp_err_t request_policy_decision(const char *command_id,
     cJSON_AddStringToObject(policy, "target_node", target_node ? target_node : "");
     cJSON_AddStringToObject(policy, "action", action);
     cJSON_AddStringToObject(policy, "args_json", args_json ? args_json : "{}");
+    cJSON_AddStringToObject(policy, "nonce", nonce ? nonce : "");
+    cJSON_AddStringToObject(policy, "args_sha256", args_sha256 ? args_sha256 : "");
+    cJSON_AddStringToObject(policy, "source_type", source_type ? source_type : "coordinator");
+    cJSON_AddStringToObject(policy, "source_id", source_id ? source_id : "coordinator_agent");
+    if (manifest_name && manifest_name[0]) cJSON_AddStringToObject(policy, "manifest_name", manifest_name);
+    if (manifest_sha256 && manifest_sha256[0]) cJSON_AddStringToObject(policy, "manifest_sha256", manifest_sha256);
     if (reply_channel && reply_channel[0]) {
         cJSON_AddStringToObject(policy, "reply_channel", reply_channel);
     }
@@ -678,6 +692,28 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     }
     copy_text(trace_id_copy, sizeof(trace_id_copy), trace_id);
 
+    char nonce_copy[ESPAGENT_MESH_NONCE_MAX] = {0};
+    /* command_id is already bound separately; keep nonce short and bounded for MCU JSON/signing. */
+    snprintf(nonce_copy, sizeof(nonce_copy), "nonce-%08lx",
+             (unsigned long)((uint64_t)(esp_timer_get_time() / 1000) & 0xffffffffUL));
+    char args_sha256[65] = {0};
+    cJSON *args_for_hash = cJSON_GetObjectItem(root, "args");
+    char *args_hash_text = args_for_hash ? cJSON_PrintUnformatted(args_for_hash) : NULL;
+    const char *hash_input = args_hash_text ? args_hash_text : "{}";
+    unsigned char digest[32] = {0};
+    const mbedtls_md_info_t *md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (md_info && mbedtls_md(md_info, (const unsigned char *)hash_input,
+                              strlen(hash_input), digest) == 0) {
+        for (size_t i = 0; i < sizeof(digest); i++) {
+            snprintf(args_sha256 + i * 2, 3, "%02x", digest[i]);
+        }
+    }
+    cJSON_free(args_hash_text);
+    const char *source_type = json_string(root, "source_type");
+    const char *source_id = json_string(root, "source_id");
+    const char *manifest_name = json_string(root, "manifest_name");
+    const char *manifest_sha256 = json_string(root, "manifest_sha256");
+
     int ttl_ms = json_int(root, "ttl_ms", 30000);
     if (ttl_ms < 1000) {
         ttl_ms = 1000;
@@ -704,6 +740,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     int64_t ts_ms = esp_timer_get_time() / 1000;
     cJSON_AddStringToObject(cmd, "command_id", command_id_copy);
     cJSON_AddStringToObject(cmd, "trace_id", trace_id_copy);
+    cJSON_AddStringToObject(cmd, "nonce", nonce_copy);
     if (target_node_copy[0]) {
         cJSON_AddStringToObject(cmd, "target_node", target_node_copy);
     }
@@ -734,6 +771,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     sign_cmd.safety_level = safety_level;
     sign_cmd.require_ack = require_ack;
     sign_cmd.ts_ms = ts_ms;
+    snprintf(sign_cmd.nonce, sizeof(sign_cmd.nonce), "%s", nonce_copy);
     cJSON *args_for_sign = cJSON_GetObjectItem(cmd, "args");
     char *args_printed = args_for_sign ? cJSON_PrintUnformatted(args_for_sign) : NULL;
     snprintf(sign_cmd.args_json, sizeof(sign_cmd.args_json), "%s", args_printed ? args_printed : "{}");
@@ -773,6 +811,12 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                        sign_cmd.args_json,
                                                        safety_level,
                                                        ttl_ms,
+                                                       nonce_copy,
+                                                       args_sha256,
+                                                       source_type && source_type[0] ? source_type : "coordinator",
+                                                       source_id && source_id[0] ? source_id : "coordinator_agent",
+                                                       manifest_name,
+                                                       manifest_sha256,
                                                        reply_channel_copy,
                                                        reply_chat_id_copy,
                                                        policy_json,

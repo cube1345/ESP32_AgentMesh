@@ -1940,6 +1940,23 @@ static esp_err_t route_to_control_agent(cJSON *root, char *output, size_t output
         return ESP_ERR_NO_MEM;
     }
     cJSON_DeleteItemFromObject(args, "local");
+    const char *device = json_string(root, "device");
+    if (device && device[0]) {
+        char sig_path[128] = {0};
+        char signature[80] = {0};
+        snprintf(sig_path, sizeof(sig_path), ESPAGENT_SPIFFS_BASE "/devices/%s.json.sha256", device);
+        FILE *sig = fopen(sig_path, "r");
+        size_t n = sig ? fread(signature, 1, sizeof(signature) - 1, sig) : 0;
+        if (sig) fclose(sig);
+        signature[n] = '\0';
+        char normalized[65] = {0};
+        size_t pos = 0;
+        for (size_t i = 0; signature[i] && pos < sizeof(normalized) - 1; i++) {
+            if (isxdigit((unsigned char)signature[i])) normalized[pos++] = (char)tolower((unsigned char)signature[i]);
+        }
+        cJSON_AddStringToObject(cmd, "manifest_name", device);
+        if (pos == 64) cJSON_AddStringToObject(cmd, "manifest_sha256", normalized);
+    }
     cJSON_AddStringToObject(cmd, "target_role", "control_agent");
     cJSON_AddStringToObject(cmd, "action", "virtual_device_control");
     cJSON_AddItemToObject(cmd, "args", args);

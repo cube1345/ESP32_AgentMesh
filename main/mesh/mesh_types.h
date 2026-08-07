@@ -10,6 +10,7 @@
 #define ESPAGENT_MESH_TRACE_MAX       48
 #define ESPAGENT_MESH_ARGS_JSON_MAX   256
 #define ESPAGENT_MESH_SIGNATURE_MAX   65
+#define ESPAGENT_MESH_NONCE_MAX       40
 
 typedef enum {
     ESPAGENT_MESH_SAFETY_LOW = 0,
@@ -25,6 +26,7 @@ typedef struct {
     char action[ESPAGENT_MESH_ACTION_MAX];
     char args_json[ESPAGENT_MESH_ARGS_JSON_MAX];
     char signature[ESPAGENT_MESH_SIGNATURE_MAX];
+    char nonce[ESPAGENT_MESH_NONCE_MAX];
     int64_t ts_ms;
     int ttl_ms;
     int safety_level;
