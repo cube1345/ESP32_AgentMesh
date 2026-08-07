@@ -1,6 +1,7 @@
 #include "tools/tool_sandbox.h"
 
 #include "espagent_config.h"
+#include "capability/capability_registry.h"
 #include "roles/role_config.h"
 
 #include "cJSON.h"
@@ -259,6 +260,14 @@ static bool sandbox_check_mesh(cJSON *root, char *reason, size_t reason_size)
         return false;
     }
     const char *action = json_string_value(root, "action");
+    const char *target_role = json_string_value(root, "target_role");
+    if (action && strcmp(action, "agent_task") != 0 &&
+        !espagent_capability_mesh_action_allowed(action, target_role)) {
+        deny(reason, reason_size,
+             "sandbox denied mesh_send_command: capability contract rejects action=%s target_role=%s",
+             action, target_role ? target_role : "");
+        return false;
+    }
     if (action &&
         strcmp(action, "gpio_write") != 0 &&
         strcmp(action, "copper_gpio_write") != 0 &&

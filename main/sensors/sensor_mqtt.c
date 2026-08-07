@@ -745,6 +745,12 @@ static int json_optional_int(cJSON *root, const char *key, int default_value)
     return cJSON_IsNumber(item) ? item->valueint : default_value;
 }
 
+static int64_t json_optional_i64(cJSON *root, const char *key, int64_t default_value)
+{
+    cJSON *item = cJSON_GetObjectItem(root, key);
+    return cJSON_IsNumber(item) ? (int64_t)item->valuedouble : default_value;
+}
+
 static double json_optional_number(cJSON *root, const char *key, double default_value)
 {
     cJSON *item = cJSON_GetObjectItem(root, key);
@@ -1846,6 +1852,12 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
     const char *source_id = json_optional_string(root, "source_id");
     const char *manifest_name = json_optional_string(root, "manifest_name");
     const char *manifest_sha256 = json_optional_string(root, "manifest_sha256");
+    const char *task_id = json_optional_string(root, "task_id");
+    const char *parent_task_id = json_optional_string(root, "parent_task_id");
+    const char *source_channel = json_optional_string(root, "source_channel");
+    const char *source_chat_id = json_optional_string(root, "source_chat_id");
+    int64_t deadline_ms = json_optional_i64(root, "deadline_ms", 0);
+    int retry_count = json_optional_int(root, "retry_count", 0);
     int ttl_ms = json_optional_int(root, "ttl_ms", 30000);
     int safety_level = json_optional_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
 
@@ -2087,6 +2099,16 @@ policy_done:
     cJSON_AddStringToObject(out, "guardian_role", espagent_node_role());
     cJSON_AddStringToObject(out, "command_id", command_id_copy);
     cJSON_AddStringToObject(out, "trace_id", trace_id_copy);
+    json_add_optional_string(out, "task_id", task_id);
+    json_add_optional_string(out, "parent_task_id", parent_task_id);
+    json_add_optional_string(out, "source_channel", source_channel);
+    json_add_optional_string(out, "source_chat_id", source_chat_id);
+    cJSON_AddNumberToObject(out, "deadline_ms", (double)deadline_ms);
+    cJSON_AddNumberToObject(out, "retry_count", retry_count);
+    cJSON_AddStringToObject(out, "task_status",
+                            strcmp(decision, "needs_confirmation") == 0
+                                ? "policy_pending"
+                                : allowed ? "queued" : "failed");
     cJSON_AddStringToObject(out, "action", action_copy);
     cJSON_AddStringToObject(out, "target_role", target_role_copy);
     cJSON_AddStringToObject(out, "target_node", target_node_copy);
@@ -2937,6 +2959,15 @@ static void handle_mesh_command(const char *source, const char *payload, size_t 
                  cmd.action);
         return;
     }
+
+    (void)sensor_mqtt_publish_timeline_event("execution",
+                                             "mesh_command_running",
+                                             "running",
+                                             "Target role accepted Mesh command for execution",
+                                             cmd.command_id,
+                                             cmd.target_role,
+                                             cmd.target_node,
+                                             cmd.action);
 
     if (handle_guardian_approval_mesh_command(&cmd)) {
         return;

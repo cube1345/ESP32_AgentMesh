@@ -3,6 +3,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "espagent_config.h"
+#include "capability/capability_registry.h"
+#include "tools/tool_registry.h"
 #include "cJSON.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -313,6 +315,22 @@ static int lua_espagent_runtime_info(lua_State *L)
     return 1;
 }
 
+static int lua_espagent_capability_contract(lua_State *L)
+{
+    const char *name = luaL_checkstring(L, 1);
+    char contract[2048] = {0};
+    esp_err_t err = espagent_capability_write_contract_json(name,
+                                                            contract,
+                                                            sizeof(contract));
+    if (err != ESP_OK) {
+        lua_pushnil(L);
+        lua_pushstring(L, esp_err_to_name(err));
+        return 2;
+    }
+    lua_pushstring(L, contract);
+    return 1;
+}
+
 static int luaopen_espagent(lua_State *L)
 {
     static const luaL_Reg funcs[] = {
@@ -320,6 +338,7 @@ static int luaopen_espagent(lua_State *L)
         {"delay_ms", lua_espagent_delay_ms},
         {"now_ms", lua_espagent_now_ms},
         {"runtime_info", lua_espagent_runtime_info},
+        {"capability_contract", lua_espagent_capability_contract},
         {NULL, NULL},
     };
     luaL_newlib(L, funcs);

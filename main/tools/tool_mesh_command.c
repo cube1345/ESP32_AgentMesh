@@ -319,6 +319,7 @@ static esp_err_t request_policy_decision(const char *command_id,
                                          const char *manifest_sha256,
                                          const char *reply_channel,
                                          const char *reply_chat_id,
+                                         const espagent_task_meta_t *task,
                                          char *decision_json,
                                          size_t decision_json_size,
                                          char *reason,
@@ -334,6 +335,15 @@ static esp_err_t request_policy_decision(const char *command_id,
     cJSON_AddStringToObject(policy, "event", "policy_check");
     cJSON_AddStringToObject(policy, "command_id", command_id);
     cJSON_AddStringToObject(policy, "trace_id", trace_id);
+    if (task) {
+        cJSON_AddStringToObject(policy, "task_id", task->task_id);
+        if (task->parent_task_id[0]) cJSON_AddStringToObject(policy, "parent_task_id", task->parent_task_id);
+        cJSON_AddStringToObject(policy, "source_channel", task->source_channel);
+        cJSON_AddStringToObject(policy, "source_chat_id", task->source_chat_id);
+        cJSON_AddNumberToObject(policy, "deadline_ms", (double)task->deadline_ms);
+        cJSON_AddNumberToObject(policy, "retry_count", task->retry_count);
+        cJSON_AddStringToObject(policy, "task_status", "policy_pending");
+    }
     cJSON_AddStringToObject(policy, "source_role", "coordinator_agent");
     cJSON_AddStringToObject(policy, "target_role", target_role ? target_role : "");
     cJSON_AddStringToObject(policy, "target_node", target_node ? target_node : "");
@@ -537,7 +547,7 @@ static esp_err_t start_mesh_wait_task(const char *command_id,
         return ESP_ERR_NO_MEM;
     }
 
-    snprintf(ctx->task_id, sizeof(ctx->task_id), "mesh-task-%s", command_id);
+    snprintf(ctx->task_id, sizeof(ctx->task_id), "task-%s", command_id);
     snprintf(ctx->command_id, sizeof(ctx->command_id), "%s", command_id);
     snprintf(ctx->trace_id, sizeof(ctx->trace_id), "%s", trace_id ? trace_id : "");
     snprintf(ctx->target_role, sizeof(ctx->target_role), "%s", target_role ? target_role : "");
@@ -748,11 +758,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
 
     const char *parent_task_id = json_string(root, "parent_task_id");
     char task_id_copy[ESPAGENT_MESH_TASK_ID_MAX] = {0};
-    const char *task_id = json_string(root, "task_id");
-    if (!task_id || !task_id[0]) {
-        snprintf(task_id_copy, sizeof(task_id_copy), "task-%s", command_id_copy);
-        task_id = task_id_copy;
-    }
+    snprintf(task_id_copy, sizeof(task_id_copy), "task-%s", command_id_copy);
+    const char *task_id = task_id_copy;
     char parent_task_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
     copy_text(parent_task_id_copy, sizeof(parent_task_id_copy), parent_task_id);
 
@@ -854,6 +861,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                        manifest_sha256,
                                                        reply_channel_copy,
                                                        reply_chat_id_copy,
+                                                       &sign_cmd.task,
                                                        policy_json,
                                                        sizeof(policy_json),
                                                        policy_reason,
@@ -914,6 +922,14 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                  "mesh_command_queued",
                                                  "ok",
                                                  output,
+                                                 command_id_copy,
+                                                 target_role_copy,
+                                                 target_node_copy,
+                                                 action_copy);
+        (void)sensor_mqtt_publish_timeline_event("result",
+                                                 "mesh_wait_started",
+                                                 "waiting_result",
+                                                 "Mesh command queued; awaiting OutputMessage",
                                                  command_id_copy,
                                                  target_role_copy,
                                                  target_node_copy,

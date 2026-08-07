@@ -79,3 +79,6 @@ const char *espagent_capability_risk_name(espagent_capability_risk_t risk);
 bool espagent_capability_mesh_action_allowed(const char *action,
                                              const char *target_role);
 bool espagent_capability_requires_guardian(const char *name_or_id);
+esp_err_t espagent_capability_write_contract_json(const char *name_or_id,
+                                                  char *output,
+                                                  size_t output_size);

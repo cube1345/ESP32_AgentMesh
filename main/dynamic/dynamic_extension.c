@@ -1,6 +1,7 @@
 #include "dynamic/dynamic_extension.h"
 
 #include "cJSON.h"
+#include "capability/capability_registry.h"
 #include "esp_log.h"
 #include "espagent_config.h"
 #include "lua/espagent_lua_runtime.h"
@@ -132,6 +133,22 @@ esp_err_t dynamic_extension_build_catalog(char *buf, size_t size)
             cJSON_AddStringToObject(obj, "device", device);
             cJSON_AddStringToObject(obj, "file", entry->d_name);
             cJSON_AddStringToObject(obj, "dir", dir_path);
+            cJSON *contracts = cJSON_CreateArray();
+            if (contracts) {
+                char contract[2048] = {0};
+                if (espagent_capability_write_contract_json("virtual_device_read",
+                                                            contract, sizeof(contract)) == ESP_OK) {
+                    cJSON *item = cJSON_Parse(contract);
+                    if (item) cJSON_AddItemToArray(contracts, item);
+                }
+                memset(contract, 0, sizeof(contract));
+                if (espagent_capability_write_contract_json("virtual_device_control",
+                                                            contract, sizeof(contract)) == ESP_OK) {
+                    cJSON *item = cJSON_Parse(contract);
+                    if (item) cJSON_AddItemToArray(contracts, item);
+                }
+                cJSON_AddItemToObject(obj, "capability_contracts", contracts);
+            }
             cJSON_AddItemToArray(devices, obj);
         }
         closedir(dir);

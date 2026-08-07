@@ -314,3 +314,37 @@ bool espagent_capability_requires_guardian(const char *name_or_id)
     const espagent_capability_descriptor_t *cap = espagent_capability_find(name_or_id);
     return cap ? cap->requires_guardian : false;
 }
+
+esp_err_t espagent_capability_write_contract_json(const char *name_or_id,
+                                                  char *output,
+                                                  size_t output_size)
+{
+    if (!output || output_size == 0) return ESP_ERR_INVALID_ARG;
+    output[0] = '\0';
+    const espagent_capability_descriptor_t *cap = espagent_capability_find(name_or_id);
+    if (!cap) return ESP_ERR_NOT_FOUND;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return ESP_ERR_NO_MEM;
+    cJSON_AddStringToObject(root, "name", cap->name);
+    cJSON_AddStringToObject(root, "version", cap->version ? cap->version : "1.0");
+    cJSON_AddStringToObject(root, "role", cap->role ? cap->role : ESPAGENT_ROLE_COORDINATOR);
+    cJSON_AddStringToObject(root, "risk", espagent_capability_risk_name(cap->risk));
+    cJSON_AddNumberToObject(root, "timeout_ms", cap->timeout_ms ? cap->timeout_ms : 3000);
+    cJSON_AddBoolToObject(root, "idempotent", cap->idempotent);
+    cJSON_AddBoolToObject(root, "requires_guardian", cap->requires_guardian);
+    cJSON_AddStringToObject(root, "family", cap->family ? cap->family : "utility");
+    cJSON *schema = cJSON_Parse(cap->input_schema_json ? cap->input_schema_json : "{}");
+    if (schema) cJSON_AddItemToObject(root, "input_schema", schema);
+
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) return ESP_ERR_NO_MEM;
+    if (strlen(json) >= output_size) {
+        cJSON_free(json);
+        return ESP_ERR_NO_MEM;
+    }
+    snprintf(output, output_size, "%s", json);
+    cJSON_free(json);
+    return ESP_OK;
+}

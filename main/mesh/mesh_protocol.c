@@ -69,6 +69,21 @@ static bool json_bool(cJSON *root, const char *key, bool default_value)
     return cJSON_IsTrue(item);
 }
 
+static espagent_task_status_t json_task_status(cJSON *root)
+{
+    const char *status = json_string(root, "task_status");
+    if (!status) return ESPAGENT_TASK_QUEUED;
+    if (strcmp(status, "created") == 0) return ESPAGENT_TASK_CREATED;
+    if (strcmp(status, "policy_pending") == 0) return ESPAGENT_TASK_POLICY_PENDING;
+    if (strcmp(status, "running") == 0) return ESPAGENT_TASK_RUNNING;
+    if (strcmp(status, "waiting_result") == 0) return ESPAGENT_TASK_WAITING_RESULT;
+    if (strcmp(status, "succeeded") == 0) return ESPAGENT_TASK_SUCCEEDED;
+    if (strcmp(status, "failed") == 0) return ESPAGENT_TASK_FAILED;
+    if (strcmp(status, "expired") == 0) return ESPAGENT_TASK_EXPIRED;
+    if (strcmp(status, "cancelled") == 0) return ESPAGENT_TASK_CANCELLED;
+    return ESPAGENT_TASK_QUEUED;
+}
+
 static esp_err_t copy_args_json(cJSON *root, espagent_mesh_command_t *out)
 {
     const char *args_json = json_string(root, "args_json");
@@ -162,12 +177,15 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     out->safety_level = json_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
     out->require_ack = json_bool(root, "require_ack", true);
     copy_field(out->task.task_id, sizeof(out->task.task_id), json_string(root, "task_id"));
+    if (!out->task.task_id[0] && out->command_id[0]) {
+        snprintf(out->task.task_id, sizeof(out->task.task_id), "task-%.34s", out->command_id);
+    }
     copy_field(out->task.parent_task_id, sizeof(out->task.parent_task_id), json_string(root, "parent_task_id"));
     copy_field(out->task.source_channel, sizeof(out->task.source_channel), json_string(root, "source_channel"));
     copy_field(out->task.source_chat_id, sizeof(out->task.source_chat_id), json_string(root, "source_chat_id"));
     out->task.deadline_ms = json_i64(root, "deadline_ms", out->ts_ms + out->ttl_ms);
     out->task.retry_count = (uint16_t)json_int(root, "retry_count", 0);
-    out->task.status = ESPAGENT_TASK_QUEUED;
+    out->task.status = json_task_status(root);
     copy_field(out->task.command_id, sizeof(out->task.command_id), out->command_id);
     copy_field(out->task.trace_id, sizeof(out->task.trace_id), out->trace_id);
     copy_field(out->task.target_role, sizeof(out->task.target_role), out->target_role);
