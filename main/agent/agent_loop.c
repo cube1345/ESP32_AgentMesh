@@ -5034,6 +5034,8 @@ static void agent_loop_task(void *arg) {
                                             ESPAGENT_AGENT_STAGE_TOOL_VALIDATE, 3000);
       agent_log_heap_stage("before_tool", &turn_heap_start);
       (void)espagent_agent_state_transition(&turn_state,
+                                            ESPAGENT_AGENT_STAGE_POLICY_CHECK, 15000);
+      (void)espagent_agent_state_transition(&turn_state,
                                             ESPAGENT_AGENT_STAGE_TOOL_EXECUTE, 15000);
       cJSON *tool_results =
           build_tool_results(&resp, &msg, tool_output, TOOL_OUTPUT_SIZE,
