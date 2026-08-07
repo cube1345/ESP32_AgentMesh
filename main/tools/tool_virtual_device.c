@@ -3,6 +3,7 @@
 #include "espagent_config.h"
 #include "roles/role_config.h"
 #include "tools/gpio_policy.h"
+#include "tools/tool_environment.h"
 #include "tools/tool_mesh_command.h"
 
 #include "cJSON.h"
@@ -587,6 +588,73 @@ static esp_err_t decode_reading(const virtual_i2c_device_t *cfg,
     return ESP_OK;
 }
 
+static esp_err_t try_shared_environment_i2c_read(const virtual_i2c_device_t *cfg,
+                                                char *output,
+                                                size_t output_size)
+{
+    bool is_aht = strcmp(cfg->decode_type, "aht20_temp_humidity") == 0 &&
+                  cfg->address == ESPAGENT_AHT10_DEFAULT_ADDR &&
+                  cfg->sda_gpio == ESPAGENT_AHT10_DEFAULT_SDA_GPIO &&
+                  cfg->scl_gpio == ESPAGENT_AHT10_DEFAULT_SCL_GPIO;
+    bool is_bh1750 = strcmp(cfg->decode_type, "raw_u16_be") == 0 &&
+                     cfg->address == ESPAGENT_BH1750_DEFAULT_ADDR &&
+                     cfg->sda_gpio == ESPAGENT_BH1750_DEFAULT_SDA_GPIO &&
+                     cfg->scl_gpio == ESPAGENT_BH1750_DEFAULT_SCL_GPIO;
+    if (!is_aht && !is_bh1750) {
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    esp_err_t last_err = ESP_ERR_NOT_FOUND;
+    char status[96] = {0};
+    tool_environment_values_t values = {0};
+    for (int attempt = 0; attempt < 5; attempt++) {
+        memset(&values, 0, sizeof(values));
+        status[0] = '\0';
+        last_err = tool_environment_read_values(&values, status, sizeof(status));
+        if (last_err == ESP_OK &&
+            is_aht &&
+            values.temperature_c_x10 != -1 &&
+            values.humidity_percent_x10 != -1) {
+            snprintf(output, output_size,
+                     "OK: virtual_device_read device=%s protocol=i2c/shared_env addr=0x%02x SDA=%d SCL=%d -> temperature=%.2f C humidity=%.2f %%RH source=env_mon [%s]",
+                     cfg->device,
+                     cfg->address,
+                     cfg->sda_gpio,
+                     cfg->scl_gpio,
+                     (double)values.temperature_c_x10 / 10.0,
+                     (double)values.humidity_percent_x10 / 10.0,
+                     status);
+            ESP_LOGI(TAG, "virtual_device_read reused environment sensor path result=%s", output);
+            return ESP_OK;
+        }
+        if (last_err == ESP_OK &&
+            is_bh1750 &&
+            values.light_lux_x10 != -1) {
+            snprintf(output, output_size,
+                     "OK: virtual_device_read device=%s protocol=i2c/shared_env addr=0x%02x SDA=%d SCL=%d -> %s=%.3f %s raw=%d source=env_mon [%s]",
+                     cfg->device,
+                     cfg->address,
+                     cfg->sda_gpio,
+                     cfg->scl_gpio,
+                     cfg->field[0] ? cfg->field : "light_lux",
+                     (double)values.light_lux_x10 / 10.0,
+                     cfg->unit[0] ? cfg->unit : "lux",
+                     values.light_raw,
+                     status);
+            ESP_LOGI(TAG, "virtual_device_read reused environment light path result=%s", output);
+            return ESP_OK;
+        }
+        vTaskDelay(pdMS_TO_TICKS(120));
+    }
+
+    snprintf(output, output_size,
+             "Error: shared environment read unavailable for device=%s after retries (%s, %s)",
+             cfg->device,
+             esp_err_to_name(last_err),
+             status[0] ? status : "no status");
+    return last_err == ESP_OK ? ESP_ERR_INVALID_RESPONSE : last_err;
+}
+
 static esp_err_t execute_i2c_manifest(cJSON *manifest,
                                       const virtual_i2c_device_t *cfg,
                                       char *output,
@@ -601,6 +669,11 @@ static esp_err_t execute_i2c_manifest(cJSON *manifest,
     if (op_count <= 0 || op_count > I2C_OP_MAX) {
         snprintf(output, output_size, "Error: operations count must be 1..%d", I2C_OP_MAX);
         return ESP_ERR_INVALID_SIZE;
+    }
+
+    esp_err_t shared_err = try_shared_environment_i2c_read(cfg, output, output_size);
+    if (shared_err == ESP_OK) {
+        return ESP_OK;
     }
 
     i2c_master_bus_handle_t bus = NULL;
