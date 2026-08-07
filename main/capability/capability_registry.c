@@ -1,6 +1,7 @@
 #include "capability/capability_registry.h"
 
 #include "capability/role_capability_profile.h"
+#include "roles/role_config.h"
 #include "cJSON.h"
 #include "esp_log.h"
 
@@ -71,6 +72,17 @@ static const char *legacy_family_for_tool(const char *name)
         return "control";
     }
     return "utility";
+}
+
+static const char *legacy_role_for_tool(const char *name)
+{
+    const char *family = legacy_family_for_tool(name);
+    if (streq(family, "control")) return ESPAGENT_ROLE_CONTROL;
+    if (streq(family, "sensor")) return ESPAGENT_ROLE_SENSOR;
+    if (streq(name, "guardian_approval_list") ||
+        streq(name, "guardian_approval_confirm") ||
+        streq(name, "guardian_approval_deny")) return ESPAGENT_ROLE_GUARDIAN;
+    return ESPAGENT_ROLE_COORDINATOR;
 }
 
 static espagent_capability_risk_t legacy_risk_for_tool(const char *name)
@@ -161,9 +173,14 @@ esp_err_t espagent_capability_register_legacy_tool(const char *name,
     espagent_capability_descriptor_t cap = {
         .id = name,
         .name = name,
+        .version = "1.0",
+        .role = legacy_role_for_tool(name),
         .family = legacy_family_for_tool(name),
         .description = description,
         .input_schema_json = input_schema_json,
+        .timeout_ms = 3000,
+        .idempotent = false,
+        .requires_guardian = legacy_risk_for_tool(name) == ESPAGENT_CAP_RISK_CONTROL,
         .flags = legacy_flags_for_tool(name),
         .risk = legacy_risk_for_tool(name),
         .execute = execute,
@@ -221,9 +238,14 @@ char *espagent_capability_build_llm_tools_json(void)
             continue;
         }
         cJSON_AddStringToObject(tool, "name", cap->name);
+        cJSON_AddStringToObject(tool, "version", cap->version ? cap->version : "1.0");
+        cJSON_AddStringToObject(tool, "role", cap->role ? cap->role : ESPAGENT_ROLE_COORDINATOR);
         cJSON_AddStringToObject(tool, "description", cap->description ? cap->description : "");
         cJSON_AddStringToObject(tool, "family", cap->family ? cap->family : "utility");
         cJSON_AddStringToObject(tool, "risk", espagent_capability_risk_name(cap->risk));
+        cJSON_AddNumberToObject(tool, "timeout_ms", cap->timeout_ms ? cap->timeout_ms : 3000);
+        cJSON_AddBoolToObject(tool, "idempotent", cap->idempotent);
+        cJSON_AddBoolToObject(tool, "requires_guardian", cap->requires_guardian);
 
         cJSON *schema = cJSON_Parse(cap->input_schema_json ? cap->input_schema_json : "{}");
         if (schema) {
@@ -267,4 +289,28 @@ const char *espagent_capability_risk_name(espagent_capability_risk_t risk)
     default:
         return "unknown";
     }
+}
+
+bool espagent_capability_mesh_action_allowed(const char *action,
+                                             const char *target_role)
+{
+    if (!action || !action[0]) return false;
+    /* These are protocol capabilities, not local tools, but remain contracted. */
+    if (streq(action, "control_state") || streq(action, "control_emergency_stop") ||
+        streq(action, "control_clear_emergency_stop")) {
+        return !target_role || streq(target_role, ESPAGENT_ROLE_CONTROL);
+    }
+    if (streq(action, "guardian_approval_list") || streq(action, "guardian_approval_confirm") ||
+        streq(action, "guardian_approval_deny")) {
+        return !target_role || streq(target_role, ESPAGENT_ROLE_GUARDIAN);
+    }
+    const espagent_capability_descriptor_t *cap = espagent_capability_find(action);
+    if (!cap) return false;
+    return !target_role || !cap->role || streq(cap->role, target_role);
+}
+
+bool espagent_capability_requires_guardian(const char *name_or_id)
+{
+    const espagent_capability_descriptor_t *cap = espagent_capability_find(name_or_id);
+    return cap ? cap->requires_guardian : false;
 }

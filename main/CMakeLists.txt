@@ -11,6 +11,7 @@ set(ESPAGENT_CORE_SRCS
 
 set(ESPAGENT_AGENT_SRCS
     "agent/agent_loop.c"
+    "agent/agent_state_machine.c"
     "agent/context_builder.c"
     "agent/slash_command.c"
     "capability/capability_registry.c"

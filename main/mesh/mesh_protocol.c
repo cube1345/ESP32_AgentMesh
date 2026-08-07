@@ -11,6 +11,22 @@
 #include <stdio.h>
 #include <string.h>
 
+const char *espagent_task_status_name(espagent_task_status_t status)
+{
+    switch (status) {
+    case ESPAGENT_TASK_CREATED: return "created";
+    case ESPAGENT_TASK_POLICY_PENDING: return "policy_pending";
+    case ESPAGENT_TASK_QUEUED: return "queued";
+    case ESPAGENT_TASK_RUNNING: return "running";
+    case ESPAGENT_TASK_WAITING_RESULT: return "waiting_result";
+    case ESPAGENT_TASK_SUCCEEDED: return "succeeded";
+    case ESPAGENT_TASK_FAILED: return "failed";
+    case ESPAGENT_TASK_EXPIRED: return "expired";
+    case ESPAGENT_TASK_CANCELLED: return "cancelled";
+    default: return "unknown";
+    }
+}
+
 static void set_err(char *err_buf, size_t err_buf_size, const char *msg)
 {
     if (err_buf && err_buf_size > 0) {
@@ -145,6 +161,16 @@ esp_err_t espagent_mesh_parse_command_json(const char *json,
     out->ttl_ms = json_int(root, "ttl_ms", 30000);
     out->safety_level = json_int(root, "safety_level", ESPAGENT_MESH_SAFETY_MEDIUM);
     out->require_ack = json_bool(root, "require_ack", true);
+    copy_field(out->task.task_id, sizeof(out->task.task_id), json_string(root, "task_id"));
+    copy_field(out->task.parent_task_id, sizeof(out->task.parent_task_id), json_string(root, "parent_task_id"));
+    copy_field(out->task.source_channel, sizeof(out->task.source_channel), json_string(root, "source_channel"));
+    copy_field(out->task.source_chat_id, sizeof(out->task.source_chat_id), json_string(root, "source_chat_id"));
+    out->task.deadline_ms = json_i64(root, "deadline_ms", out->ts_ms + out->ttl_ms);
+    out->task.retry_count = (uint16_t)json_int(root, "retry_count", 0);
+    out->task.status = ESPAGENT_TASK_QUEUED;
+    copy_field(out->task.command_id, sizeof(out->task.command_id), out->command_id);
+    copy_field(out->task.trace_id, sizeof(out->task.trace_id), out->trace_id);
+    copy_field(out->task.target_role, sizeof(out->task.target_role), out->target_role);
 
     esp_err_t args_err = copy_args_json(root, out);
     cJSON_Delete(root);

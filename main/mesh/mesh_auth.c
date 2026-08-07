@@ -55,7 +55,7 @@ static esp_err_t build_canonical(const espagent_mesh_command_t *cmd,
     }
     int n = snprintf(buf,
                      buf_size,
-                     "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%d\n%d\n%lld",
+                     "%s\n%s\n%s\n%s\n%s\n%s\n%s\n%d\n%d\n%lld\n%s\n%s\n%s\n%s\n%lld\n%u",
                      cmd->command_id,
                      cmd->trace_id,
                      cmd->target_node,
@@ -65,7 +65,13 @@ static esp_err_t build_canonical(const espagent_mesh_command_t *cmd,
                      cmd->nonce,
                      cmd->ttl_ms,
                      cmd->safety_level,
-                     (long long)cmd->ts_ms);
+                     (long long)cmd->ts_ms,
+                     cmd->task.task_id,
+                     cmd->task.parent_task_id,
+                     cmd->task.source_channel,
+                     cmd->task.source_chat_id,
+                     (long long)cmd->task.deadline_ms,
+                     (unsigned)cmd->task.retry_count);
     return (n > 0 && (size_t)n < buf_size) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -110,7 +116,7 @@ static esp_err_t sign_with_key(const espagent_mesh_command_t *cmd,
     if (!cmd) {
         return ESP_ERR_INVALID_ARG;
     }
-    char canonical[640] = {0};
+    char canonical[896] = {0};
     esp_err_t err = build_canonical(cmd, canonical, sizeof(canonical));
     if (err != ESP_OK) {
         return err;

@@ -39,9 +39,14 @@ enum {
 typedef struct {
     const char *id;
     const char *name;
+    const char *version;
+    const char *role;
     const char *family;
     const char *description;
     const char *input_schema_json;
+    uint32_t timeout_ms;
+    bool idempotent;
+    bool requires_guardian;
     uint32_t flags;
     espagent_capability_risk_t risk;
     espagent_capability_execute_fn execute;
@@ -69,3 +74,8 @@ char *espagent_capability_build_llm_tools_json(void);
 void espagent_capability_list(const espagent_capability_descriptor_t **items, int *count);
 
 const char *espagent_capability_risk_name(espagent_capability_risk_t risk);
+
+/* Mesh, Lua, sandbox and tool callers use this same action contract. */
+bool espagent_capability_mesh_action_allowed(const char *action,
+                                             const char *target_role);
+bool espagent_capability_requires_guardian(const char *name_or_id);

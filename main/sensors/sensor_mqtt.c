@@ -175,6 +175,19 @@ static void stateboard_note_event(const char *event_type,
 static bool mqtt_coordinator_background_housekeeping_allowed(const char *reason);
 static void maybe_forward_guardian_notice_payload(const char *payload, size_t payload_len);
 
+static const char *task_result_status_from_event(const char *status)
+{
+    if (!status || !status[0]) return "created";
+    if (strcmp(status, "ok") == 0 || strcmp(status, "allowed") == 0) return "succeeded";
+    if (strcmp(status, "timeout") == 0) return "expired";
+    if (strcmp(status, "cancelled") == 0) return "cancelled";
+    if (strcmp(status, "queued") == 0) return "queued";
+    if (strcmp(status, "running") == 0) return "running";
+    if (strcmp(status, "waiting_result") == 0) return "waiting_result";
+    if (strcmp(status, "policy_pending") == 0) return "policy_pending";
+    return "failed";
+}
+
 static size_t sensor_mqtt_pub_queue_depth_for_role(void)
 {
     if (espagent_role_is_coordinator()) {
@@ -1422,7 +1435,13 @@ esp_err_t sensor_mqtt_publish_output_message(const char *event,
     json_add_optional_string(root, "command_id", command_id);
     json_add_optional_string(root, "trace_id", trace_id);
     json_add_optional_string(root, "action", action);
+    if (command_id && command_id[0]) {
+        char task_id[ESPAGENT_MESH_ID_MAX + 8] = {0};
+        snprintf(task_id, sizeof(task_id), "task-%s", command_id);
+        cJSON_AddStringToObject(root, "task_id", task_id);
+    }
     cJSON_AddStringToObject(root, "status", result_err == ESP_OK ? "ok" : "error");
+    cJSON_AddStringToObject(root, "result_status", result_err == ESP_OK ? "succeeded" : "failed");
     cJSON_AddStringToObject(root, "esp_err", esp_err_to_name(result_err));
     cJSON_AddStringToObject(root, "summary", summary ? summary : "");
 
@@ -1518,8 +1537,14 @@ esp_err_t sensor_mqtt_publish_timeline_event(const char *phase,
     cJSON_AddStringToObject(root, "event", event_type ? event_type : "event");
     cJSON_AddStringToObject(root, "phase", phase ? phase : "");
     cJSON_AddStringToObject(root, "status", status ? status : "");
+    cJSON_AddStringToObject(root, "result_status", task_result_status_from_event(status));
     cJSON_AddStringToObject(root, "summary", summary ? summary : "");
     json_add_optional_string(root, "command_id", command_id);
+    if (command_id && command_id[0]) {
+        char task_id[ESPAGENT_MESH_ID_MAX + 8] = {0};
+        snprintf(task_id, sizeof(task_id), "task-%s", command_id);
+        cJSON_AddStringToObject(root, "task_id", task_id);
+    }
     json_add_optional_string(root, "target_role", target_role);
     json_add_optional_string(root, "target_node", target_node);
     json_add_optional_string(root, "action", action);

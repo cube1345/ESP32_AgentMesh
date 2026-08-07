@@ -1,5 +1,6 @@
 #include "agent_loop.h"
 #include "agent/context_builder.h"
+#include "agent/agent_state_machine.h"
 #include "agent/slash_command.h"
 #include "bus/message_bus.h"
 #include "llm/llm_proxy.h"
@@ -17,6 +18,7 @@
 #include "cJSON.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <ctype.h>
@@ -4616,6 +4618,16 @@ static void agent_loop_task(void *arg) {
     const agent_heap_snapshot_t turn_heap_start = agent_heap_snapshot();
     agent_log_heap_stage("turn_start", &turn_heap_start);
 
+    char turn_trace_id[ESPAGENT_MESH_TRACE_MAX] = {0};
+    snprintf(turn_trace_id, sizeof(turn_trace_id), "turn-%lld",
+             (long long)(esp_timer_get_time() / 1000));
+    espagent_agent_state_t turn_state;
+    espagent_agent_state_init(&turn_state, turn_trace_id, msg.channel, msg.chat_id,
+                              ESPAGENT_CONTEXT_BUF_SIZE);
+    ESP_LOGI(TAG, "AGENT_STAGE trace_id=%s stage=%s timeout_ms=%u",
+             turn_state.trace_id, espagent_agent_stage_name(turn_state.stage),
+             (unsigned)turn_state.stage_timeout_ms);
+
     ESP_LOGI(TAG, "Processing message from %s:%s", msg.channel, msg.chat_id);
     ESP_LOGI(TAG,
              "=== CONV ==================================================");
@@ -4825,6 +4837,8 @@ static void agent_loop_task(void *arg) {
     tool_summary[0] = '\0';
     tool_fallback[0] = '\0';
 
+    (void)espagent_agent_state_transition(&turn_state,
+                                          ESPAGENT_AGENT_STAGE_BUILD_CONTEXT, 3000);
     agent_log_heap_stage("before_route", &turn_heap_start);
     if (!try_execute_deterministic_skill_read_request(&msg, &final_text) &&
         !try_execute_deterministic_skill_rule_request(
@@ -4920,6 +4934,8 @@ static void agent_loop_task(void *arg) {
       if (espagent_role_is_coordinator()) {
         espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
       }
+      (void)espagent_agent_state_transition(&turn_state,
+                                            ESPAGENT_AGENT_STAGE_MODEL_CALL, 30000);
       agent_log_heap_stage("before_llm", &turn_heap_start);
       err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
       if (compact_messages) {
@@ -5014,11 +5030,17 @@ static void agent_loop_task(void *arg) {
       cJSON_AddItemToArray(messages, asst_msg);
 
       /* Execute tools and append results */
+      (void)espagent_agent_state_transition(&turn_state,
+                                            ESPAGENT_AGENT_STAGE_TOOL_VALIDATE, 3000);
       agent_log_heap_stage("before_tool", &turn_heap_start);
+      (void)espagent_agent_state_transition(&turn_state,
+                                            ESPAGENT_AGENT_STAGE_TOOL_EXECUTE, 15000);
       cJSON *tool_results =
           build_tool_results(&resp, &msg, tool_output, TOOL_OUTPUT_SIZE,
                              tool_summary, TOOL_SUMMARY_SIZE,
                              tool_fallback, TOOL_OUTPUT_SIZE + 512);
+      (void)espagent_agent_state_transition(&turn_state,
+                                            ESPAGENT_AGENT_STAGE_RESULT_VALIDATE, 5000);
       agent_log_heap_stage("after_tool", &turn_heap_start);
       cJSON *result_msg = cJSON_CreateObject();
       cJSON_AddStringToObject(result_msg, "role", "user");
@@ -5072,6 +5094,10 @@ static void agent_loop_task(void *arg) {
     }
 
     /* 5. Send response */
+    (void)espagent_agent_state_transition(&turn_state,
+                                          ESPAGENT_AGENT_STAGE_FINALIZE, 3000);
+    ESP_LOGI(TAG, "AGENT_STAGE trace_id=%s stage=%s",
+             turn_state.trace_id, espagent_agent_stage_name(turn_state.stage));
     if (final_text && final_text[0]) {
       if (proactive_turn && text_is_proactive_no_message(final_text)) {
         ESP_LOGI(TAG, "Proactive check chose no message");

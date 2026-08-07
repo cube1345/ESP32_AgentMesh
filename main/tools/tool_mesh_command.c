@@ -4,6 +4,7 @@
 #include "esp_log.h"
 #include "espagent_config.h"
 #include "bus/message_bus.h"
+#include "capability/capability_registry.h"
 #include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
 #include "net/net_guard.h"
@@ -655,6 +656,14 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     copy_text(action_copy, sizeof(action_copy), action);
     copy_text(target_role_copy, sizeof(target_role_copy), target_role);
     copy_text(target_node_copy, sizeof(target_node_copy), target_node);
+    if (strcmp(action_copy, "agent_task") != 0 &&
+        !espagent_capability_mesh_action_allowed(action_copy, target_role_copy)) {
+        cJSON_Delete(root);
+        snprintf(output, output_size,
+                 "Error: capability contract rejects action=%s target_role=%s",
+                 action_copy, target_role_copy);
+        return ESP_ERR_INVALID_ARG;
+    }
 
     char topic[160] = {0};
     esp_err_t topic_err = ESP_OK;
@@ -737,9 +746,26 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     copy_text(reply_channel_copy, sizeof(reply_channel_copy), reply_channel);
     copy_text(reply_chat_id_copy, sizeof(reply_chat_id_copy), reply_chat_id);
 
+    const char *parent_task_id = json_string(root, "parent_task_id");
+    char task_id_copy[ESPAGENT_MESH_TASK_ID_MAX] = {0};
+    const char *task_id = json_string(root, "task_id");
+    if (!task_id || !task_id[0]) {
+        snprintf(task_id_copy, sizeof(task_id_copy), "task-%s", command_id_copy);
+        task_id = task_id_copy;
+    }
+    char parent_task_id_copy[ESPAGENT_MESH_ID_MAX] = {0};
+    copy_text(parent_task_id_copy, sizeof(parent_task_id_copy), parent_task_id);
+
     int64_t ts_ms = esp_timer_get_time() / 1000;
     cJSON_AddStringToObject(cmd, "command_id", command_id_copy);
     cJSON_AddStringToObject(cmd, "trace_id", trace_id_copy);
+    cJSON_AddStringToObject(cmd, "task_id", task_id);
+    if (parent_task_id_copy[0]) cJSON_AddStringToObject(cmd, "parent_task_id", parent_task_id_copy);
+    if (reply_channel_copy[0]) cJSON_AddStringToObject(cmd, "source_channel", reply_channel_copy);
+    if (reply_chat_id_copy[0]) cJSON_AddStringToObject(cmd, "source_chat_id", reply_chat_id_copy);
+    cJSON_AddNumberToObject(cmd, "deadline_ms", (double)(ts_ms + ttl_ms));
+    cJSON_AddNumberToObject(cmd, "retry_count", 0);
+    cJSON_AddStringToObject(cmd, "task_status", "queued");
     cJSON_AddStringToObject(cmd, "nonce", nonce_copy);
     if (target_node_copy[0]) {
         cJSON_AddStringToObject(cmd, "target_node", target_node_copy);
@@ -764,6 +790,15 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     espagent_mesh_command_t sign_cmd = {0};
     snprintf(sign_cmd.command_id, sizeof(sign_cmd.command_id), "%s", command_id_copy);
     snprintf(sign_cmd.trace_id, sizeof(sign_cmd.trace_id), "%s", trace_id_copy);
+    snprintf(sign_cmd.task.task_id, sizeof(sign_cmd.task.task_id), "%s", task_id);
+    snprintf(sign_cmd.task.parent_task_id, sizeof(sign_cmd.task.parent_task_id), "%s", parent_task_id_copy);
+    snprintf(sign_cmd.task.command_id, sizeof(sign_cmd.task.command_id), "%s", command_id_copy);
+    snprintf(sign_cmd.task.trace_id, sizeof(sign_cmd.task.trace_id), "%s", trace_id_copy);
+    snprintf(sign_cmd.task.source_channel, sizeof(sign_cmd.task.source_channel), "%s", reply_channel_copy);
+    snprintf(sign_cmd.task.source_chat_id, sizeof(sign_cmd.task.source_chat_id), "%s", reply_chat_id_copy);
+    snprintf(sign_cmd.task.target_role, sizeof(sign_cmd.task.target_role), "%s", target_role_copy);
+    sign_cmd.task.deadline_ms = ts_ms + ttl_ms;
+    sign_cmd.task.status = ESPAGENT_TASK_QUEUED;
     snprintf(sign_cmd.target_node, sizeof(sign_cmd.target_node), "%s", target_node_copy);
     snprintf(sign_cmd.target_role, sizeof(sign_cmd.target_role), "%s", target_role_copy);
     snprintf(sign_cmd.action, sizeof(sign_cmd.action), "%s", action_copy);
