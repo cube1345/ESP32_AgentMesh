@@ -106,7 +106,7 @@ esp_err_t espagent_agent_state_transition(espagent_agent_state_t *state,
     state->stage = next;
     state->stage_timeout_ms = timeout_ms;
     state->stage_started_ms = esp_timer_get_time() / 1000;
-    return ESP_OK;
+    return state->last_error;
 }
 
 bool espagent_agent_state_timed_out(const espagent_agent_state_t *state,

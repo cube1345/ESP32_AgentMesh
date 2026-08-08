@@ -31,6 +31,7 @@ set(ESPAGENT_AGENT_SRCS
 set(ESPAGENT_MESH_ROLE_SRCS
     "mesh/mesh_protocol.c"
     "mesh/mesh_auth.c"
+    "mesh/task_registry.c"
     "node/node_profile.c"
     "roles/role_config.c"
     "roles/coordinator_node.c"

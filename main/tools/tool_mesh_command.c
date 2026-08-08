@@ -7,6 +7,7 @@
 #include "capability/capability_registry.h"
 #include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
+#include "mesh/task_registry.h"
 #include "net/net_guard.h"
 #include "sensors/sensor_mqtt.h"
 #include "tools/tool_sandbox.h"
@@ -805,7 +806,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     snprintf(sign_cmd.task.source_chat_id, sizeof(sign_cmd.task.source_chat_id), "%s", reply_chat_id_copy);
     snprintf(sign_cmd.task.target_role, sizeof(sign_cmd.task.target_role), "%s", target_role_copy);
     sign_cmd.task.deadline_ms = ts_ms + ttl_ms;
-    sign_cmd.task.status = ESPAGENT_TASK_QUEUED;
+    sign_cmd.task.status = ESPAGENT_TASK_POLICY_PENDING;
     snprintf(sign_cmd.target_node, sizeof(sign_cmd.target_node), "%s", target_node_copy);
     snprintf(sign_cmd.target_role, sizeof(sign_cmd.target_role), "%s", target_role_copy);
     snprintf(sign_cmd.action, sizeof(sign_cmd.action), "%s", action_copy);
@@ -818,6 +819,7 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
     char *args_printed = args_for_sign ? cJSON_PrintUnformatted(args_for_sign) : NULL;
     snprintf(sign_cmd.args_json, sizeof(sign_cmd.args_json), "%s", args_printed ? args_printed : "{}");
     cJSON_free(args_printed);
+    (void)espagent_task_registry_upsert(&sign_cmd.task, "Guardian policy check pending");
     char signature[ESPAGENT_MESH_SIGNATURE_MAX] = {0};
     esp_err_t sign_err = espagent_mesh_auth_sign_command(&sign_cmd, signature, sizeof(signature));
     if (sign_err != ESP_OK) {
@@ -867,6 +869,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                        policy_reason,
                                                        sizeof(policy_reason));
         if (policy_err != ESP_OK) {
+            (void)espagent_task_registry_update(command_id_copy, ESPAGENT_TASK_FAILED,
+                                                policy_reason);
             snprintf(output, output_size,
                      "Error: Guardian policy blocked mesh command action=%s command_id=%s reason=%s decision=%s",
                      action_copy, command_id_copy, policy_reason, policy_json[0] ? policy_json : "(none)");
@@ -891,9 +895,13 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                              target_role_copy,
                                              target_node_copy,
                                              action_copy);
+    sign_cmd.task.status = ESPAGENT_TASK_QUEUED;
+    (void)espagent_task_registry_upsert(&sign_cmd.task, "Guardian allowed; awaiting MQTT dispatch");
 
     esp_err_t dispatch_err = sensor_mqtt_wait_connected(12000);
     if (dispatch_err != ESP_OK) {
+        (void)espagent_task_registry_update(command_id_copy, ESPAGENT_TASK_FAILED,
+                                            "MQTT unavailable for Mesh dispatch");
         snprintf(output, output_size,
                  "Error: MQTT is not connected for mesh dispatch action=%s command_id=%s (%s)",
                  action_copy, command_id_copy, esp_err_to_name(dispatch_err));
@@ -915,6 +923,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                  target_role_copy,
                                                  require_ack);
     if (err == ESP_OK) {
+        (void)espagent_task_registry_update(command_id_copy, ESPAGENT_TASK_QUEUED,
+                                            "MQTT Mesh command queued");
         snprintf(output, output_size,
                  "OK: queued MQTT mesh command action=%s topic=%s command_id=%s",
                  action_copy, topic, command_id_copy);
@@ -934,6 +944,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
                                                  target_role_copy,
                                                  target_node_copy,
                                                  action_copy);
+        (void)espagent_task_registry_update(command_id_copy, ESPAGENT_TASK_WAITING_RESULT,
+                                            "Awaiting target OutputMessage");
         if (require_ack) {
             uint32_t wait_ms = ttl_ms > 0 ? (uint32_t)ttl_ms : 30000U;
             if (async_wait) {
@@ -987,6 +999,8 @@ esp_err_t tool_mesh_send_command_execute(const char *input_json,
             }
         }
     } else {
+        (void)espagent_task_registry_update(command_id_copy, ESPAGENT_TASK_FAILED,
+                                            "MQTT publish failed");
         snprintf(output, output_size,
                  "Error: failed to queue MQTT mesh command (%s)",
                  esp_err_to_name(err));

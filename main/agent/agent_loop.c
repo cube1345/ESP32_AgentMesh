@@ -4834,11 +4834,12 @@ static void agent_loop_task(void *arg) {
     bool sent_working_status = false;
     bool mesh_related_tool_seen = false;
     esp_err_t last_llm_err = ESP_OK;
+    esp_err_t stage_err = ESP_OK;
     tool_summary[0] = '\0';
     tool_fallback[0] = '\0';
 
-    (void)espagent_agent_state_transition(&turn_state,
-                                          ESPAGENT_AGENT_STAGE_BUILD_CONTEXT, 3000);
+    stage_err = espagent_agent_state_transition(&turn_state,
+                                                ESPAGENT_AGENT_STAGE_BUILD_CONTEXT, 3000);
     agent_log_heap_stage("before_route", &turn_heap_start);
     if (!try_execute_deterministic_skill_read_request(&msg, &final_text) &&
         !try_execute_deterministic_skill_rule_request(
@@ -4874,7 +4875,7 @@ static void agent_loop_task(void *arg) {
     }
     agent_log_heap_stage("after_route", &turn_heap_start);
 
-    while (!final_text && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
+    while (!final_text && stage_err == ESP_OK && iteration < ESPAGENT_AGENT_MAX_TOOL_ITER) {
       /* Send "working" indicator before each API call */
 #if ESPAGENT_AGENT_SEND_WORKING_STATUS
       if (!proactive_turn && !sent_working_status && !prefer_direct_reply &&
@@ -4934,8 +4935,11 @@ static void agent_loop_task(void *arg) {
       if (espagent_role_is_coordinator()) {
         espagent_net_guard_defer_background(AGENT_LLM_BACKGROUND_DEFER_MS);
       }
-      (void)espagent_agent_state_transition(&turn_state,
-                                            ESPAGENT_AGENT_STAGE_MODEL_CALL, 30000);
+      stage_err = espagent_agent_state_transition(&turn_state,
+                                                  ESPAGENT_AGENT_STAGE_MODEL_CALL, 30000);
+      if (stage_err != ESP_OK) {
+        break;
+      }
       agent_log_heap_stage("before_llm", &turn_heap_start);
       err = llm_chat_tools(system_prompt, llm_messages, active_tools_json, &resp);
       if (compact_messages) {
@@ -5030,19 +5034,29 @@ static void agent_loop_task(void *arg) {
       cJSON_AddItemToArray(messages, asst_msg);
 
       /* Execute tools and append results */
-      (void)espagent_agent_state_transition(&turn_state,
-                                            ESPAGENT_AGENT_STAGE_TOOL_VALIDATE, 3000);
+      stage_err = espagent_agent_state_transition(&turn_state,
+                                                  ESPAGENT_AGENT_STAGE_TOOL_VALIDATE, 3000);
+      if (stage_err != ESP_OK) {
+        llm_response_free(&resp);
+        break;
+      }
       agent_log_heap_stage("before_tool", &turn_heap_start);
-      (void)espagent_agent_state_transition(&turn_state,
-                                            ESPAGENT_AGENT_STAGE_POLICY_CHECK, 15000);
-      (void)espagent_agent_state_transition(&turn_state,
-                                            ESPAGENT_AGENT_STAGE_TOOL_EXECUTE, 15000);
+      stage_err = espagent_agent_state_transition(&turn_state,
+                                                  ESPAGENT_AGENT_STAGE_POLICY_CHECK, 15000);
+      if (stage_err == ESP_OK) {
+        stage_err = espagent_agent_state_transition(&turn_state,
+                                                    ESPAGENT_AGENT_STAGE_TOOL_EXECUTE, 15000);
+      }
+      if (stage_err != ESP_OK) {
+        llm_response_free(&resp);
+        break;
+      }
       cJSON *tool_results =
           build_tool_results(&resp, &msg, tool_output, TOOL_OUTPUT_SIZE,
                              tool_summary, TOOL_SUMMARY_SIZE,
                              tool_fallback, TOOL_OUTPUT_SIZE + 512);
-      (void)espagent_agent_state_transition(&turn_state,
-                                            ESPAGENT_AGENT_STAGE_RESULT_VALIDATE, 5000);
+      stage_err = espagent_agent_state_transition(&turn_state,
+                                                  ESPAGENT_AGENT_STAGE_RESULT_VALIDATE, 5000);
       agent_log_heap_stage("after_tool", &turn_heap_start);
       cJSON *result_msg = cJSON_CreateObject();
       cJSON_AddStringToObject(result_msg, "role", "user");
@@ -5050,6 +5064,9 @@ static void agent_loop_task(void *arg) {
       cJSON_AddItemToArray(messages, result_msg);
 
       llm_response_free(&resp);
+      if (stage_err != ESP_OK) {
+        break;
+      }
       iteration++;
 
       if (!final_text &&
@@ -5069,6 +5086,14 @@ static void agent_loop_task(void *arg) {
     cJSON_Delete(messages);
 
     if (!final_text) {
+      if (stage_err != ESP_OK) {
+        char stage_error[192] = {0};
+        snprintf(stage_error, sizeof(stage_error),
+                 "Agent stage %s failed for trace %s: %s",
+                 espagent_agent_stage_name(turn_state.stage), turn_state.trace_id,
+                 esp_err_to_name(stage_err));
+        final_text = strdup(stage_error);
+      } else
       if (tool_fallback[0]) {
         final_text = strdup(tool_fallback);
       } else if (tool_output[0]) {
@@ -5096,8 +5121,10 @@ static void agent_loop_task(void *arg) {
     }
 
     /* 5. Send response */
-    (void)espagent_agent_state_transition(&turn_state,
-                                          ESPAGENT_AGENT_STAGE_FINALIZE, 3000);
+    if (stage_err == ESP_OK) {
+      stage_err = espagent_agent_state_transition(&turn_state,
+                                                  ESPAGENT_AGENT_STAGE_FINALIZE, 3000);
+    }
     ESP_LOGI(TAG, "AGENT_STAGE trace_id=%s stage=%s",
              turn_state.trace_id, espagent_agent_stage_name(turn_state.stage));
     if (final_text && final_text[0]) {

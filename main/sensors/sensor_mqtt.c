@@ -6,6 +6,7 @@
 #include "guardian/approval_queue.h"
 #include "mesh/mesh_auth.h"
 #include "mesh/mesh_protocol.h"
+#include "mesh/task_registry.h"
 #include "net/net_guard.h"
 #include "node/node_profile.h"
 #include "roles/role_config.h"
@@ -1168,6 +1169,17 @@ static void output_cache_store_json(cJSON *root)
         ESP_LOGI(TAG, "Cached OutputMessage command_id=%s", cmd->valuestring);
     }
 
+    const char *status = json_optional_string(root, "result_status");
+    if (!status[0]) status = json_optional_string(root, "status");
+    const char *summary = json_optional_string(root, "summary");
+    (void)espagent_task_registry_update(
+        cmd->valuestring,
+        strcmp(status, "succeeded") == 0 || strcmp(status, "ok") == 0
+            ? ESPAGENT_TASK_SUCCEEDED
+            : strcmp(status, "expired") == 0 ? ESPAGENT_TASK_EXPIRED
+                                               : ESPAGENT_TASK_FAILED,
+        summary);
+
     cJSON_free(json);
 }
 
@@ -1237,6 +1249,19 @@ static void policy_cache_maybe_store_payload(const char *payload, size_t payload
 
     if (policy_payload_is_decision(root)) {
         policy_cache_store_json(root);
+        const char *command_id = json_optional_string(root, "command_id");
+        const bool allowed = cJSON_IsTrue(cJSON_GetObjectItem(root, "allowed"));
+        const char *decision = json_optional_string(root, "decision");
+        const char *reason = json_optional_string(root, "reason");
+        if (command_id[0]) {
+            (void)espagent_task_registry_update(
+                command_id,
+                allowed ? ESPAGENT_TASK_QUEUED
+                        : strcmp(decision, "needs_confirmation") == 0
+                              ? ESPAGENT_TASK_POLICY_PENDING
+                              : ESPAGENT_TASK_FAILED,
+                reason);
+        }
     }
 
     cJSON_Delete(root);
@@ -1470,6 +1495,12 @@ esp_err_t sensor_mqtt_publish_output_message(const char *event,
     cJSON_AddNumberToObject(root, "ts_ms", (double)ts_ms);
 
     output_cache_store_json(root);
+    if (command_id && command_id[0]) {
+        (void)espagent_task_registry_update(command_id,
+                                            result_err == ESP_OK ? ESPAGENT_TASK_SUCCEEDED
+                                                                 : ESPAGENT_TASK_FAILED,
+                                            summary ? summary : result_text);
+    }
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -2959,6 +2990,10 @@ static void handle_mesh_command(const char *source, const char *payload, size_t 
                  cmd.action);
         return;
     }
+
+    cmd.task.status = ESPAGENT_TASK_RUNNING;
+    (void)espagent_task_registry_upsert(&cmd.task,
+                                        "Target role accepted Mesh command for execution");
 
     (void)sensor_mqtt_publish_timeline_event("execution",
                                              "mesh_command_running",

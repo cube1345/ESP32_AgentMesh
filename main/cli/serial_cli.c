@@ -16,6 +16,7 @@
 #include "drivers/max98357.h"
 #include "skills/skill_loader.h"
 #include "sensors/sensor_mqtt.h"
+#include "mesh/task_registry.h"
 #include "guardian/approval_queue.h"
 
 #include <string.h>
@@ -793,6 +794,18 @@ static int cmd_ir_stop_status(int argc, char **argv)
     return err == ESP_OK ? 0 : 1;
 }
 
+static int cmd_mesh_task_status(int argc, char **argv)
+{
+    if (argc != 2) {
+        printf("Usage: mesh_task_status <task_id|command_id>\n");
+        return 1;
+    }
+    char output[768] = {0};
+    esp_err_t err = espagent_task_registry_write_json(argv[1], output, sizeof(output));
+    printf("mesh_task_status: %s\n%s\n", esp_err_to_name(err), output);
+    return err == ESP_OK ? 0 : 1;
+}
+
 static int cmd_tool_exec(int argc, char **argv)
 {
     if (argc < 2) {
@@ -1551,6 +1564,13 @@ esp_err_t serial_cli_init(void)
         .func = &cmd_ir_stop_status,
     };
     esp_console_cmd_register(&ir_stop_status_cmd);
+
+    esp_console_cmd_t mesh_task_status_cmd = {
+        .command = "mesh_task_status",
+        .help = "Show live Mesh task metadata and correlated result by task_id or command_id",
+        .func = &cmd_mesh_task_status,
+    };
+    esp_console_cmd_register(&mesh_task_status_cmd);
 
     /* tool_exec */
     esp_console_cmd_t tool_exec_cmd = {
