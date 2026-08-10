@@ -20,6 +20,7 @@
 
 #include "espagent_config.h"
 #include "agent/agent_loop.h"
+#include "automation/automation_engine.h"
 #include "bus/message_bus.h"
 #include "cache/cache_store.h"
 #include "channels/feishu/feishu_bot.h"
@@ -350,6 +351,7 @@ esp_err_t espagent_app_init_subsystems(void)
     ESP_RETURN_ON_ERROR(memory_v2_init(), TAG, "memory_v2_init failed");
     ESP_RETURN_ON_ERROR(cache_store_init(), TAG, "cache_store_init failed");
     ESP_RETURN_ON_ERROR(skill_loader_init(), TAG, "skill_loader_init failed");
+    ESP_RETURN_ON_ERROR(automation_engine_init(), TAG, "automation_engine_init failed");
     ESP_RETURN_ON_ERROR(dynamic_extension_init(), TAG, "dynamic_extension_init failed");
     ESP_RETURN_ON_ERROR(espagent_device_registry_init(), TAG, "device_registry_init failed");
     ESP_RETURN_ON_ERROR(session_mgr_init(), TAG, "session_mgr_init failed");
@@ -507,6 +509,12 @@ esp_err_t espagent_app_start_network_services(void)
     ESP_RETURN_ON_ERROR(guardian_node_start(), TAG, "guardian_node_start failed");
 
     ESP_RETURN_ON_ERROR(sensor_mqtt_start(), TAG, "sensor_mqtt_start failed");
+
+    if (espagent_role_is_coordinator()) {
+        ESP_RETURN_ON_ERROR(automation_engine_start(), TAG, "automation_engine_start failed");
+    } else {
+        ESP_LOGI(TAG, "Automation engine skipped for role=%s", ESPAGENT_NODE_ROLE);
+    }
 
     if (espagent_role_runs_llm()) {
         ESP_RETURN_ON_ERROR(agent_loop_start(), TAG, "agent_loop_start failed");

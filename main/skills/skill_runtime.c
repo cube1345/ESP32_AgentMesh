@@ -1,6 +1,7 @@
 #include "skills/skill_runtime.h"
 
 #include "skills/skill_loader.h"
+#include "automation/automation_engine.h"
 #include "espagent_config.h"
 
 #include "cJSON.h"
@@ -296,9 +297,24 @@ esp_err_t skill_runtime_upsert(const char *name,
         return ESP_ERR_INVALID_ARG;
     }
 
+    char condition_message[256] = {0};
+    esp_err_t condition_err = automation_engine_sync_skill_condition(
+        name, content, condition_message, sizeof(condition_message));
+    if (condition_err != ESP_OK) {
+        if (message && message_size > 0) {
+            snprintf(message, message_size, "skill condition rejected: %s",
+                     condition_message[0] ? condition_message : esp_err_to_name(condition_err));
+        }
+        return condition_err;
+    }
+
     char path[160];
     esp_err_t err = build_skill_path(name, path, sizeof(path));
     if (err != ESP_OK) {
+        char cleanup_message[128] = {0};
+        (void)automation_engine_remove_skill_condition(name,
+                                                        cleanup_message,
+                                                        sizeof(cleanup_message));
         if (message && message_size > 0) {
             snprintf(message, message_size, "failed to build skill path for %s", name ? name : "(null)");
         }
@@ -307,6 +323,10 @@ esp_err_t skill_runtime_upsert(const char *name,
 
     FILE *f = fopen(path, "w");
     if (!f) {
+        char cleanup_message[128] = {0};
+        (void)automation_engine_remove_skill_condition(name,
+                                                        cleanup_message,
+                                                        sizeof(cleanup_message));
         if (message && message_size > 0) {
             snprintf(message, message_size, "cannot open %s for writing", path);
         }
@@ -317,6 +337,10 @@ esp_err_t skill_runtime_upsert(const char *name,
     size_t written = fwrite(content, 1, len, f);
     fclose(f);
     if (written != len) {
+        char cleanup_message[128] = {0};
+        (void)automation_engine_remove_skill_condition(name,
+                                                        cleanup_message,
+                                                        sizeof(cleanup_message));
         if (message && message_size > 0) {
             snprintf(message, message_size, "short write to %s (%d/%d bytes)",
                      path, (int)written, (int)len);
@@ -355,6 +379,11 @@ esp_err_t skill_runtime_delete(const char *name,
         }
         return ESP_ERR_INVALID_ARG;
     }
+
+    char condition_message[128] = {0};
+    (void)automation_engine_remove_skill_condition(name,
+                                                   condition_message,
+                                                   sizeof(condition_message));
 
     char path[160];
     esp_err_t err = build_skill_path(name, path, sizeof(path));

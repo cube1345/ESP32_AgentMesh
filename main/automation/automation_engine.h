@@ -20,3 +20,12 @@ esp_err_t automation_engine_list(char *output, size_t output_size);
 esp_err_t automation_engine_remove(const char *id,
                                    char *output,
                                    size_t output_size);
+
+esp_err_t automation_engine_sync_skill_condition(const char *skill_name,
+                                                 const char *content,
+                                                 char *output,
+                                                 size_t output_size);
+
+esp_err_t automation_engine_remove_skill_condition(const char *skill_name,
+                                                   char *output,
+                                                   size_t output_size);

@@ -17,6 +17,8 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <ctype.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,6 +56,7 @@ typedef struct {
     bool used;
     char id[24];
     char name[32];
+    char source_skill[49];
     bool enabled;
     automation_metric_t metric;
     float threshold;
@@ -72,8 +75,6 @@ static automation_workflow_t s_workflows[AUTOMATION_MAX_WORKFLOWS];
 static automation_rule_t s_rules[AUTOMATION_MAX_RULES];
 static SemaphoreHandle_t s_lock = NULL;
 static TaskHandle_t s_task = NULL;
-
-#define AUTOMATION_PERSIST_STACK 4096
 
 static void lock(void)
 {
@@ -462,6 +463,9 @@ static esp_err_t persist_rules_locked(void)
 
         cJSON_AddStringToObject(item, "id", rule->id);
         cJSON_AddStringToObject(item, "name", rule->name);
+        if (rule->source_skill[0]) {
+            cJSON_AddStringToObject(item, "source_skill", rule->source_skill);
+        }
         cJSON_AddBoolToObject(item, "enabled", rule->enabled);
         cJSON_AddStringToObject(item, "metric", automation_metric_name(rule->metric));
         cJSON_AddNumberToObject(item, "threshold", rule->threshold);
@@ -499,37 +503,6 @@ static esp_err_t persist_rules_locked(void)
     fclose(f);
     cJSON_free(json);
     ESP_LOGI(TAG, "Saved automation rules to %s", ESPAGENT_AUTOMATION_FILE);
-    return ESP_OK;
-}
-
-static void persist_rules_task(void *arg)
-{
-    (void)arg;
-    lock();
-    esp_err_t err = persist_rules_locked();
-    unlock();
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "Async automation rule persist failed: %s", esp_err_to_name(err));
-    }
-    vTaskDelete(NULL);
-}
-
-static esp_err_t schedule_rules_persist(void)
-{
-    BaseType_t ok = xTaskCreatePinnedToCore(persist_rules_task,
-                                           "auto_persist",
-                                           AUTOMATION_PERSIST_STACK,
-                                           NULL,
-                                           3,
-                                           NULL,
-                                           0);
-    if (ok != pdPASS) {
-        ESP_LOGW(TAG,
-                 "Async automation rule persist task create failed (free_internal=%u largest_internal=%u)",
-                 (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-        return ESP_ERR_NO_MEM;
-    }
     return ESP_OK;
 }
 
@@ -584,6 +557,8 @@ static esp_err_t load_rules_locked(void)
             rule->used = true;
             json_get_string(item, "id", rule->id, sizeof(rule->id));
             json_get_string(item, "name", rule->name, sizeof(rule->name));
+            json_get_string(item, "source_skill", rule->source_skill,
+                            sizeof(rule->source_skill));
             rule->enabled = json_get_bool(item, "enabled", true);
             char metric[32] = {0};
             json_get_string(item, "metric", metric, sizeof(metric));
@@ -610,23 +585,6 @@ static esp_err_t load_rules_locked(void)
 
     cJSON_Delete(root);
     ESP_LOGI(TAG, "Loaded automation rules");
-    return ESP_OK;
-}
-
-static esp_err_t clear_rule_slot_locked(int slot, const char *reason, char *id_out, size_t id_out_size)
-{
-    if (slot < 0 || slot >= AUTOMATION_MAX_RULES || !s_rules[slot].used) {
-        return ESP_ERR_NOT_FOUND;
-    }
-    char id[sizeof(s_rules[slot].id)] = {0};
-    snprintf(id, sizeof(id), "%s", s_rules[slot].id);
-    if (id_out && id_out_size > 0) {
-        snprintf(id_out, id_out_size, "%s", id);
-    }
-    memset(&s_rules[slot], 0, sizeof(s_rules[slot]));
-    ESP_LOGI(TAG, "Auto-cleared automation rule %s after %s",
-             id,
-             reason && reason[0] ? reason : "completion");
     return ESP_OK;
 }
 
@@ -826,34 +784,14 @@ static void rule_task(void *arg)
                                "act",
                                action_err == ESP_OK ? "ok" : "error",
                                action_output[0] ? action_output : "automation rule action executed");
-            bool removed = false;
-            char removed_id[sizeof(snapshot.id)] = {0};
             lock();
             if (s_rules[i].used && strcmp(s_rules[i].id, snapshot.id) == 0) {
-                esp_err_t clear_err = clear_rule_slot_locked(i, "first branch action", removed_id, sizeof(removed_id));
-                if (clear_err == ESP_OK) {
-                    removed = true;
-                } else {
-                    ESP_LOGW(TAG, "Failed to auto-clear rule %s: %s",
-                             snapshot.id,
-                             esp_err_to_name(clear_err));
+                s_rules[i].last_branch = current_branch;
+                if (action_err == ESP_OK) {
+                    s_rules[i].last_action_ms = now_ms;
                 }
             }
             unlock();
-            if (removed) {
-                esp_err_t persist_err = schedule_rules_persist();
-                if (persist_err != ESP_OK) {
-                    ESP_LOGW(TAG, "Failed to schedule persist for auto-cleared rule %s: %s",
-                             removed_id[0] ? removed_id : snapshot.id,
-                             esp_err_to_name(persist_err));
-                }
-            }
-            publish_rule_event(&snapshot,
-                               "cleanup",
-                               "ok",
-                               action_err == ESP_OK
-                                   ? "automation rule completed and auto-removed"
-                                   : "automation rule action failed and auto-removed");
             lock();
         }
         unlock();
@@ -1027,8 +965,11 @@ static esp_err_t add_rule_locked(cJSON *root, char *output, size_t output_size)
     rule->enabled = json_get_bool(root, "enabled", true);
     gen_id(rule->id, sizeof(rule->id), "rule");
     snprintf(rule->name, sizeof(rule->name), "%s", name);
+    json_get_string(root, "source_skill", rule->source_skill,
+                    sizeof(rule->source_skill));
     rule->interval_s = (uint32_t)json_get_int(root, "interval_s", 10);
     if (rule->interval_s < 1) rule->interval_s = 1;
+    if (rule->interval_s > 86400) rule->interval_s = 86400;
     rule->cooldown_s = (uint32_t)json_get_int(root, "cooldown_s", 30);
     if (rule->cooldown_s > 300) rule->cooldown_s = 300;
     rule->hysteresis = (float)json_get_double(root, "hysteresis_c", 1.0);
@@ -1056,7 +997,9 @@ static esp_err_t add_rule_locked(cJSON *root, char *output, size_t output_size)
 
     esp_err_t save_err = persist_rules_locked();
     if (save_err != ESP_OK) {
-        snprintf(output, output_size, "Error: created rule but failed to persist (%s)", esp_err_to_name(save_err));
+        memset(rule, 0, sizeof(*rule));
+        snprintf(output, output_size, "Error: failed to persist rule (%s)", esp_err_to_name(save_err));
+        return save_err;
     } else {
         snprintf(output, output_size,
                  "OK: rule %s created metric=%s threshold=%.2f interval=%us cooldown=%us",
@@ -1167,4 +1110,226 @@ esp_err_t automation_engine_remove(const char *id,
     unlock();
     snprintf(output, output_size, "Error: automation item %s not found", id);
     return ESP_ERR_NOT_FOUND;
+}
+
+static bool condition_value(const char *line, const char *key,
+                            char *out, size_t out_size)
+{
+    char pattern[48] = {0};
+    if (!line || !key || !out || out_size == 0) {
+        return false;
+    }
+    snprintf(pattern, sizeof(pattern), "%s=", key);
+    const char *p = strstr(line, pattern);
+    if (!p) {
+        return false;
+    }
+    p += strlen(pattern);
+    size_t len = 0;
+    while (p[len] && !isspace((unsigned char)p[len])) {
+        len++;
+    }
+    if (len == 0 || len >= out_size) {
+        return false;
+    }
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool automation_condition_action_allowed(const char *action)
+{
+    return action &&
+           (strcmp(action, "set_status_light") == 0 ||
+            strcmp(action, "ws2812_set") == 0 ||
+            strcmp(action, "set_curtain") == 0 ||
+            strcmp(action, "servo_write") == 0 ||
+            strcmp(action, "set_humidifier") == 0 ||
+            strcmp(action, "set_fan") == 0 ||
+            strcmp(action, "set_device_led") == 0 ||
+            strcmp(action, "gpio_write") == 0 ||
+            strcmp(action, "virtual_device_control") == 0);
+}
+
+static esp_err_t remove_skill_condition_locked(const char *skill_name,
+                                               char *output,
+                                               size_t output_size)
+{
+    bool removed = false;
+    for (int i = 0; i < AUTOMATION_MAX_RULES; i++) {
+        if (!s_rules[i].used ||
+            strcmp(s_rules[i].source_skill, skill_name) != 0) {
+            continue;
+        }
+        memset(&s_rules[i], 0, sizeof(s_rules[i]));
+        removed = true;
+    }
+    if (removed) {
+        esp_err_t err = persist_rules_locked();
+        if (err != ESP_OK) {
+            snprintf(output, output_size, "Error: skill condition removed but persist failed: %s",
+                     esp_err_to_name(err));
+            return err;
+        }
+    }
+    if (output && output_size > 0) {
+        snprintf(output, output_size, "%s",
+                 removed ? "OK: previous skill condition removed"
+                         : "OK: no previous skill condition");
+    }
+    return ESP_OK;
+}
+
+esp_err_t automation_engine_remove_skill_condition(const char *skill_name,
+                                                   char *output,
+                                                   size_t output_size)
+{
+    if (!skill_name || !skill_name[0]) {
+        snprintf(output, output_size, "Error: skill name is required");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (ensure_lock() != ESP_OK) {
+        snprintf(output, output_size, "Error: automation lock unavailable");
+        return ESP_ERR_NO_MEM;
+    }
+    lock();
+    esp_err_t err = remove_skill_condition_locked(skill_name, output, output_size);
+    unlock();
+    return err;
+}
+
+esp_err_t automation_engine_sync_skill_condition(const char *skill_name,
+                                                 const char *content,
+                                                 char *output,
+                                                 size_t output_size)
+{
+    if (!skill_name || !skill_name[0] || strlen(skill_name) >= 32 || !content) {
+        snprintf(output, output_size, "Error: invalid skill condition identity");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *directive = strstr(content, "@condition");
+    if (!directive) {
+        return automation_engine_remove_skill_condition(skill_name, output, output_size);
+    }
+    const char *line_end = strpbrk(directive, "\r\n");
+    size_t line_len = line_end ? (size_t)(line_end - directive) : strlen(directive);
+    if (line_len == 0 || line_len >= 1024) {
+        snprintf(output, output_size, "Error: @condition line is too long");
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    char line[1024] = {0};
+    memcpy(line, directive, line_len);
+    line[line_len] = '\0';
+    char metric[32] = {0};
+    char threshold[24] = {0};
+    char hysteresis[24] = {0};
+    char interval[24] = {0};
+    char cooldown[24] = {0};
+    char above_action[48] = {0};
+    char below_action[48] = {0};
+    char above_args[320] = {0};
+    char below_args[320] = {0};
+    if (!condition_value(line, "metric", metric, sizeof(metric)) ||
+        !condition_value(line, "threshold", threshold, sizeof(threshold)) ||
+        !condition_value(line, "above_action", above_action, sizeof(above_action)) ||
+        !condition_value(line, "above_args", above_args, sizeof(above_args)) ||
+        !condition_value(line, "below_action", below_action, sizeof(below_action)) ||
+        !condition_value(line, "below_args", below_args, sizeof(below_args))) {
+        snprintf(output, output_size,
+                 "Error: @condition requires metric, threshold, above_action, above_args, below_action, below_args");
+        return ESP_ERR_INVALID_ARG;
+    }
+    (void)condition_value(line, "hysteresis", hysteresis, sizeof(hysteresis));
+    (void)condition_value(line, "interval_s", interval, sizeof(interval));
+    (void)condition_value(line, "cooldown_s", cooldown, sizeof(cooldown));
+
+    char *end = NULL;
+    double threshold_value = strtod(threshold, &end);
+    if (!end || *end || !isfinite(threshold_value) ||
+        (strcmp(metric, "humidity_percent") == 0 &&
+         (threshold_value < 0.0 || threshold_value > 100.0)) ||
+        (strcmp(metric, "humidity_percent") != 0 &&
+         strcmp(metric, "temperature_c") != 0 &&
+         strcmp(metric, "light_lux") != 0)) {
+        snprintf(output, output_size, "Error: unsupported or invalid condition metric/threshold");
+        return ESP_ERR_INVALID_ARG;
+    }
+    char *interval_end = NULL;
+    char *cooldown_end = NULL;
+    long interval_value = interval[0] ? strtol(interval, &interval_end, 10) : 30;
+    long cooldown_value = cooldown[0] ? strtol(cooldown, &cooldown_end, 10) : 300;
+    char *hysteresis_end = NULL;
+    double hysteresis_value = hysteresis[0] ? strtod(hysteresis, &hysteresis_end) : 1.0;
+    if ((interval[0] && (!interval_end || *interval_end)) ||
+        (cooldown[0] && (!cooldown_end || *cooldown_end)) ||
+        (hysteresis[0] && (!hysteresis_end || *hysteresis_end)) ||
+        interval_value < 5 || interval_value > 86400 ||
+        cooldown_value < 5 || cooldown_value > 300 ||
+        !isfinite(hysteresis_value) || hysteresis_value < 0.0 || hysteresis_value > 100.0) {
+        snprintf(output, output_size, "Error: interval/cooldown/hysteresis is outside safe bounds");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!automation_condition_action_allowed(above_action) ||
+        !automation_condition_action_allowed(below_action)) {
+        snprintf(output, output_size, "Error: condition action is not allowed");
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON *above = cJSON_Parse(above_args);
+    cJSON *below = cJSON_Parse(below_args);
+    if (!above || !below || !cJSON_IsObject(above) || !cJSON_IsObject(below)) {
+        cJSON_Delete(above);
+        cJSON_Delete(below);
+        snprintf(output, output_size, "Error: condition args must be JSON objects");
+        return ESP_ERR_INVALID_ARG;
+    }
+    cJSON_Delete(above);
+    cJSON_Delete(below);
+
+    if (ensure_lock() != ESP_OK) {
+        snprintf(output, output_size, "Error: automation lock unavailable");
+        return ESP_ERR_NO_MEM;
+    }
+    lock();
+    esp_err_t remove_err = remove_skill_condition_locked(skill_name, output, output_size);
+    unlock();
+    if (remove_err != ESP_OK) {
+        return remove_err;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    cJSON *above_obj = cJSON_CreateObject();
+    cJSON *below_obj = cJSON_CreateObject();
+    if (!root || !above_obj || !below_obj) {
+        cJSON_Delete(root);
+        cJSON_Delete(above_obj);
+        cJSON_Delete(below_obj);
+        snprintf(output, output_size, "Error: condition rule out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+    cJSON_AddStringToObject(root, "name", skill_name);
+    cJSON_AddStringToObject(root, "source_skill", skill_name);
+    cJSON_AddStringToObject(root, "metric", metric);
+    cJSON_AddNumberToObject(root, "threshold", threshold_value);
+    cJSON_AddNumberToObject(root, "hysteresis_c", hysteresis_value);
+    cJSON_AddNumberToObject(root, "interval_s", interval_value);
+    cJSON_AddNumberToObject(root, "cooldown_s", cooldown_value);
+    cJSON_AddStringToObject(above_obj, "action", above_action);
+    cJSON_AddStringToObject(above_obj, "target_role", "control_agent");
+    cJSON_AddItemToObject(above_obj, "args", cJSON_Parse(above_args));
+    cJSON_AddStringToObject(below_obj, "action", below_action);
+    cJSON_AddStringToObject(below_obj, "target_role", "control_agent");
+    cJSON_AddItemToObject(below_obj, "args", cJSON_Parse(below_args));
+    cJSON_AddItemToObject(root, "above", above_obj);
+    cJSON_AddItemToObject(root, "below", below_obj);
+    char *json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!json) {
+        snprintf(output, output_size, "Error: condition rule serialization failed");
+        return ESP_ERR_NO_MEM;
+    }
+    esp_err_t err = automation_engine_create_rule(json, output, output_size);
+    cJSON_free(json);
+    return err;
 }
