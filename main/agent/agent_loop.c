@@ -3676,6 +3676,18 @@ static bool try_execute_deterministic_skill_rule_request(
   return *final_text != NULL;
 }
 
+static bool message_explicitly_denies_confirmation(const char *message) {
+  static const char *const markers[] = {
+      "没有明确确认", "未明确确认", "没有确认", "未确认",
+      "不要确认", "无需确认", "not explicitly confirmed",
+      "without explicit confirmation", "without confirmation",
+      "do not confirm", "no confirmation",
+  };
+  return message && message_has_any_keyword(
+                         message, markers,
+                         sizeof(markers) / sizeof(markers[0]));
+}
+
 static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *msg,
                              char *output, size_t output_size) {
   if (!call || !msg || !msg->content || call->name[0] == '\0') {
@@ -3686,6 +3698,18 @@ static bool tool_guard_check(const llm_tool_call_t *call, const espagent_msg_t *
   const char *message = msg->content;
   bool allowed = true;
   const char *expected = NULL;
+
+  /* User denial of confirmation cannot be overridden by model-generated args. */
+  if ((strcmp(tool_name, "write_file") == 0 ||
+       strcmp(tool_name, "edit_file") == 0) &&
+      message_explicitly_denies_confirmation(message)) {
+    snprintf(output, output_size,
+             "Guard blocked tool '%s': the user did not explicitly confirm a skill file change.",
+             tool_name);
+    ESP_LOGW(TAG, "Tool guard blocked %s: explicit confirmation was denied by user",
+             tool_name);
+    return false;
+  }
 
   if (message_is_skill_or_knowledge_query(message) &&
       is_runtime_skill_qa_blocked_tool_name(tool_name)) {
