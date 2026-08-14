@@ -700,7 +700,7 @@ esp_err_t tool_registry_init(void)
 
     register_tool(&(espagent_tool_t){
         .name = "spawn_subagent",
-        .description = "Delegate an independent subtask to a temporary ESPAgent subagent. The subagent runs its own short ReAct tool loop, cannot spawn nested subagents, and returns a concise result. Use this for separable work such as searching, reading files, or summarizing a focused subtask before the main answer.",
+        .description = "Delegate one focused subtask to a temporary ESPAgent subagent. The subagent cannot spawn nested subagents and may execute at most one allowed tool; when it does, its tool result is returned directly. Use this for a single separable lookup, file read, search, or concise analysis before the main answer.",
         .input_schema_json =
             "{\"type\":\"object\","
             "\"properties\":{\"task\":{\"type\":\"string\",\"description\":\"The focused subtask for the subagent to complete\"},"

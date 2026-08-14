@@ -1651,7 +1651,30 @@ static bool policy_agent_task_target_allowed(const char *target_role)
             strcmp(target_role, ESPAGENT_ROLE_GUARDIAN) == 0);
 }
 
+static bool guardian_agent_task_requests_control(const char *task)
+{
+    static const char *const control_terms[] = {
+        "control_agent", "third role", "third node", "actuator", "servo",
+        "gpio", "ws2812", "status light", "led", "relay", "curtain",
+        "humidifier", "fan", "gree ac", "air-conditioner",
+        "第三角色", "第三节点", "控制节点", "执行控制", "执行器", "舵机",
+        "引脚", "状态灯", "开灯", "关灯", "灯带", "继电器", "窗帘",
+        "加湿器", "风扇", "空调",
+    };
+
+    if (!task || !task[0]) {
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(control_terms) / sizeof(control_terms[0]); i++) {
+        if (strcasestr(task, control_terms[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool guardian_agent_task_args_allowed(const char *args_json,
+                                             const char *target_role,
                                              char *reason,
                                              size_t reason_size)
 {
@@ -1672,6 +1695,16 @@ static bool guardian_agent_task_args_allowed(const char *args_json,
     if (strlen(task) > 220) {
         cJSON_Delete(args);
         snprintf(reason, reason_size, "agent_task task is too long");
+        return false;
+    }
+
+    /* Guardian can audit a Control request but must never impersonate Control.
+     * Reject obvious actuator requests before they enter Guardian's local LLM. */
+    if (strcmp(target_role, ESPAGENT_ROLE_GUARDIAN) == 0 &&
+        guardian_agent_task_requests_control(task)) {
+        cJSON_Delete(args);
+        snprintf(reason, reason_size,
+                 "guardian_agent cannot execute control work; target control_agent instead");
         return false;
     }
 
@@ -1986,7 +2019,8 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
             risk_score += 30;
         } else {
             char arg_reason[160] = {0};
-            if (guardian_agent_task_args_allowed(args_json, arg_reason, sizeof(arg_reason))) {
+            if (guardian_agent_task_args_allowed(args_json, target_role_copy,
+                                                 arg_reason, sizeof(arg_reason))) {
                 decision = "allow";
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s", arg_reason);
                 reason = dynamic_reason;
@@ -1996,6 +2030,10 @@ static void handle_guardian_policy_check(const char *payload, size_t payload_len
                 snprintf(dynamic_reason, sizeof(dynamic_reason), "%s",
                          arg_reason[0] ? arg_reason : "agent_task arguments denied");
                 reason = dynamic_reason;
+                reason_code = (strcmp(target_role_copy, ESPAGENT_ROLE_GUARDIAN) == 0 &&
+                               strstr(dynamic_reason, "cannot execute control") != NULL)
+                                  ? "guardian_role_boundary"
+                                  : "agent_task_args_denied";
                 risk_score += 30;
             }
         }

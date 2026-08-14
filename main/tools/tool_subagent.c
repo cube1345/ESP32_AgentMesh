@@ -225,43 +225,6 @@ static bool subagent_tool_allowed(const char *name)
            strcmp(name, "list_dir") == 0;
 }
 
-static cJSON *build_assistant_content(const llm_response_t *resp)
-{
-    cJSON *content = cJSON_CreateArray();
-    if (!content) {
-        return NULL;
-    }
-
-    if (resp->text && resp->text_len > 0) {
-        cJSON *text_block = cJSON_CreateObject();
-        if (text_block) {
-            cJSON_AddStringToObject(text_block, "type", "text");
-            cJSON_AddStringToObject(text_block, "text", resp->text);
-            cJSON_AddItemToArray(content, text_block);
-        }
-    }
-
-    for (int i = 0; i < resp->call_count; i++) {
-        const llm_tool_call_t *call = &resp->calls[i];
-        cJSON *tool_block = cJSON_CreateObject();
-        if (!tool_block) {
-            continue;
-        }
-        cJSON_AddStringToObject(tool_block, "type", "tool_use");
-        cJSON_AddStringToObject(tool_block, "id", call->id);
-        cJSON_AddStringToObject(tool_block, "name", call->name);
-
-        cJSON *input = cJSON_Parse(call->input ? call->input : "{}");
-        if (!input) {
-            input = cJSON_CreateObject();
-        }
-        cJSON_AddItemToObject(tool_block, "input", input);
-        cJSON_AddItemToArray(content, tool_block);
-    }
-
-    return content;
-}
-
 static void subagent_cleanup_ctx(subagent_ctx_t *ctx)
 {
     if (!ctx) {
@@ -344,85 +307,51 @@ static void subagent_run(subagent_ctx_t *ctx)
     cJSON_AddStringToObject(user_msg, "content", ctx->task ? ctx->task : "");
     cJSON_AddItemToArray(messages, user_msg);
 
-    for (int iter = 0; iter < ESPAGENT_SUBAGENT_MAX_TOOL_ITER; iter++) {
-        llm_response_t resp = {0};
-        esp_err_t err = llm_chat_tools(system_prompt, messages,
-                                       s_subagent_tools_json, &resp);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "Subagent LLM call failed: %s", esp_err_to_name(err));
-            ctx->result = strdup("Error: subagent LLM call failed");
-            break;
-        }
+    llm_response_t resp = {0};
+    esp_err_t err = llm_chat_tools(system_prompt, messages, s_subagent_tools_json, &resp);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Subagent LLM call failed: %s", esp_err_to_name(err));
+        ctx->result = strdup("Error: subagent LLM call failed");
+        goto done;
+    }
 
-        if (!resp.tool_use) {
-            ctx->result = (resp.text && resp.text_len > 0)
-                              ? strdup(resp.text)
-                              : strdup("(subagent produced no output)");
-            llm_response_free(&resp);
-            break;
-        }
-
-        ESP_LOGI(TAG, "Subagent tool iteration %d: %d calls",
-                 iter + 1, resp.call_count);
-
-        cJSON *asst_msg = cJSON_CreateObject();
-        if (asst_msg) {
-            cJSON_AddStringToObject(asst_msg, "role", "assistant");
-            cJSON *assistant_content = build_assistant_content(&resp);
-            if (assistant_content) {
-                cJSON_AddItemToObject(asst_msg, "content", assistant_content);
-                cJSON_AddItemToArray(messages, asst_msg);
-            } else {
-                cJSON_Delete(asst_msg);
-            }
-        }
-
-        cJSON *results = cJSON_CreateArray();
-        for (int i = 0; results && i < resp.call_count; i++) {
-            const llm_tool_call_t *call = &resp.calls[i];
-            tool_output[0] = '\0';
-            if (subagent_tool_allowed(call->name)) {
-                tool_registry_execute_as(call->name,
-                                         call->input ? call->input : "{}",
-                                         ESPAGENT_CAP_CALLER_SUBAGENT,
-                                         tool_output,
-                                         ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
-            } else {
-                snprintf(tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE,
-                         "Error: tool '%s' is not available to subagents",
-                         call->name[0] ? call->name : "(empty)");
-                ESP_LOGW(TAG, "Blocked subagent tool call: %s",
-                         call->name[0] ? call->name : "(empty)");
-            }
-            ESP_LOGI(TAG, "Subagent tool %s result: %d bytes",
-                     call->name, (int)strlen(tool_output));
-
-            cJSON *result_block = cJSON_CreateObject();
-            if (result_block) {
-                cJSON_AddStringToObject(result_block, "type", "tool_result");
-                cJSON_AddStringToObject(result_block, "tool_use_id", call->id);
-                cJSON_AddStringToObject(result_block, "content", tool_output);
-                cJSON_AddItemToArray(results, result_block);
-            }
-        }
-
-        if (results) {
-            cJSON *result_msg = cJSON_CreateObject();
-            if (result_msg) {
-                cJSON_AddStringToObject(result_msg, "role", "user");
-                cJSON_AddItemToObject(result_msg, "content", results);
-                cJSON_AddItemToArray(messages, result_msg);
-            } else {
-                cJSON_Delete(results);
-            }
-        }
-
+    if (!resp.tool_use) {
+        ctx->result = (resp.text && resp.text_len > 0)
+                          ? strdup(resp.text)
+                          : strdup("(subagent produced no output)");
         llm_response_free(&resp);
+        goto done;
     }
 
-    if (!ctx->result) {
-        ctx->result = strdup("Error: subagent reached max iterations without final answer");
+    const llm_tool_call_t *call = &resp.calls[0];
+    if (resp.call_count > 1) {
+        ESP_LOGW(TAG, "Subagent requested %d tools; executing only the first", resp.call_count);
     }
+    tool_output[0] = '\0';
+    if (subagent_tool_allowed(call->name)) {
+        tool_registry_execute_as(call->name,
+                                 call->input ? call->input : "{}",
+                                 ESPAGENT_CAP_CALLER_SUBAGENT,
+                                 tool_output,
+                                 ESPAGENT_SUBAGENT_TOOL_BUF_SIZE);
+    } else {
+        snprintf(tool_output, ESPAGENT_SUBAGENT_TOOL_BUF_SIZE,
+                 "Error: tool '%s' is not available to subagents",
+                 call->name[0] ? call->name : "(empty)");
+        ESP_LOGW(TAG, "Blocked subagent tool call: %s",
+                 call->name[0] ? call->name : "(empty)");
+    }
+    ESP_LOGI(TAG, "Subagent tool %s result: %d bytes",
+             call->name, (int)strlen(tool_output));
+
+    size_t result_size = strlen(tool_output) + sizeof("Subagent completed: ");
+    ctx->result = malloc(result_size);
+    if (ctx->result) {
+        snprintf(ctx->result, result_size, "Subagent completed: %s", tool_output);
+    } else {
+        ctx->result = strdup("Error: subagent result allocation failed");
+    }
+    llm_response_free(&resp);
 
 done:
     if (messages) {
