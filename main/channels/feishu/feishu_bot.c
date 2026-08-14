@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
@@ -114,31 +115,137 @@ static void feishu_http_retry_delay(const char *phase, int attempt, esp_err_t er
 }
 
 /* ── Message deduplication ─────────────────────────────────── */
-#define FEISHU_DEDUP_CACHE_SIZE 64
+#define FEISHU_DEDUP_CACHE_SIZE 128
+#define FEISHU_MESSAGE_ID_MAX 96
+#define FEISHU_DEDUP_COMPACT_AT (FEISHU_DEDUP_CACHE_SIZE * 2)
 
-static uint64_t s_seen_msg_keys[FEISHU_DEDUP_CACHE_SIZE] = {0};
+typedef enum {
+    FEISHU_DEDUP_NEW = 0,
+    FEISHU_DEDUP_SEEN,
+    FEISHU_DEDUP_UNAVAILABLE,
+} feishu_dedup_result_t;
+
+static char s_seen_message_ids[FEISHU_DEDUP_CACHE_SIZE][FEISHU_MESSAGE_ID_MAX] = {{0}};
+static size_t s_seen_msg_count = 0;
 static size_t s_seen_msg_idx = 0;
+static size_t s_seen_persisted_count = 0;
+static bool s_seen_store_ready = false;
 
-static uint64_t fnv1a64(const char *s)
+static bool message_id_is_safe(const char *message_id)
 {
-    uint64_t h = 1469598103934665603ULL;
-    if (!s) return h;
-    while (*s) {
-        h ^= (unsigned char)(*s++);
-        h *= 1099511628211ULL;
+    if (!message_id || !message_id[0] || strlen(message_id) >= FEISHU_MESSAGE_ID_MAX) {
+        return false;
     }
-    return h;
+    return strpbrk(message_id, "\r\n") == NULL;
 }
 
-static bool dedup_check_and_record(const char *message_id)
+static bool dedup_contains(const char *message_id)
 {
-    uint64_t key = fnv1a64(message_id);
-    for (size_t i = 0; i < FEISHU_DEDUP_CACHE_SIZE; i++) {
-        if (s_seen_msg_keys[i] == key) return true;
+    for (size_t i = 0; i < s_seen_msg_count; i++) {
+        if (strcmp(s_seen_message_ids[i], message_id) == 0) {
+            return true;
+        }
     }
-    s_seen_msg_keys[s_seen_msg_idx] = key;
-    s_seen_msg_idx = (s_seen_msg_idx + 1) % FEISHU_DEDUP_CACHE_SIZE;
     return false;
+}
+
+static void dedup_record_memory(const char *message_id)
+{
+    snprintf(s_seen_message_ids[s_seen_msg_idx], FEISHU_MESSAGE_ID_MAX, "%s", message_id);
+    s_seen_msg_idx = (s_seen_msg_idx + 1) % FEISHU_DEDUP_CACHE_SIZE;
+    if (s_seen_msg_count < FEISHU_DEDUP_CACHE_SIZE) {
+        s_seen_msg_count++;
+    }
+}
+
+static esp_err_t dedup_compact_store(void)
+{
+    char temp_path[sizeof(ESPAGENT_FEISHU_INBOX_FILE) + 5] = {0};
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", ESPAGENT_FEISHU_INBOX_FILE);
+    FILE *file = fopen(temp_path, "w");
+    if (!file) {
+        return ESP_FAIL;
+    }
+
+    size_t first = s_seen_msg_count == FEISHU_DEDUP_CACHE_SIZE ? s_seen_msg_idx : 0;
+    for (size_t i = 0; i < s_seen_msg_count; i++) {
+        size_t index = (first + i) % FEISHU_DEDUP_CACHE_SIZE;
+        if (fprintf(file, "%s\n", s_seen_message_ids[index]) < 0) {
+            fclose(file);
+            remove(temp_path);
+            return ESP_FAIL;
+        }
+    }
+    if (fclose(file) != 0 || rename(temp_path, ESPAGENT_FEISHU_INBOX_FILE) != 0) {
+        remove(temp_path);
+        return ESP_FAIL;
+    }
+    s_seen_persisted_count = s_seen_msg_count;
+    return ESP_OK;
+}
+
+static esp_err_t dedup_load_store(void)
+{
+    memset(s_seen_message_ids, 0, sizeof(s_seen_message_ids));
+    s_seen_msg_count = 0;
+    s_seen_msg_idx = 0;
+    s_seen_persisted_count = 0;
+
+    FILE *file = fopen(ESPAGENT_FEISHU_INBOX_FILE, "r");
+    if (!file) {
+        s_seen_store_ready = true;
+        return ESP_OK;
+    }
+
+    char line[FEISHU_MESSAGE_ID_MAX] = {0};
+    while (fgets(line, sizeof(line), file)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (!message_id_is_safe(line) || dedup_contains(line)) {
+            continue;
+        }
+        dedup_record_memory(line);
+        s_seen_persisted_count++;
+    }
+    if (ferror(file) || fclose(file) != 0) {
+        s_seen_store_ready = false;
+        return ESP_FAIL;
+    }
+    s_seen_store_ready = true;
+    if (s_seen_persisted_count > FEISHU_DEDUP_COMPACT_AT) {
+        return dedup_compact_store();
+    }
+    return ESP_OK;
+}
+
+static feishu_dedup_result_t dedup_check_and_record(const char *message_id)
+{
+    if (!s_seen_store_ready || !message_id_is_safe(message_id)) {
+        return FEISHU_DEDUP_UNAVAILABLE;
+    }
+    if (dedup_contains(message_id)) {
+        return FEISHU_DEDUP_SEEN;
+    }
+
+    FILE *file = fopen(ESPAGENT_FEISHU_INBOX_FILE, "a");
+    if (!file) {
+        ESP_LOGE(TAG, "Feishu dedup store write failed; dropping inbound message");
+        s_seen_store_ready = false;
+        return FEISHU_DEDUP_UNAVAILABLE;
+    }
+    int write_result = fprintf(file, "%s\n", message_id);
+    int close_result = fclose(file);
+    if (write_result < 0 || close_result != 0) {
+        ESP_LOGE(TAG, "Feishu dedup store write failed; dropping inbound message");
+        s_seen_store_ready = false;
+        return FEISHU_DEDUP_UNAVAILABLE;
+    }
+
+    dedup_record_memory(message_id);
+    s_seen_persisted_count++;
+    if (s_seen_persisted_count == FEISHU_DEDUP_COMPACT_AT && dedup_compact_store() != ESP_OK) {
+        ESP_LOGW(TAG, "Feishu dedup store compaction failed; continuing with append log");
+    }
+    return FEISHU_DEDUP_NEW;
 }
 
 /* ── HTTP response accumulator ─────────────────────────────── */
@@ -1054,8 +1161,13 @@ static void handle_message_event(cJSON *event)
     const char *msg_type   = cJSON_IsString(msg_type_j) ? msg_type_j->valuestring : "text";
 
     /* Deduplication */
-    if (message_id[0] && dedup_check_and_record(message_id)) {
+    feishu_dedup_result_t dedup_result = dedup_check_and_record(message_id);
+    if (dedup_result == FEISHU_DEDUP_SEEN) {
         ESP_LOGD(TAG, "Duplicate message %s, skipping", message_id);
+        return;
+    }
+    if (dedup_result == FEISHU_DEDUP_UNAVAILABLE) {
+        ESP_LOGE(TAG, "Feishu dedup unavailable; dropping inbound message to prevent replay");
         return;
     }
 
@@ -1143,6 +1255,13 @@ static void handle_message_event(cJSON *event)
 
 esp_err_t feishu_bot_init(void)
 {
+    if (dedup_load_store() != ESP_OK) {
+        ESP_LOGE(TAG, "Feishu persistent dedup initialization failed; inbound commands will be dropped");
+    } else {
+        ESP_LOGI(TAG, "Feishu persistent dedup restored: %u message ids",
+                 (unsigned)s_seen_msg_count);
+    }
+
     nvs_handle_t nvs;
     if (nvs_open(ESPAGENT_NVS_FEISHU, NVS_READONLY, &nvs) == ESP_OK) {
         char tmp_id[64] = {0};
