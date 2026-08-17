@@ -32,9 +32,11 @@ export type TimelineFilter = '全部' | 'telemetry' | 'state' | 'policy' | 'sand
 
 export interface NodePanel {
   node: AgentNode;
+  recognized: boolean;
   sentSummary: string[];
   recvSummary: string[];
   subagentLabel: string;
+  extraNodes: NodePanel[];
 }
 
 const roleLabels: Record<AgentNode['role'], { title: string; short: string; icon: React.ReactNode }> = {
@@ -78,7 +80,7 @@ function runtimeErrorLabel(error: string): string {
 function NodeCard({ panel, compact = false }: { panel: NodePanel; compact?: boolean }) {
   const meta = roleLabels[panel.node.role];
   return (
-    <article className={`node-card ${roleClass(panel.node.role)} ${compact ? 'node-card-compact' : ''}`}>
+    <article className={`node-card ${roleClass(panel.node.role)} ${panel.recognized ? '' : 'node-card-unrecognized'} ${compact ? 'node-card-compact' : ''}`}>
       <div className="node-card-header">
         <span className="role-icon">{meta.icon}</span>
         <div>
@@ -124,8 +126,6 @@ interface OverviewProps {
 }
 
 export function OverviewView({ payload, nodes, isLive }: OverviewProps) {
-  const coordinator = nodes.find((item) => item.node.role === 'coordinator_agent');
-  const satellites = nodes.filter((item) => item.node.role !== 'coordinator_agent');
   return (
     <div className="view-stack view-enter">
       <div className="overview-grid">
@@ -135,10 +135,17 @@ export function OverviewView({ payload, nodes, isLive }: OverviewProps) {
             <span className={`source-indicator ${isLive ? 'is-live' : ''}`}>{isLive ? '实时 MQTT' : '演示数据'}</span>
           </div>
           <div className="topology-stage">
-            {coordinator && <div className="topology-core"><NodeCard panel={coordinator} /></div>}
-            <div className="topology-link topology-link-vertical" />
-            <div className="topology-satellites">
-              {satellites.map((panel) => <NodeCard key={panel.node.role} panel={panel} />)}
+            <div className="topology-grid">
+              {nodes.map((panel) => (
+                <div className="topology-lane" key={panel.node.role}>
+                  {panel.extraNodes.length > 0 && (
+                    <div className="topology-extra-stack">
+                      {panel.extraNodes.map((extraPanel) => <NodeCard key={extraPanel.node.id} panel={extraPanel} compact />)}
+                    </div>
+                  )}
+                  <NodeCard panel={panel} />
+                </div>
+              ))}
             </div>
           </div>
         </section>

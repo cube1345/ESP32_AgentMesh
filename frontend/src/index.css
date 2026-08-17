@@ -606,46 +606,36 @@ select {
 .topology-stage {
   position: relative;
   min-height: 390px;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
+  display: grid;
+  align-items: center;
   padding: 14px 4%;
   background: #f7f9f8;
   border-radius: 6px;
 }
 
-.topology-core {
-  z-index: 2;
-  width: min(290px, 80%);
-  margin: 0 auto 66px;
-}
-
-.topology-link-vertical {
-  position: absolute;
-  top: 166px;
-  left: 50%;
-  width: 1px;
-  height: 70px;
-  background: #b9c3be;
-}
-
-.topology-satellites {
-  position: relative;
+.topology-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: end;
+  gap: 12px;
+  width: 100%;
 }
 
-.topology-satellites::before {
-  position: absolute;
-  top: -35px;
-  right: 16.5%;
-  left: 16.5%;
-  height: 35px;
-  border-top: 1px solid #b9c3be;
-  border-right: 1px solid #b9c3be;
-  border-left: 1px solid #b9c3be;
-  content: "";
+.topology-lane {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.topology-extra-stack {
+  display: grid;
+  gap: 8px;
+}
+
+.topology-extra-stack .node-card {
+  border-top-width: 2px;
 }
 
 .node-card {
@@ -666,6 +656,7 @@ select {
 .role-control { --role-color: #d88b26; }
 .role-guardian { --role-color: #c94b4b; }
 .role-display { --role-color: #7867a8; }
+.node-card.node-card-unrecognized { --role-color: #98a39d; }
 
 .node-card-header {
   display: grid;
@@ -684,6 +675,11 @@ select {
   background: color-mix(in srgb, var(--role-color) 11%, white);
 }
 
+.node-card-unrecognized .role-icon {
+  color: #7b8780;
+  background: #edf0ee;
+}
+
 .node-card-header strong,
 .node-card-header small { display: block; }
 .node-card-header strong { font-size: 12px; }
@@ -700,6 +696,11 @@ select {
 .status-degraded, .status-queued { color: #9a681e; background: #fbf0df; }
 .status-offline, .status-warn { color: #a9423e; background: #f9e9e8; }
 .status-ok { background: #1a8b70; }
+
+.node-card-unrecognized .status-badge {
+  color: #69756e;
+  background: #edf0ee;
+}
 
 .node-card > code {
   display: block;
@@ -956,10 +957,8 @@ select {
   .workspace-surface { padding: 16px; }
 
   .topology-stage { min-height: auto; padding: 8px; }
-  .topology-core { width: 100%; margin: 0 0 10px; }
-  .topology-link { display: none; }
-  .topology-satellites { grid-template-columns: 1fr; gap: 10px; }
-  .topology-satellites::before { display: none; }
+  .topology-grid { grid-template-columns: 1fr; gap: 10px; }
+  .topology-lane { gap: 8px; }
   .node-card-detail { display: none; }
   .environment-row { grid-template-columns: 92px 1fr 34px; }
   .event-row summary { grid-template-columns: 7px minmax(90px, 0.8fr) minmax(100px, 1fr); }

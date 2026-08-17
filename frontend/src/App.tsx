@@ -182,7 +182,10 @@ function App() {
 
   useEffect(() => {
     let cancelled = false;
-    const sync = async () => { const next = await fetchDashboard(); if (!cancelled && next.nodes.length) setPayload(next); };
+    const sync = async () => {
+      const next = await fetchDashboard();
+      if (!cancelled && (next.nodes.length > 0 || next.mqtt)) setPayload(next);
+    };
     void sync();
     const timer = window.setInterval(sync, 3000);
     return () => { cancelled = true; window.clearInterval(timer); };
@@ -284,16 +287,26 @@ function App() {
   }), [payload.timeline, timelineFilter]);
 
   const fixedNodes = useMemo<NodePanel[]>(() => fixedNodeOrder.map((role) => {
-    const node = payload.nodes.find((item) => item.role === role) || { id: role, role, transport: ['MQTT Mesh'], status: 'offline' as const, location: 'not detected', responsibilities: [], surfaces: [] };
-    const outgoing = payload.timeline.filter((event) => stageMatchesNode(event.source, node));
-    const incoming = payload.timeline.filter((event) => stageMatchesNode(event.target, node));
+    const matchedNodes = payload.nodes.filter((item) => item.role === role);
+    const node = matchedNodes[0] || { id: role, role, transport: ['MQTT Mesh'], status: 'offline' as const, location: 'not detected', responsibilities: [], surfaces: [] };
     const hints = nodeChannelHints[role];
-    return {
-      node,
-      sentSummary: outgoing.length ? outgoing.slice(0, 3).map((event) => `${event.stage}: ${event.payload}`) : hints.sends,
-      recvSummary: incoming.length ? incoming.slice(0, 3).map((event) => `${event.stage}: ${event.payload}`) : hints.receives,
-      subagentLabel: hints.subagent ? '可用，当前未运行' : '该节点不开放 Subagent'
+
+    const createPanel = (currentNode: AgentNode, recognized: boolean): NodePanel => {
+      const outgoing = payload.timeline.filter((event) => stageMatchesNode(event.source, currentNode));
+      const incoming = payload.timeline.filter((event) => stageMatchesNode(event.target, currentNode));
+      return {
+        node: currentNode,
+        recognized,
+        sentSummary: outgoing.length ? outgoing.slice(0, 3).map((event) => `${event.stage}: ${event.payload}`) : hints.sends,
+        recvSummary: incoming.length ? incoming.slice(0, 3).map((event) => `${event.stage}: ${event.payload}`) : hints.receives,
+        subagentLabel: hints.subagent ? '可用，当前未运行' : '该节点不开放 Subagent',
+        extraNodes: []
+      };
     };
+
+    const primaryPanel = createPanel(node, matchedNodes.length > 0);
+    primaryPanel.extraNodes = matchedNodes.slice(1).map((extraNode) => createPanel(extraNode, true));
+    return primaryPanel;
   }), [payload.nodes, payload.timeline]);
 
   const nodeStats = useMemo(() => ({
