@@ -191,6 +191,12 @@ export interface DashboardPayload {
     lastEventAt: string | null;
     lastError: string | null;
   };
+  hostAgent?: {
+    enabled: boolean;
+    role: 'coordinator_agent';
+    maxActions: number;
+    maxRounds: number;
+  };
   guardian?: {
     updatedAt: string;
     payload: Record<string, unknown>;

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
+import { createHostCoordinatorAgent, sha256, signMeshCommand } from './host_coordinator_agent.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -53,6 +54,8 @@ const SERIAL_CMD_PATH = process.env.ESPAGENT_SERIAL_CMD_PATH ||
   path.join(REPO_ROOT, 'tools', 'serial_cmd.py');
 const LOCAL_SPIFFS_SKILLS_DIR = path.join(REPO_ROOT, 'spiffs_data', 'skills');
 const CHAT_GATEWAY_PATH = '/ws';
+const HOST_AGENT_ENABLED = process.env.ESPAGENT_HOST_AGENT_ENABLED === '1';
+const HOST_AGENT_POLICY_TIMEOUT_MS = Number(process.env.ESPAGENT_HOST_AGENT_POLICY_TIMEOUT_MS || 15000);
 const runtimeSkills = new Map();
 let runtimeSkillsCacheAt = 0;
 const pendingSkillRequests = new Map();
@@ -62,6 +65,7 @@ let runtimeDeviceManifestsCacheAt = 0;
 const chatSessions = new Map();
 const wsSessions = new Set();
 const feishuBridgeSeen = new Map();
+const hostAgentPending = new Map();
 let feishuBridgeCredentialsPromise = null;
 let feishuBridgeToken = null;
 const MAX_TIMELINE_EVENTS = 120;
@@ -1120,6 +1124,12 @@ function toDashboardPayload() {
     flows,
     mqtt: store.mqtt,
     chatGateway: store.chatGateway,
+    hostAgent: {
+      enabled: hostAgent.enabled,
+      role: 'coordinator_agent',
+      maxActions: hostAgent.maxActions,
+      maxRounds: hostAgent.maxRounds
+    },
     feishuBridge: store.feishuBridge,
     guardian: store.guardian
   };
@@ -1188,6 +1198,32 @@ function createChatSession(downstream) {
       }
       session.chatId = chatId;
       chatSessions.set(chatId, session);
+
+      if (HOST_AGENT_ENABLED) {
+        void hostAgent.run({ chatId, channel: 'websocket', content: payload.content })
+          .then((result) => {
+            if (session.downstream.readyState === WebSocket.OPEN) {
+              session.downstream.send(JSON.stringify({
+                type: 'response',
+                chat_id: chatId,
+                content: result.content,
+                trace_id: result.traceId,
+                action_count: result.actionCount
+              }));
+            }
+          })
+          .catch((error) => {
+            noteChatGatewayEvent(error instanceof Error ? error.message : String(error));
+            if (session.downstream.readyState === WebSocket.OPEN) {
+              session.downstream.send(JSON.stringify({
+                type: 'system',
+                chat_id: chatId,
+                content: `上位机 Coordinator 处理失败：${error instanceof Error ? error.message : String(error)}`
+              }));
+            }
+          });
+        return;
+      }
 
       const requestPayload = JSON.stringify({
         type: 'message',
@@ -1537,13 +1573,144 @@ const client = mqtt.connect(MQTT_URL, {
   clientId: `espagent-dashboard-${Math.random().toString(16).slice(2, 10)}`
 });
 
+function hostPendingKey(kind, id) {
+  return `${kind}:${id}`;
+}
+
+function makeHostId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function waitForHostEvent(kind, id, timeoutMs = HOST_AGENT_POLICY_TIMEOUT_MS) {
+  const key = hostPendingKey(kind, id);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      hostAgentPending.delete(key);
+      resolve(null);
+    }, timeoutMs);
+    hostAgentPending.set(key, { resolve, timer });
+  });
+}
+
+function publishMqtt(topic, payload) {
+  return new Promise((resolve, reject) => {
+    if (!store.mqtt.connected) {
+      reject(new Error('MQTT gateway is offline'));
+      return;
+    }
+    client.publish(topic, JSON.stringify(payload), { qos: 1 }, (error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function publishHostMeshCommand(request) {
+  const targetRole = String(request.target_role || '');
+  const targetNode = String(request.target_node || '');
+  const action = String(request.action || '');
+  if (!['sensor_agent', 'control_agent', 'guardian_agent'].includes(targetRole)) {
+    return { ok: false, error: 'target_role must be sensor_agent, control_agent, or guardian_agent' };
+  }
+  if (!action) return { ok: false, error: 'action is required' };
+
+  const commandId = makeHostId('cmd');
+  const traceId = String(request.traceId || makeHostId('trace'));
+  const taskId = String(request.taskId || `task-${commandId}`);
+  const parentTaskId = String(request.parentTaskId || '');
+  const sourceChannel = String(request.sourceChannel || 'web');
+  const sourceChatId = String(request.sourceChatId || 'host_console_01');
+  const ttlMs = Math.max(1000, Math.min(30000, Number(request.ttl_ms || 30000)));
+  const safetyLevel = Math.max(0, Math.min(2, Number(request.safety_level ?? 1)));
+  const args = request.args && typeof request.args === 'object' && !Array.isArray(request.args)
+    ? request.args
+    : {};
+  const argsJson = JSON.stringify(args);
+  const timestamp = Date.now();
+  const nonce = `nonce-${Math.random().toString(16).slice(2, 10)}`;
+  const deadline = timestamp + ttlMs;
+  const argsHash = sha256(argsJson);
+  const common = {
+    command_id: commandId,
+    trace_id: traceId,
+    task_id: taskId,
+    parent_task_id: parentTaskId,
+    source_channel: sourceChannel,
+    source_chat_id: sourceChatId,
+    deadline_ms: deadline,
+    retry_count: 0,
+    task_status: 'policy_pending',
+    source_role: 'coordinator_agent',
+    target_role: targetRole,
+    target_node: targetNode,
+    action,
+    args_json: argsJson,
+    nonce,
+    args_sha256: argsHash,
+    source_type: 'coordinator',
+    source_id: 'coordinator_agent',
+    safety_level: safetyLevel,
+    ttl_ms: ttlMs,
+    ts_ms: timestamp
+  };
+
+  try {
+    const decisionWait = waitForHostEvent('policy', commandId);
+    await publishMqtt(`${TOPIC_PREFIX}/security/policy_check`, {
+      schema: 'espagent.policy_check.v1',
+      event: 'policy_check',
+      ...common,
+      reply_channel: sourceChannel,
+      reply_chat_id: sourceChatId
+    });
+    const decision = await decisionWait;
+    if (!decision || decision.decision !== 'allow' || decision.allowed !== true) {
+      return { ok: false, command_id: commandId, trace_id: traceId, status: 'blocked', reason: decision?.reason || 'Guardian policy decision timed out' };
+    }
+
+    const command = {
+      schema: 'espagent.mesh_command.v1',
+      ...common,
+      task_status: 'queued',
+      require_ack: true,
+      args,
+      signature: ''
+    };
+    command.signature = signMeshCommand({
+      ...command,
+      args_json: argsJson
+    }, MESH_AUTH_KEY);
+    const outputWait = waitForHostEvent('output', commandId, ttlMs);
+    const topic = targetNode
+      ? `${TOPIC_PREFIX}/nodes/${targetNode}/command`
+      : `${TOPIC_PREFIX}/roles/${targetRole}/command`;
+    await publishMqtt(topic, command);
+    const output = await outputWait;
+    if (!output) {
+      return { ok: true, command_id: commandId, trace_id: traceId, status: 'queued', topic, warning: 'execution result timed out' };
+    }
+    return { ok: output.status === 'ok' || output.status === 'succeeded', command_id: commandId, trace_id: traceId, status: output.status || 'completed', result: output.result || output.text || output };
+  } catch (error) {
+    return { ok: false, command_id: commandId, trace_id: traceId, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+const hostAgent = createHostCoordinatorAgent({
+  enabled: HOST_AGENT_ENABLED,
+  publishMeshCommand: publishHostMeshCommand,
+  getDashboardState: () => toDashboardPayload(),
+  publishTimeline: handleTimeline
+});
+
 client.on('connect', () => {
   store.mqtt.connected = true;
   const topics = [
     `${TOPIC_PREFIX}/nodes/+/telemetry`,
     `${TOPIC_PREFIX}/nodes/+/state`,
+    `${TOPIC_PREFIX}/nodes/+/events`,
     SKILLS_MQTT_REPLY_TOPIC,
     `${TOPIC_PREFIX}/agent/timeline`,
+    `${TOPIC_PREFIX}/security/decision`,
     `${TOPIC_PREFIX}/guardian/stateboard`,
     CHAT_REPLY_TOPIC
   ];
@@ -1576,6 +1743,29 @@ client.on('message', (topic, buffer, packet) => {
   store.mqtt.lastEventAt = nowIso();
 
   if (!payload) {
+    return;
+  }
+
+  if (topic === `${TOPIC_PREFIX}/security/decision` && payload.command_id) {
+    const pending = hostAgentPending.get(hostPendingKey('policy', payload.command_id));
+    if (pending) {
+      clearTimeout(pending.timer);
+      hostAgentPending.delete(hostPendingKey('policy', payload.command_id));
+      pending.resolve(payload);
+    }
+    handleTimeline(payload, meta);
+    return;
+  }
+
+  if (topic.endsWith('/events') && payload.command_id &&
+      (payload.schema === 'espagent.output.v1' || payload.type === 'output' || payload.event === 'mesh_command_result')) {
+    const pending = hostAgentPending.get(hostPendingKey('output', payload.command_id));
+    if (pending) {
+      clearTimeout(pending.timer);
+      hostAgentPending.delete(hostPendingKey('output', payload.command_id));
+      pending.resolve(payload);
+    }
+    handleTimeline(payload, meta);
     return;
   }
 
