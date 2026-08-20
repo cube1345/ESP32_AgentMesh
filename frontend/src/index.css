@@ -792,6 +792,195 @@ select {
 .capability-row > span:last-child { color: #65716b; font-size: 9px; }
 
 /* Collaboration and safety */
+.trace-surface {
+  min-width: 0;
+}
+
+.trace-grid {
+  display: grid;
+  grid-template-columns: 280px minmax(0, 1fr);
+  gap: 16px;
+}
+
+.trace-list {
+  max-height: 560px;
+  overflow-y: auto;
+}
+
+.trace-list-item {
+  width: 100%;
+  display: grid;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 12px;
+  border: 1px solid #dfe5e2;
+  border-radius: 7px;
+  color: #445049;
+  background: #f8faf9;
+  cursor: pointer;
+  text-align: left;
+}
+
+.trace-list-item:hover,
+.trace-list-item.is-active {
+  border-color: #b9c9f0;
+  background: #edf3ff;
+}
+
+.trace-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.trace-list-head strong {
+  overflow: hidden;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-list-head span {
+  flex: 0 0 auto;
+  color: #89938e;
+  font-size: 9px;
+}
+
+.trace-list-item p {
+  display: -webkit-box;
+  overflow: hidden;
+  margin: 0;
+  color: #66716b;
+  font-size: 10px;
+  line-height: 1.5;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.trace-list-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.trace-detail {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
+.trace-detail-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.trace-detail-header strong {
+  display: block;
+  font-size: 14px;
+}
+
+.trace-detail-header p {
+  margin: 6px 0 0;
+  color: #69756e;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
+.trace-lanes {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.trace-lane {
+  min-width: 0;
+  border: 1px solid #dfe5e2;
+  border-radius: 7px;
+  background: #f8faf9;
+}
+
+.trace-lane-header {
+  padding: 12px 12px 10px;
+  border-bottom: 1px solid #e6ece8;
+}
+
+.trace-lane-header strong,
+.trace-lane-header small {
+  display: block;
+}
+
+.trace-lane-header strong {
+  font-size: 11px;
+}
+
+.trace-lane-header small {
+  margin-top: 3px;
+  color: #89938e;
+  font-size: 9px;
+}
+
+.trace-lane-body {
+  max-height: 420px;
+  overflow-y: auto;
+  padding: 12px;
+}
+
+.trace-lane-empty {
+  padding: 18px 10px;
+  color: #97a19c;
+  font-size: 10px;
+  text-align: center;
+}
+
+.trace-event-card {
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid #e2e8e4;
+  border-radius: 6px;
+  background: #fff;
+}
+
+.trace-event-card:last-child {
+  margin-bottom: 0;
+}
+
+.trace-event-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.trace-event-meta strong {
+  overflow: hidden;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trace-event-meta span {
+  flex: 0 0 auto;
+  color: #8f9994;
+  font-size: 8px;
+}
+
+.trace-event-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.trace-event-card p {
+  margin: 8px 0 0;
+  color: #55615a;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .collaboration-grid,
 .security-grid,
 .preferences-grid {
@@ -924,6 +1113,8 @@ select {
   .summary-source { grid-column: 1 / -1; border-top: 1px solid #e7ebe9; }
   .overview-grid, .overview-grid-secondary { grid-template-columns: 1fr; }
   .collaboration-grid, .security-grid, .preferences-grid { grid-template-columns: 1fr; }
+  .trace-grid { grid-template-columns: 1fr; }
+  .trace-lanes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 
 @media (max-width: 760px) {
@@ -960,6 +1151,9 @@ select {
   .topology-grid { grid-template-columns: 1fr; gap: 10px; }
   .topology-lane { gap: 8px; }
   .node-card-detail { display: none; }
+  .trace-detail-header { display: block; }
+  .trace-detail-header .trace-list-tags { margin-top: 10px; }
+  .trace-lanes { grid-template-columns: 1fr; }
   .environment-row { grid-template-columns: 92px 1fr 34px; }
   .event-row summary { grid-template-columns: 7px minmax(90px, 0.8fr) minmax(100px, 1fr); }
   .event-row time { display: none; }

@@ -13,7 +13,7 @@ import {
   SaveOutlined
 } from '@ant-design/icons';
 import { Alert, Button, Empty, Form, Input, Popconfirm, Progress, Segmented, Select, Slider, Spin, Switch, Tag, Typography } from 'antd';
-import { lazy, Suspense } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
 import type {
   AgentNode,
   DashboardPayload,
@@ -47,6 +47,13 @@ const roleLabels: Record<AgentNode['role'], { title: string; short: string; icon
   display_terminal: { title: '展示终端', short: 'Display', icon: <ApiOutlined /> }
 };
 
+const traceRoleOrder: AgentNode['role'][] = [
+  'coordinator_agent',
+  'sensor_agent',
+  'control_agent',
+  'guardian_agent'
+];
+
 function roleClass(role: AgentNode['role']): string {
   return `role-${role.replace('_agent', '').replace('_terminal', '')}`;
 }
@@ -75,6 +82,230 @@ function eventKey(event: TimelineEvent, index: number): string {
 function runtimeErrorLabel(error: string): string {
   if (/9009|python3|not recognized/i.test(error)) return '串口工具不可用，请检查 Python 与 USB0';
   return error;
+}
+
+function isAgentRole(value: string | undefined): value is AgentNode['role'] {
+  return value === 'coordinator_agent' ||
+    value === 'sensor_agent' ||
+    value === 'control_agent' ||
+    value === 'guardian_agent' ||
+    value === 'display_terminal';
+}
+
+function inferRoleFromText(text: string): AgentNode['role'] | null {
+  if (text.includes('coordinator_agent') || text.includes('coordinator')) return 'coordinator_agent';
+  if (text.includes('sensor_agent') || text.includes('sensor')) return 'sensor_agent';
+  if (text.includes('control_agent') || text.includes('control')) return 'control_agent';
+  if (text.includes('guardian_agent') || text.includes('guardian')) return 'guardian_agent';
+  return null;
+}
+
+function inferTraceRole(event: TimelineEvent): AgentNode['role'] | null {
+  if (isAgentRole(event.role)) return event.role;
+  return inferRoleFromText(`${event.nodeId || ''} ${event.source} ${event.target}`);
+}
+
+function eventSortValue(event: TimelineEvent, fallbackIndex: number, total: number): number {
+  if (typeof event.tsMs === 'number' && Number.isFinite(event.tsMs)) return event.tsMs;
+  return total - fallbackIndex;
+}
+
+function isStructuredTraceEvent(event: TimelineEvent): boolean {
+  if (event.stage === 'node_state' || event.stage === 'telemetry') return false;
+  if (event.taskId || event.traceId || event.commandId) return true;
+  return event.stage === 'tool_use' ||
+    event.stage === 'tool_result' ||
+    event.stage === 'dispatch' ||
+    event.stage === 'policy_check' ||
+    event.stage === 'policy_decision' ||
+    event.stage === 'final_reply' ||
+    event.stage === 'execution' ||
+    event.stage === 'sandbox_denied';
+}
+
+function traceGroupKey(event: TimelineEvent, index: number, total: number): string {
+  if (event.taskId) return `task:${event.taskId}`;
+  if (event.traceId) return `trace:${event.traceId}`;
+  if (event.commandId) return `command:${event.commandId}`;
+  const role = inferTraceRole(event) || 'unknown';
+  const bucket = Math.floor(eventSortValue(event, index, total) / 15000);
+  return `local:${role}:${bucket}`;
+}
+
+function traceLabel(event: TimelineEvent): string {
+  return event.action || event.commandId || event.taskId || event.traceId || event.stage;
+}
+
+interface StructuredTrace {
+  id: string;
+  label: string;
+  summary: string;
+  latestTime: string;
+  latestTs: number;
+  status: TimelineEvent['status'];
+  taskId?: string;
+  traceId?: string;
+  commandId?: string;
+  action?: string;
+  roles: Partial<Record<AgentNode['role'], TimelineEvent[]>>;
+  eventCount: number;
+}
+
+function buildStructuredTraces(events: TimelineEvent[]): StructuredTrace[] {
+  const groups = new Map<string, StructuredTrace>();
+  const total = events.length;
+
+  events
+    .filter(isStructuredTraceEvent)
+    .forEach((event, index) => {
+      const key = traceGroupKey(event, index, total);
+      const laneRole = inferTraceRole(event);
+      const sortValue = eventSortValue(event, index, total);
+      const existing = groups.get(key);
+      const trace = existing || {
+        id: key,
+        label: traceLabel(event),
+        summary: event.payload,
+        latestTime: event.time,
+        latestTs: sortValue,
+        status: event.status,
+        taskId: event.taskId,
+        traceId: event.traceId,
+        commandId: event.commandId,
+        action: event.action,
+        roles: {},
+        eventCount: 0
+      };
+
+      trace.eventCount += 1;
+      if (!trace.summary || sortValue >= trace.latestTs) {
+        trace.summary = event.payload;
+        trace.latestTime = event.time;
+        trace.latestTs = sortValue;
+        trace.status = event.status;
+        trace.label = traceLabel(event);
+      }
+      if (!trace.taskId && event.taskId) trace.taskId = event.taskId;
+      if (!trace.traceId && event.traceId) trace.traceId = event.traceId;
+      if (!trace.commandId && event.commandId) trace.commandId = event.commandId;
+      if (!trace.action && event.action) trace.action = event.action;
+
+      if (laneRole) {
+        if (!trace.roles[laneRole]) trace.roles[laneRole] = [];
+        trace.roles[laneRole]!.push(event);
+      }
+      groups.set(key, trace);
+    });
+
+  const traces = Array.from(groups.values());
+  traces.forEach((trace) => {
+    traceRoleOrder.forEach((role) => {
+      if (trace.roles[role]) {
+        trace.roles[role] = trace.roles[role]!.sort((left, right) => left.time.localeCompare(right.time));
+      }
+    });
+  });
+  return traces.sort((left, right) => right.latestTs - left.latestTs);
+}
+
+function TraceEventCard({ event }: { event: TimelineEvent }) {
+  return (
+    <div className="trace-event-card">
+      <div className="trace-event-meta">
+        <strong>{event.stage}</strong>
+        <span>{event.time}</span>
+      </div>
+      <div className="trace-event-tags">
+        {event.phase && <Tag>{event.phase}</Tag>}
+        {event.action && <Tag>{event.action}</Tag>}
+        {event.status === 'warn' && <Tag color="error">warn</Tag>}
+        {event.status === 'queued' && <Tag color="warning">queued</Tag>}
+      </div>
+      <p>{event.payload}</p>
+    </div>
+  );
+}
+
+function StructuredTracePanel({ events }: { events: TimelineEvent[] }) {
+  const traces = useMemo(() => buildStructuredTraces(events), [events]);
+  const [activeTraceId, setActiveTraceId] = useState('');
+
+  useEffect(() => {
+    if (!traces.some((trace) => trace.id === activeTraceId)) {
+      setActiveTraceId(traces[0]?.id || '');
+    }
+  }, [activeTraceId, traces]);
+
+  const activeTrace = traces.find((trace) => trace.id === activeTraceId) || null;
+
+  return (
+    <section className="workspace-surface trace-surface">
+      <div className="section-heading">
+        <div><span>Structured Trace</span><h2>ReAct Trace</h2></div>
+        <small>{traces.length ? `最近 ${traces.length} 条任务` : '等待结构化事件'}</small>
+      </div>
+      {!traces.length ? (
+        <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="当前还没有可归并的 ReAct trace" />
+      ) : (
+        <div className="trace-grid">
+          <div className="trace-list panel-scroll">
+            {traces.map((trace) => (
+              <button
+                key={trace.id}
+                className={`trace-list-item ${trace.id === activeTraceId ? 'is-active' : ''}`}
+                onClick={() => setActiveTraceId(trace.id)}
+              >
+                <div className="trace-list-head">
+                  <strong>{trace.label}</strong>
+                  <span>{trace.latestTime}</span>
+                </div>
+                <p>{trace.summary}</p>
+                <div className="trace-list-tags">
+                  {trace.taskId && <Tag>{trace.taskId}</Tag>}
+                  {trace.commandId && <Tag>{trace.commandId}</Tag>}
+                  <Tag>{trace.eventCount} events</Tag>
+                </div>
+              </button>
+            ))}
+          </div>
+          <div className="trace-detail">
+            {activeTrace && (
+              <>
+                <div className="trace-detail-header">
+                  <div>
+                    <strong>{activeTrace.label}</strong>
+                    <p>{activeTrace.summary}</p>
+                  </div>
+                  <div className="trace-list-tags">
+                    {activeTrace.traceId && <Tag>{activeTrace.traceId}</Tag>}
+                    {activeTrace.taskId && <Tag>{activeTrace.taskId}</Tag>}
+                    {activeTrace.action && <Tag color="blue">{activeTrace.action}</Tag>}
+                  </div>
+                </div>
+                <div className="trace-lanes">
+                  {traceRoleOrder.map((role) => (
+                    <div className="trace-lane" key={role}>
+                      <div className="trace-lane-header">
+                        <strong>{roleLabels[role].title}</strong>
+                        <small>{roleLabels[role].short}</small>
+                      </div>
+                      <div className="trace-lane-body">
+                        {(activeTrace.roles[role] || []).length ? (
+                          activeTrace.roles[role]!.map((event) => <TraceEventCard key={event.eventId || `${event.stage}-${event.time}-${event.payload}`} event={event} />)
+                        ) : (
+                          <div className="trace-lane-empty">本任务未经过该节点</div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+    </section>
+  );
 }
 
 function NodeCard({ panel, compact = false }: { panel: NodePanel; compact?: boolean }) {
@@ -211,25 +442,28 @@ interface CollaborationProps {
 
 export function CollaborationView({ payload, filteredTimeline, filter, setFilter }: CollaborationProps) {
   return (
-    <div className="collaboration-grid view-enter">
-      <section className="workspace-surface flow-surface">
-        <div className="section-heading"><div><span>Message Flow</span><h2>协作链路</h2></div><BranchesOutlined /></div>
-        <div className="flow-list panel-scroll">
-          {payload.flows.map((flow, index) => (
-            <div className="flow-step" key={flow.id}>
-              <span className="flow-index">{String(index + 1).padStart(2, '0')}</span>
-              <div><strong>{flow.step}</strong><small>{flow.transport}</small><p>{flow.producer} → {flow.consumer}</p><code>{flow.topic}</code></div>
-            </div>
-          ))}
-        </div>
-      </section>
-      <section className="workspace-surface timeline-surface">
-        <div className="section-heading timeline-heading">
-          <div><span>Event Stream</span><h2>事件时间线</h2></div>
-          <Segmented value={filter} onChange={(value) => setFilter(value as TimelineFilter)} options={['全部', 'telemetry', 'state', 'policy', 'sandbox', 'reply', 'error']} />
-        </div>
-        <EventList events={filteredTimeline.slice(0, 60)} empty="当前筛选条件下没有事件" />
-      </section>
+    <div className="view-stack view-enter">
+      <StructuredTracePanel events={payload.timeline} />
+      <div className="collaboration-grid">
+        <section className="workspace-surface flow-surface">
+          <div className="section-heading"><div><span>Message Flow</span><h2>协作链路</h2></div><BranchesOutlined /></div>
+          <div className="flow-list panel-scroll">
+            {payload.flows.map((flow, index) => (
+              <div className="flow-step" key={flow.id}>
+                <span className="flow-index">{String(index + 1).padStart(2, '0')}</span>
+                <div><strong>{flow.step}</strong><small>{flow.transport}</small><p>{flow.producer} → {flow.consumer}</p><code>{flow.topic}</code></div>
+              </div>
+            ))}
+          </div>
+        </section>
+        <section className="workspace-surface timeline-surface">
+          <div className="section-heading timeline-heading">
+            <div><span>Event Stream</span><h2>事件时间线</h2></div>
+            <Segmented value={filter} onChange={(value) => setFilter(value as TimelineFilter)} options={['全部', 'telemetry', 'state', 'policy', 'sandbox', 'reply', 'error']} />
+          </div>
+          <EventList events={filteredTimeline.slice(0, 60)} empty="当前筛选条件下没有事件" />
+        </section>
+      </div>
     </div>
   );
 }

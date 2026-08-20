@@ -30,6 +30,18 @@ export interface TimelineEvent {
   target: string;
   payload: string;
   status: 'ok' | 'queued' | 'warn';
+  eventId?: string;
+  nodeId?: string;
+  role?: AgentNodeRole | string;
+  phase?: string;
+  traceId?: string;
+  taskId?: string;
+  parentTaskId?: string;
+  commandId?: string;
+  action?: string;
+  targetRole?: string;
+  targetNode?: string;
+  tsMs?: number;
 }
 
 export interface EnvironmentMetric {

@@ -1272,7 +1272,12 @@ function handleTelemetry(topic, payload) {
     source: nodeId,
     target: 'dashboard',
     payload: `temp=${payload.temp ?? '-'} humidity=${payload.humidity ?? '-'} co2=${payload.co2 ?? '-'} lux=${payload.light_lux ?? '-'}`,
-    status: 'ok'
+    status: 'ok',
+    eventId: `telemetry-${nodeId}-${Date.now()}`,
+    nodeId,
+    role,
+    phase: 'sensor',
+    tsMs: Date.now()
   });
 }
 
@@ -1291,7 +1296,12 @@ function handleState(topic, payload) {
     source: nodeId,
     target: 'dashboard',
     payload: `state=${payload.state || 'unknown'} role=${role}`,
-    status: payload.state === 'online' ? 'ok' : 'warn'
+    status: payload.state === 'online' ? 'ok' : 'warn',
+    eventId: `state-${nodeId}-${Date.now()}`,
+    nodeId,
+    role,
+    phase: 'state',
+    tsMs: Date.now()
   });
 }
 
@@ -1494,7 +1504,23 @@ function handleTimeline(payload, meta = {}) {
     source: payload.node_id || payload.sender || payload.source || 'mesh',
     target: payload.recipient || payload.target_role || payload.target_node || 'dashboard',
     payload: payload.summary || payload.text || payload.detail || JSON.stringify(payload).slice(0, 160),
-    status: payload.status === 'ok' || payload.status === 'queued' ? payload.status : payload.status === 'error' ? 'warn' : 'ok'
+    status: payload.status === 'ok' || payload.status === 'queued' ? payload.status : payload.status === 'error' ? 'warn' : 'ok',
+    eventId: typeof payload.event_id === 'string' ? payload.event_id : undefined,
+    nodeId: typeof payload.node_id === 'string' ? payload.node_id : undefined,
+    role: typeof payload.role === 'string'
+      ? payload.role
+      : typeof payload.source_role === 'string'
+        ? payload.source_role
+        : undefined,
+    phase: typeof payload.phase === 'string' ? payload.phase : undefined,
+    traceId: typeof payload.trace_id === 'string' ? payload.trace_id : undefined,
+    taskId: typeof payload.task_id === 'string' ? payload.task_id : undefined,
+    parentTaskId: typeof payload.parent_task_id === 'string' ? payload.parent_task_id : undefined,
+    commandId: typeof payload.command_id === 'string' ? payload.command_id : undefined,
+    action: typeof payload.action === 'string' ? payload.action : undefined,
+    targetRole: typeof payload.target_role === 'string' ? payload.target_role : undefined,
+    targetNode: typeof payload.target_node === 'string' ? payload.target_node : undefined,
+    tsMs: Number.isFinite(Number(payload.ts_ms)) ? Number(payload.ts_ms) : undefined
   });
 }
 
