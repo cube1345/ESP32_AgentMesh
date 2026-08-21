@@ -70,6 +70,18 @@ real long-running ReAct loop while retaining a human-in-the-loop safety gate.
 planned in one host turn, but each hardware action is still individually
 checked by Guardian and executed by the target node.
 
+The Host validates every Mesh action against the firmware role whitelist before
+publishing. The compatibility alias `set_status_led` is normalized to the
+firmware action `set_status_light`; unsupported actions and role/action
+mismatches are returned to the ReAct loop as tool errors without reaching MQTT.
+
+Host-generated command, trace, task, parent-task, channel, and chat identifiers
+are compacted before signing and publishing. The Host policy request also omits
+its redundant reply-channel copy because Host responses are correlated locally
+by command ID. This keeps normal Guardian `policy_decision` responses below the
+ESP32 MQTT payload limit while preserving stable correlation IDs for
+long-running sessions.
+
 If Mesh authentication is enabled on the firmware, provide the matching key
 to the host with `ESPAGENT_MESH_AUTH_KEY`. Keep this value out of the frontend
 bundle and source control.

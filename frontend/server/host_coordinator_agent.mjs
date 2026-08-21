@@ -5,6 +5,49 @@ const DEFAULT_MAX_ROUNDS = 8;
 const DEFAULT_MAX_HISTORY = 12;
 const DEFAULT_TIMEOUT_MS = 45_000;
 
+const SENSOR_MESH_ACTIONS = [
+  'read_temperature_humidity',
+  'read_environment',
+  'read_light_level',
+  'virtual_device_read'
+];
+const CONTROL_MESH_ACTIONS = [
+  'virtual_device_control',
+  'set_status_light',
+  'ws2812_set',
+  'set_curtain',
+  'servo_write',
+  'set_humidifier',
+  'set_fan',
+  'set_device_led',
+  'copper_gpio_write',
+  'gpio_write',
+  'gree_ac_control',
+  'control_state',
+  'control_emergency_stop',
+  'control_clear_emergency_stop'
+];
+const GUARDIAN_MESH_ACTIONS = [
+  'guardian_approval_list',
+  'guardian_approval_confirm',
+  'guardian_approval_deny'
+];
+export const HOST_MESH_ACTIONS = Object.freeze([
+  'agent_task',
+  ...SENSOR_MESH_ACTIONS,
+  ...CONTROL_MESH_ACTIONS,
+  ...GUARDIAN_MESH_ACTIONS
+]);
+
+const meshActionsByRole = {
+  sensor_agent: new Set(['agent_task', ...SENSOR_MESH_ACTIONS]),
+  control_agent: new Set(['agent_task', ...CONTROL_MESH_ACTIONS]),
+  guardian_agent: new Set(['agent_task', ...GUARDIAN_MESH_ACTIONS])
+};
+const meshActionAliases = {
+  set_status_led: 'set_status_light'
+};
+
 const meshTool = {
   type: 'function',
   function: {
@@ -16,7 +59,7 @@ const meshTool = {
       properties: {
         target_role: { type: 'string', enum: ['sensor_agent', 'control_agent', 'guardian_agent'] },
         target_node: { type: 'string' },
-        action: { type: 'string' },
+        action: { type: 'string', enum: HOST_MESH_ACTIONS },
         args: { type: 'object' },
         safety_level: { type: 'integer', minimum: 0, maximum: 2 },
         ttl_ms: { type: 'integer', minimum: 1000, maximum: 30000 }
@@ -53,7 +96,41 @@ function nowMs() {
 }
 
 function makeId(prefix) {
-  return `${prefix}-${randomUUID().replaceAll('-', '').slice(0, 20)}`;
+  const shortPrefix = { trace: 'tr', call: 'cl', proposal: 'pr' }[prefix] || prefix.slice(0, 2);
+  return `${shortPrefix}-${randomUUID().replaceAll('-', '').slice(0, 10)}`;
+}
+
+export function normalizeHostMeshAction(action) {
+  const value = String(action || '').trim();
+  return meshActionAliases[value] || value;
+}
+
+export function validateHostMeshRequest(request) {
+  const targetRole = String(request?.target_role || '');
+  const action = normalizeHostMeshAction(request?.action);
+  const allowed = meshActionsByRole[targetRole];
+  if (!allowed) {
+    return { ok: false, action, error: 'target_role must be sensor_agent, control_agent, or guardian_agent' };
+  }
+  if (!HOST_MESH_ACTIONS.includes(action)) {
+    return { ok: false, action, error: `unsupported mesh action: ${action || '(empty)'}` };
+  }
+  if (!allowed.has(action)) {
+    return { ok: false, action, error: `action=${action} is not allowed for target_role=${targetRole}` };
+  }
+  return { ok: true, action, targetRole };
+}
+
+export function compactMeshContextId(value, prefix = 'ctx', maxBytes = 24) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  const limit = Math.max(8, Math.trunc(Number(maxBytes) || 24));
+  if (Buffer.byteLength(text, 'utf8') <= limit && /^[A-Za-z0-9_.:-]+$/.test(text)) {
+    return text;
+  }
+  const safePrefix = String(prefix || 'ctx').replace(/[^A-Za-z0-9]/g, '').slice(0, 4) || 'ctx';
+  const hashLength = Math.max(3, Math.min(12, limit - safePrefix.length - 1));
+  return `${safePrefix}-${sha256(text).slice(0, hashLength)}`;
 }
 
 function parseOpenAiResponse(payload) {
@@ -196,10 +273,16 @@ export function createHostCoordinatorAgent({
             if (actionCount >= maxActions) break;
             actionCount += 1;
             const args = parseArguments(call.arguments);
+            if (call.name === 'mesh_send_command') {
+              args.action = normalizeHostMeshAction(args.action);
+            }
             publishTimeline?.({ event: 'host_agent_action', phase: 'tool_use', status: 'queued', role: 'coordinator_agent', trace_id: traceId, task_id: `task-${traceId}`, command_id: call.id, source: 'coordinator_agent', target: args.target_role || 'dashboard', action: call.name, payload: compact(args) });
             let result;
             if (call.name === 'mesh_send_command') {
-              if (approvalRequired && args.target_role === 'control_agent') {
+              const validation = validateHostMeshRequest(args);
+              if (!validation.ok) {
+                result = validation;
+              } else if (approvalRequired && args.target_role === 'control_agent') {
                 result = await onApprovalRequired?.({
                   proposalId: makeId('proposal'),
                   callId: call.id,

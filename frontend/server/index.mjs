@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { createHash, createHmac } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -7,7 +7,14 @@ import { fileURLToPath } from 'node:url';
 import { StringDecoder } from 'node:string_decoder';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createHostCoordinatorAgent, sha256, signMeshCommand } from './host_coordinator_agent.mjs';
+import {
+  compactMeshContextId,
+  createHostCoordinatorAgent,
+  normalizeHostMeshAction,
+  sha256,
+  signMeshCommand,
+  validateHostMeshRequest
+} from './host_coordinator_agent.mjs';
 import { createHostAutomation } from './host_automation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -1582,7 +1589,8 @@ function hostPendingKey(kind, id) {
 }
 
 function makeHostId(prefix) {
-  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 10)}`;
+  const shortPrefix = { command: 'cmd', trace: 'tr', task: 'tsk' }[prefix] || String(prefix || 'id').slice(0, 4);
+  return `${shortPrefix}-${randomUUID().replaceAll('-', '').slice(0, 12)}`;
 }
 
 function waitForHostEvent(kind, id, timeoutMs = HOST_AGENT_POLICY_TIMEOUT_MS) {
@@ -1610,20 +1618,19 @@ function publishMqtt(topic, payload) {
 }
 
 async function publishHostMeshCommand(request) {
-  const targetRole = String(request.target_role || '');
-  const targetNode = String(request.target_node || '');
-  const action = String(request.action || '');
-  if (!['sensor_agent', 'control_agent', 'guardian_agent'].includes(targetRole)) {
-    return { ok: false, error: 'target_role must be sensor_agent, control_agent, or guardian_agent' };
-  }
-  if (!action) return { ok: false, error: 'action is required' };
+  const validation = validateHostMeshRequest(request);
+  if (!validation.ok) return validation;
 
-  const commandId = makeHostId('cmd');
-  const traceId = String(request.traceId || makeHostId('trace'));
-  const taskId = String(request.taskId || `task-${commandId}`);
-  const parentTaskId = String(request.parentTaskId || '');
-  const sourceChannel = String(request.sourceChannel || 'web');
-  const sourceChatId = String(request.sourceChatId || 'host_console_01');
+  const targetRole = validation.targetRole;
+  const targetNode = String(request.target_node || '');
+  const action = normalizeHostMeshAction(validation.action);
+
+  const commandId = makeHostId('command');
+  const traceId = compactMeshContextId(request.traceId || makeHostId('trace'), 'tr', 16);
+  const taskId = compactMeshContextId(request.taskId || `task-${commandId}`, 'tsk', 16);
+  const parentTaskId = compactMeshContextId(request.parentTaskId, 'par', 16);
+  const sourceChannel = compactMeshContextId(request.sourceChannel || 'web', 'chn', 12);
+  const sourceChatId = compactMeshContextId(request.sourceChatId || 'host_console_01', 'chat', 16);
   const ttlMs = Math.max(1000, Math.min(30000, Number(request.ttl_ms || 30000)));
   const safetyLevel = Math.max(0, Math.min(2, Number(request.safety_level ?? 1)));
   const args = request.args && typeof request.args === 'object' && !Array.isArray(request.args)
@@ -1663,9 +1670,7 @@ async function publishHostMeshCommand(request) {
     await publishMqtt(`${TOPIC_PREFIX}/security/policy_check`, {
       schema: 'espagent.policy_check.v1',
       event: 'policy_check',
-      ...common,
-      reply_channel: sourceChannel,
-      reply_chat_id: sourceChatId
+      ...common
     });
     const decision = await decisionWait;
     if (!decision || decision.decision !== 'allow' || decision.allowed !== true) {
