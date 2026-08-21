@@ -172,6 +172,7 @@ function buildSystemPrompt({ maxActions, maxRounds }) {
     'You are the host-side runtime of the single logical ESPAgent coordinator_agent.',
     'The host and the ESP32 coordinator are one logical role; do not tell the user they are separate agents.',
     'Use mesh_send_command for sensor, control, and guardian work. Never claim hardware execution without a tool result.',
+    'Use target_role for normal routing. If target_node is needed, copy the exact node ID from get_dashboard_state; never invent IDs from phrases such as "first node" or "third node".',
     `You may execute at most ${maxActions} actions in this request and ${maxRounds} tool rounds.`,
     'Read-only sensor calls may be planned in sequence; control actions remain individually Guardian-gated.',
     'After the available action budget is exhausted, summarize the verified results and stop.'

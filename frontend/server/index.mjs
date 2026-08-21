@@ -1625,6 +1625,22 @@ async function publishHostMeshCommand(request) {
   const targetNode = String(request.target_node || '');
   const action = normalizeHostMeshAction(validation.action);
 
+  if (targetNode) {
+    const knownNode = store.nodes.get(targetNode);
+    if (!knownNode) {
+      return {
+        ok: false,
+        error: `unknown target_node=${targetNode}; use an online node ID from get_dashboard_state`
+      };
+    }
+    if (knownNode.role && knownNode.role !== targetRole) {
+      return {
+        ok: false,
+        error: `target_node=${targetNode} has role=${knownNode.role}, expected target_role=${targetRole}`
+      };
+    }
+  }
+
   const commandId = makeHostId('command');
   const traceId = compactMeshContextId(request.traceId || makeHostId('trace'), 'tr', 16);
   const taskId = compactMeshContextId(request.taskId || `task-${commandId}`, 'tsk', 16);
