@@ -125,6 +125,9 @@ export function createHostCoordinatorAgent({
     const tracked = next.finally(() => {
       if (queues.get(chatId) === tracked) queues.delete(chatId);
     });
+    // Keep the bookkeeping promise from becoming an unhandled rejection when
+    // the caller handles the returned `next` promise itself.
+    tracked.catch(() => {});
     queues.set(chatId, tracked);
     return next;
   }
