@@ -39,6 +39,33 @@ ESPAGENT_HOST_AGENT_MAX_ROUNDS=8
 ESPAGENT_HOST_AGENT_TIMEOUT_MS=45000
 ```
 
+## Long-running ReAct monitor
+
+The host can also run a bounded background monitor driven by Sensor telemetry.
+It is opt-in and keeps the same logical `coordinator_agent` identity:
+
+```bash
+export ESPAGENT_HOST_AUTOMATION_ENABLED=1
+export ESPAGENT_HOST_AUTOMATION_INTERVAL_MS=60000
+export ESPAGENT_HOST_AUTOMATION_MAX_PENDING=32
+```
+
+Each cycle reads the aggregated dashboard state and invokes the same Host ReAct
+loop. Sensor actions may run automatically. Any `control_agent` action is
+converted into an `awaiting_confirmation` proposal; the operator confirms it
+through:
+
+```text
+GET  /api/host/automation
+POST /api/host/automation/evaluate
+POST /api/host/proposals/<proposal_id>/approve
+POST /api/host/proposals/<proposal_id>/reject
+```
+
+Confirmation does not bypass Guardian: approval only releases the proposal to
+the normal `policy_check -> command -> OutputMessage` path. This provides a
+real long-running ReAct loop while retaining a human-in-the-loop safety gate.
+
 `mesh_send_command` is counted per structured action. Read-only actions may be
 planned in one host turn, but each hardware action is still individually
 checked by Guardian and executed by the target node.

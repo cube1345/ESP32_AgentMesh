@@ -113,7 +113,8 @@ export function createHostCoordinatorAgent({
   timeoutMs = Number(process.env.ESPAGENT_HOST_AGENT_TIMEOUT_MS || DEFAULT_TIMEOUT_MS),
   publishMeshCommand,
   getDashboardState,
-  publishTimeline
+  publishTimeline,
+  onApprovalRequired
 }) {
   const histories = new Map();
   const queues = new Map();
@@ -162,7 +163,7 @@ export function createHostCoordinatorAgent({
     return parseOpenAiResponse(payload);
   }
 
-  async function run({ chatId, channel = 'web', content }) {
+  async function run({ chatId, channel = 'web', content, approvalRequired = false }) {
     if (!enabled) throw new Error('host coordinator is disabled');
     const id = chatId || 'host_console_01';
     return enqueue(id, async () => {
@@ -195,7 +196,20 @@ export function createHostCoordinatorAgent({
             publishTimeline?.({ event: 'host_agent_action', phase: 'tool_use', status: 'queued', role: 'coordinator_agent', trace_id: traceId, task_id: `task-${traceId}`, command_id: call.id, source: 'coordinator_agent', target: args.target_role || 'dashboard', action: call.name, payload: compact(args) });
             let result;
             if (call.name === 'mesh_send_command') {
-              result = await publishMeshCommand({ ...args, traceId, taskId: `task-${traceId}`, parentTaskId: id, sourceChannel: channel, sourceChatId: id });
+              if (approvalRequired && args.target_role === 'control_agent') {
+                result = await onApprovalRequired?.({
+                  proposalId: makeId('proposal'),
+                  callId: call.id,
+                  traceId,
+                  taskId: `task-${traceId}`,
+                  parentTaskId: id,
+                  sourceChannel: channel,
+                  sourceChatId: id,
+                  ...args
+                }) || { ok: false, status: 'awaiting_confirmation', error: 'approval callback unavailable' };
+              } else {
+                result = await publishMeshCommand({ ...args, traceId, taskId: `task-${traceId}`, parentTaskId: id, sourceChannel: channel, sourceChatId: id });
+              }
             } else if (call.name === 'get_dashboard_state') {
               result = await getDashboardState();
             } else {

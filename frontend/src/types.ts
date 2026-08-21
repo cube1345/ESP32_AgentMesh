@@ -196,6 +196,14 @@ export interface DashboardPayload {
     role: 'coordinator_agent';
     maxActions: number;
     maxRounds: number;
+    automation?: {
+      enabled: boolean;
+      running: boolean;
+      intervalMs: number;
+      pending: Array<Record<string, unknown>>;
+      lastRunAt: string | null;
+      lastError: string | null;
+    };
   };
   guardian?: {
     updatedAt: string;

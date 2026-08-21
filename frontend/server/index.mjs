@@ -8,6 +8,7 @@ import { StringDecoder } from 'node:string_decoder';
 import mqtt from 'mqtt';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createHostCoordinatorAgent, sha256, signMeshCommand } from './host_coordinator_agent.mjs';
+import { createHostAutomation } from './host_automation.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,6 +56,7 @@ const SERIAL_CMD_PATH = process.env.ESPAGENT_SERIAL_CMD_PATH ||
 const LOCAL_SPIFFS_SKILLS_DIR = path.join(REPO_ROOT, 'spiffs_data', 'skills');
 const CHAT_GATEWAY_PATH = '/ws';
 const HOST_AGENT_ENABLED = process.env.ESPAGENT_HOST_AGENT_ENABLED === '1';
+const HOST_AUTOMATION_ENABLED = process.env.ESPAGENT_HOST_AUTOMATION_ENABLED === '1';
 const HOST_AGENT_POLICY_TIMEOUT_MS = Number(process.env.ESPAGENT_HOST_AGENT_POLICY_TIMEOUT_MS || 15000);
 const runtimeSkills = new Map();
 let runtimeSkillsCacheAt = 0;
@@ -1128,7 +1130,8 @@ function toDashboardPayload() {
       enabled: hostAgent.enabled,
       role: 'coordinator_agent',
       maxActions: hostAgent.maxActions,
-      maxRounds: hostAgent.maxRounds
+      maxRounds: hostAgent.maxRounds,
+      automation: hostAutomation.snapshot()
     },
     feishuBridge: store.feishuBridge,
     guardian: store.guardian
@@ -1200,7 +1203,7 @@ function createChatSession(downstream) {
       chatSessions.set(chatId, session);
 
       if (HOST_AGENT_ENABLED) {
-        void hostAgent.run({ chatId, channel: 'websocket', content: payload.content })
+        void hostAgent.run({ chatId, channel: 'websocket', content: payload.content, approvalRequired: true })
           .then((result) => {
             if (session.downstream.readyState === WebSocket.OPEN) {
               session.downstream.send(JSON.stringify({
@@ -1300,6 +1303,7 @@ function handleTelemetry(topic, payload) {
         store.environmentHistory.length - MAX_ENVIRONMENT_HISTORY_POINTS
       );
     }
+    hostAutomation.onTelemetry({ nodeId, role, payload, updatedAt });
   }
 
   pushTimeline({
@@ -1699,8 +1703,18 @@ const hostAgent = createHostCoordinatorAgent({
   enabled: HOST_AGENT_ENABLED,
   publishMeshCommand: publishHostMeshCommand,
   getDashboardState: () => toDashboardPayload(),
+  publishTimeline: handleTimeline,
+  onApprovalRequired: (proposal) => hostAutomation.requestApproval(proposal)
+});
+
+const hostAutomation = createHostAutomation({
+  enabled: HOST_AGENT_ENABLED && HOST_AUTOMATION_ENABLED,
+  runAgent: (request) => hostAgent.run(request),
+  getState: () => toDashboardPayload(),
+  publishCommand: publishHostMeshCommand,
   publishTimeline: handleTimeline
 });
+hostAutomation.start();
 
 client.on('connect', () => {
   store.mqtt.connected = true;
@@ -1840,6 +1854,24 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/dashboard') {
     sendJson(res, 200, toDashboardPayload());
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/host/automation') {
+    sendJson(res, 200, hostAutomation.snapshot());
+    return;
+  }
+
+  if (req.method === 'POST' && url.pathname === '/api/host/automation/evaluate') {
+    const result = await hostAutomation.evaluate('operator_request');
+    sendJson(res, result?.ok === false ? 502 : 200, result || { ok: false, error: 'automation disabled or already running' });
+    return;
+  }
+
+  const approvalMatch = url.pathname.match(/^\/api\/host\/proposals\/([^/]+)\/(approve|reject)$/);
+  if (req.method === 'POST' && approvalMatch) {
+    const result = await hostAutomation.approve(decodeURIComponent(approvalMatch[1]), approvalMatch[2] === 'approve');
+    sendJson(res, result.ok === false ? 404 : 200, result);
     return;
   }
 
